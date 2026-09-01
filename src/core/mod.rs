@@ -176,6 +176,29 @@ impl Cpu {
         Ok(self.emu.add_code_hook(begin, end, cb)?)
     }
 
+    /// 注册 block hook（每个基本块执行前回调，供中断投递检查等使用）。
+    ///
+    /// 回调签名：`(uc, address, size)`。`begin/end` 传 `1, 0` 表示全范围（Unicorn 约定）。
+    pub fn add_block_hook<F>(&mut self, begin: u64, end: u64, cb: F) -> Result<UcHookId>
+    where
+        F: for<'b> FnMut(&mut Unicorn<'b, ()>, u64, u32) + 'static,
+    {
+        Ok(self.emu.add_block_hook(begin, end, cb)?)
+    }
+
+    /// 注册 interrupt hook（CPU 产生异常事件时回调）。
+    ///
+    /// 回调签名：`(uc, intno)`。Cortex-M 上 `intno=8`（EXCP_EXCEPTION_EXIT）
+    /// 表示执行了异常返回（EXC_RETURN 分支 / POP {pc} 加载 EXC_RETURN 值）。
+    /// Unicorn 对该异常返回的 C 侧恢复被禁用（do_v7m_exception_exit 置空），
+    /// 需在本回调内自行出栈恢复现场。
+    pub fn add_intr_hook<F>(&mut self, cb: F) -> Result<UcHookId>
+    where
+        F: for<'b> FnMut(&mut Unicorn<'b, ()>, u32) + 'static,
+    {
+        Ok(self.emu.add_intr_hook(cb)?)
+    }
+
     /// 底层访问（供 M1 注册 hook 使用）
     pub fn raw(&mut self) -> &mut Unicorn<'static, ()> {
         &mut self.emu

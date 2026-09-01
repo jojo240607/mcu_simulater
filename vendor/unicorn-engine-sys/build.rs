@@ -325,6 +325,18 @@ impl ParseCallbacks for Renamer {
 fn generate_bindings() {
     const HEADER_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/include/unicorn/unicorn.h");
 
+    let bindings_rs = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("bindings.rs");
+
+    // 离线构建兜底：若随 vendor 带入预生成绑定（pregen_bindings.rs），直接复用，
+    // 跳过 bindgen，避免构建依赖 libclang。
+    let pregen = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("pregen_bindings.rs");
+    if pregen.exists() {
+        std::fs::copy(&pregen, &bindings_rs).unwrap_or_else(|_| {
+            panic!("Failed to copy pregenerated bindings into {bindings_rs:?}")
+        });
+        return;
+    }
+
     let bitflag_enums = [
         "uc_hook_type",
         "uc_tcg_op_flag",

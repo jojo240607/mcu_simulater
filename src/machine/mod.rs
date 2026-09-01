@@ -2,7 +2,8 @@
 //!
 //! M0 阶段：CPU + 固定板级内存布局 + ELF 加载 + 复位（向量表）。
 //! M1 接入内存总线（MMIO 经 mem hook 转发到 Rust 外设），M3 起由配置 DSL 驱动装配。
-//! M2 接入 MPU：MMIO/RAM-Flash-CCM 数据访问 + 取指 XN 三入口访问控制。
+//! M2 接入 MPU（MMIO/RAM-Flash-CCM 数据访问 + 取指 XN 三入口访问控制）
+//!     与中断投递（NVIC 挂起抢占 + 异常入栈/出栈）。
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,7 @@ use unicorn_engine::{HookType, MemType, Prot, RegisterARM, Unicorn};
 use crate::bus::Bus;
 use crate::core::{CoreError, Cpu, Result};
 use crate::peripheral::mpu::{Access, MemManageFault, Mpu};
+use crate::peripheral::nvic::{Nvic, StopReason};
 use crate::peripheral::scb::SystemControl;
 
 /// 一台仿真的 MCU
@@ -23,6 +25,8 @@ pub struct Machine {
     pub bus: Arc<Mutex<Bus>>,
     /// MPU（内存保护单元，挂载于 SCB 窗口，访问控制 hook 共享）
     pub mpu: Arc<Mutex<Mpu>>,
+    /// NVIC（嵌套向量中断控制器，挂载于 SCB 窗口，中断投递 hook 共享）
+    pub nvic: Arc<Mutex<Nvic>>,
     /// 初始 SP（向量表首字）
     pub initial_sp: u32,
     /// 复位向量（向量表第二字，含 Thumb 位处理见 [`Machine::reset`]）
@@ -37,6 +41,7 @@ impl Machine {
             cpu,
             bus: Arc::new(Mutex::new(Bus::new())),
             mpu: Arc::new(Mutex::new(Mpu::new())),
+            nvic: Arc::new(Mutex::new(Nvic::new())),
             initial_sp: 0,
             entry: 0,
         })
@@ -62,18 +67,20 @@ impl Machine {
     /// 读：hook 在 CPU 读取前把外设读值注入 RAM（Unicorn 的 MEM_READ 在读取前触发）；
     /// 写：hook 转发到总线，Unicorn 随后照常写 RAM，RAM 视图与总线保持一致。
     ///
-    /// M2 在此基础上接入 MPU（默认全强制，保真优先）：
+    /// M2 在此基础上接入 MPU（默认全强制，保真优先）与中断投递：
     /// 1. MMIO 数据访问：SCB 转发前先过 MPU 检查；
     /// 2. RAM/Flash/CCM 数据访问：挂 MEM_READ|MEM_WRITE hook，MPU 使能后全强制；
-    /// 3. 取指（执行）：挂全范围 code hook 做 XN 检查。
+    /// 3. 取指（执行）：挂全范围 code hook 做 XN 检查；
+    /// 4. 中断投递：block hook 检查挂起中断抢占，intr hook 处理 EXC_RETURN 返回。
     pub fn attach_system_control(&mut self) -> Result<()> {
         const SCB_BASE: u64 = 0xE000_E000;
         const SCB_SIZE: u32 = 0x1000;
 
-        // SCB 挂接共享 MPU：MPU 寄存器窗口与 MMFSR/MMFAR 由 SCB 委托
-        let scb = Arc::new(Mutex::new(SystemControl::new_with_mpu(
+        // SCB 挂接共享 MPU 与 NVIC：MPU/NVIC 寄存器窗口由 SCB 委托
+        let scb = Arc::new(Mutex::new(SystemControl::new_with_mpu_nvic(
             SCB_SIZE,
             self.mpu.clone(),
+            self.nvic.clone(),
         )));
         let bus = self.bus.clone();
         bus.lock()
@@ -119,7 +126,49 @@ impl Machine {
         // 3) 取指 XN 检查入口（code hook）
         self.attach_fetch_xn_hook()?;
 
-        log::info!("SCB+MPU 已挂载：0x{SCB_BASE:08X} +0x{SCB_SIZE:X}");
+        // 4) 中断投递入口（block 检查 + EXC_RETURN 拦截）
+        self.attach_interrupt_delivery()?;
+
+        log::info!("SCB+MPU+NVIC 已挂载：0x{SCB_BASE:08X} +0x{SCB_SIZE:X}");
+        Ok(())
+    }
+
+    /// 中断投递 hook：
+    /// 1. block hook：每个基本块开头检查是否有更高优先级挂起中断，若有则
+    ///    记录停机原因并停止执行（由 [`Machine::run`] 做异常入栈）；
+    /// 2. intr hook：捕获 EXC_RETURN（intno=8）异常返回事件，出栈恢复现场。
+    fn attach_interrupt_delivery(&mut self) -> Result<()> {
+        // 1) block hook：挂起中断抢占检查（begin=1,end=0 全范围）
+        let nvic = self.nvic.clone();
+        self.cpu.add_block_hook(1, 0, move |uc, _addr, _size| {
+            let primask = uc.reg_read(RegisterARM::PRIMASK).unwrap_or(0) != 0;
+            let basepri = (uc.reg_read(RegisterARM::BASEPRI).unwrap_or(0) & 0xF) as u8;
+            let mut n = nvic.lock().unwrap();
+            if let Some(irq) = n.select_pending(primask, basepri) {
+                n.set_stop_reason(StopReason::Switch(irq));
+                let _ = uc.emu_stop();
+            }
+        })?;
+
+        // 2) intr hook：EXC_RETURN 异常返回（Unicorn 的 do_v7m_exception_exit 被置空，
+        //    现场恢复完全由本回调完成：弹出异常栈、按 EXC_RETURN 选栈出栈、恢复寄存器）
+        let nvic2 = self.nvic.clone();
+        self.cpu.add_intr_hook(move |uc, intno| {
+            if intno != 8 {
+                return; // 仅处理 EXCP_EXCEPTION_EXIT
+            }
+            let exc_return = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+            if let Err(e) = exception_return(uc, &nvic2, exc_return) {
+                log::error!("异常返回失败：{e:?}");
+            }
+            nvic2
+                .lock()
+                .unwrap()
+                .set_stop_reason(StopReason::ExceptionReturn);
+            let _ = uc.emu_stop();
+        })?;
+
+        log::info!("中断投递 hook 已挂载（block 抢占检查 + EXC_RETURN 拦截）");
         Ok(())
     }
 
@@ -186,16 +235,102 @@ impl Machine {
 
     /// 运行 `count` 条指令（从当前 PC 继续）。
     ///
-    /// 若执行期间触发 MPU MemManage fault，返回 [`CoreError::MemManageFault`]。
+    /// 执行期间：
+    /// - 触发 MPU MemManage fault → 返回 [`CoreError::MemManageFault`]；
+    /// - 挂起中断抢占（block hook 停机）→ 异常入栈并进入 handler；
+    /// - 异常返回（EXC_RETURN，intr hook 停机）→ 现场已恢复，继续。
+    /// `count` 以线程模式指令计：每次 emu_start 命中 `remaining` 即结束。
     pub fn run(&mut self, count: usize) -> Result<()> {
-        let pc = self.cpu.reg_read_u32(RegisterARM::PC)?;
-        self.cpu.emu_start(pc as u64, 0, 0, count)?;
-        if let Some(f) = self.mpu.lock().unwrap().pending_fault() {
-            return Err(CoreError::MemManageFault {
-                addr: f.addr,
-                kind: f.kind,
-            });
+        let remaining = count;
+        while remaining > 0 {
+            let pc = self.cpu.reg_read_u32(RegisterARM::PC)?;
+            self.cpu.emu_start(pc as u64, 0, 0, remaining)?;
+
+            // MPU 违规优先返回
+            if let Some(f) = self.mpu.lock().unwrap().pending_fault() {
+                return Err(CoreError::MemManageFault {
+                    addr: f.addr,
+                    kind: f.kind,
+                });
+            }
+
+            let reason = self.nvic.lock().unwrap().take_stop_reason();
+            match reason {
+                StopReason::Switch(irq) => self.enter_exception(irq)?,
+                StopReason::ExceptionReturn => {}
+                StopReason::None => break, // 达到指令数上限
+            }
         }
+        Ok(())
+    }
+
+    /// 异常入栈：保存现场到当前栈，跳转到中断向量，进入 handler 模式。
+    ///
+    /// 按 ARMv7-M 入栈顺序压 8 字（低地址→高地址）：
+    /// r0 r1 r2 r3 r12 LR(被中断现场) PC xPSR；SP -= 32。
+    /// 栈选择与 EXC_RETURN：handler 模式恒 MSP(0xFFFFFFF1)；
+    /// 线程模式按 CONTROL.SPSEL：MSP(0xFFFFFFF9) 或 PSP(0xFFFFFFFD)。
+    fn enter_exception(&mut self, irq: u32) -> Result<()> {
+        let vector = 16 + irq; // 向量号（IRQ0 = vector 16）
+
+        let in_handler = self.nvic.lock().unwrap().in_handler();
+        let control = self.cpu.reg_read_u32(RegisterARM::CONTROL)?;
+        let (sp, exc_return) = if in_handler {
+            (self.cpu.reg_read_u32(RegisterARM::MSP)?, 0xFFFF_FFF1u32)
+        } else if control & 2 != 0 {
+            (self.cpu.reg_read_u32(RegisterARM::PSP)?, 0xFFFF_FFFD)
+        } else {
+            (self.cpu.reg_read_u32(RegisterARM::MSP)?, 0xFFFF_FFF9u32)
+        };
+
+        // 采集被中断现场（block hook 停机时 PC 停在块首，返回后该块重放）
+        let r0 = self.cpu.reg_read_u32(RegisterARM::R0)?;
+        let r1 = self.cpu.reg_read_u32(RegisterARM::R1)?;
+        let r2 = self.cpu.reg_read_u32(RegisterARM::R2)?;
+        let r3 = self.cpu.reg_read_u32(RegisterARM::R3)?;
+        let r12 = self.cpu.reg_read_u32(RegisterARM::R12)?;
+        let lr = self.cpu.reg_read_u32(RegisterARM::LR)?;
+        let pc_saved = self.cpu.reg_read_u32(RegisterARM::PC)?;
+        // xPSR 仅保留 APSR 标志位（bit31..24）；IPSR/EPSR 由本机接管
+        let xpsr = self.cpu.reg_read_u32(RegisterARM::XPSR)? & 0xFF00_0000;
+
+        let sp = sp - 32;
+        let mut frame = [0u8; 32];
+        for (i, v) in [r0, r1, r2, r3, r12, lr, pc_saved, xpsr]
+            .iter()
+            .enumerate()
+        {
+            frame[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        self.cpu.mem_write(sp as u64, &frame)?;
+        let sp_reg = if in_handler || exc_return == 0xFFFF_FFF9 {
+            RegisterARM::MSP
+        } else {
+            RegisterARM::PSP
+        };
+        self.cpu.reg_write(sp_reg, sp as u64)?;
+
+        // 进入 handler：LR=EXC_RETURN，IPSR=向量号，PC=向量表[vector]|1
+        self.cpu.reg_write(RegisterARM::LR, exc_return as u64)?;
+        self.cpu.reg_write(RegisterARM::IPSR, vector as u64)?;
+        let handler = u32::from_le_bytes(
+            self.cpu
+                .mem_read(0x0800_0000 + (vector as u64) * 4, 4)?
+                .try_into()
+                .unwrap(),
+        );
+        self.cpu.reg_write(RegisterARM::PC, (handler | 1) as u64)?;
+
+        // NVIC 状态：清挂起、置活跃、压异常栈
+        let mut n = self.nvic.lock().unwrap();
+        n.clear_pending(irq);
+        n.set_active(irq);
+        n.push_exception(vector);
+        drop(n);
+
+        log::info!(
+            "中断进入：IRQ{irq} → vector={vector} handler=0x{handler:08X} EXC_RETURN=0x{exc_return:08X}"
+        );
         Ok(())
     }
 
@@ -291,4 +426,78 @@ fn cpu_privileged(uc: &mut Unicorn<()>) -> bool {
 fn fault_and_stop(uc: &mut Unicorn<()>, mpu: &Arc<Mutex<Mpu>>, f: MemManageFault) {
     mpu.lock().unwrap().record_violation(f);
     let _ = uc.emu_stop();
+}
+
+/// 异常返回（intr hook 回调内调用）：EXC_RETURN 时出栈恢复被中断现场。
+///
+/// 被中断的 8 字帧布局（低地址→高地址）：
+/// r0 r1 r2 r3 r12 LR(现场) PC(返回地址) xPSR。
+/// 按 EXC_RETURN 解码返回模式与栈：bit1=0 回 handler（MSP），bit1=1 回线程
+/// （bit2=0 → MSP，bit2=1 → PSP）。
+fn exception_return<'b>(
+    uc: &mut Unicorn<'b, ()>,
+    nvic: &Arc<Mutex<Nvic>>,
+    exc_return: u32,
+) -> Result<()> {
+    let return_to_thread = exc_return & 0x2 != 0;
+    let use_psp = exc_return & 0x4 != 0;
+
+    // 出栈帧
+    let sp_reg = if use_psp {
+        RegisterARM::PSP
+    } else {
+        RegisterARM::MSP
+    };
+    let sp = uc.reg_read(sp_reg)? as u32;
+    let bytes = uc.mem_read_as_vec(sp as u64, 32)?;
+    let mut frame = [0u32; 8];
+    for (i, slot) in frame.iter_mut().enumerate() {
+        *slot = u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    // frame: [r0 r1 r2 r3 r12 lr pc xpsr]
+
+    // NVIC 状态：弹出异常栈顶、清 active（仅外部中断）
+    let mut n = nvic.lock().unwrap();
+    let vector = n
+        .pop_exception()
+        .ok_or_else(|| CoreError::Unicorn("EXC_RETURN 但无活动异常".into()))?;
+    if vector >= 16 {
+        n.clear_active(vector - 16);
+    }
+
+    // 恢复寄存器
+    uc.reg_write(RegisterARM::R0, frame[0] as u64)?;
+    uc.reg_write(RegisterARM::R1, frame[1] as u64)?;
+    uc.reg_write(RegisterARM::R2, frame[2] as u64)?;
+    uc.reg_write(RegisterARM::R3, frame[3] as u64)?;
+    uc.reg_write(RegisterARM::R12, frame[4] as u64)?;
+    uc.reg_write(RegisterARM::LR, frame[5] as u64)?; // 恢复被中断现场的调用者 LR
+    uc.reg_write(RegisterARM::PC, frame[6] as u64)?; // 恢复返回地址（含 Thumb 位）
+    let _ = uc.reg_write(RegisterARM::XPSR, frame[7] as u64); // 尽力恢复标志
+    uc.reg_write(sp_reg, (sp + 32) as u64)?;
+
+    // CONTROL.SPSEL：返回线程时按 EXC_RETURN bit2 更新；返回 handler 时不改
+    let control = uc.reg_read(RegisterARM::CONTROL)? as u32;
+    let control = if return_to_thread {
+        (control & !0x2) | if use_psp { 0x2 } else { 0x0 }
+    } else {
+        control
+    };
+    uc.reg_write(RegisterARM::CONTROL, control as u64)?;
+
+    // IPSR：回线程 → 0；回 handler → 上一层异常号（已在异常栈顶）
+    let ipsr = if return_to_thread {
+        0
+    } else {
+        n.current_exception()
+    };
+    let _ = uc.reg_write(RegisterARM::IPSR, ipsr as u64);
+    drop(n);
+
+    log::info!(
+        "异常返回：EXC_RETURN=0x{exc_return:08X} → PC=0x{:08X}（{}）",
+        frame[6],
+        if return_to_thread { "回线程" } else { "回 handler" }
+    );
+    Ok(())
 }
