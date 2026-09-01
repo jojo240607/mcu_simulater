@@ -5,13 +5,17 @@
 
 use std::fmt;
 
-use unicorn_engine::{uc_error, Arch, ArmCpuModel, Mode, Prot, RegisterARM, Unicorn};
+use unicorn_engine::{uc_error, Arch, ArmCpuModel, HookType, MemType, Mode, Prot, RegisterARM, Unicorn};
+
+use crate::peripheral::BusError;
 
 /// CPU 错误
 #[derive(Debug)]
 pub enum CoreError {
     /// Unicorn 底层错误
     Unicorn(String),
+    /// 总线/外设错误
+    Bus(BusError),
     /// I/O 错误（固件加载等）
     Io(String),
 }
@@ -20,6 +24,7 @@ impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CoreError::Unicorn(e) => write!(f, "unicorn: {e}"),
+            CoreError::Bus(e) => write!(f, "bus: {e:?}"),
             CoreError::Io(e) => write!(f, "io: {e}"),
         }
     }
@@ -30,6 +35,12 @@ impl std::error::Error for CoreError {}
 impl From<uc_error> for CoreError {
     fn from(e: uc_error) -> Self {
         CoreError::Unicorn(e.to_string())
+    }
+}
+
+impl From<BusError> for CoreError {
+    fn from(e: BusError) -> Self {
+        CoreError::Bus(e)
     }
 }
 
@@ -109,6 +120,22 @@ impl Cpu {
     /// 停止执行
     pub fn emu_stop(&mut self) -> Result<()> {
         self.emu.emu_stop()?;
+        Ok(())
+    }
+
+    /// 注册 MMIO 转发 hook：CPU 访问 `[begin, end]` 区间时回调。
+    ///
+    /// 回调签名与 Unicorn 一致：`(uc, mem_type, addr, size, value) -> bool`。
+    /// 返回 `false` 表示放行（Unicorn 随后正常访问内存），`true` 表示已处理。
+    /// 回调要求 `'static` 且可适用于任意 Unicorn 生命周期（Unicorn 内部以 HRTB 约束），
+    /// 总线转发通常捕获 `Arc<Mutex<Bus>>` 的克隆。
+    pub fn add_mmio_hook<F>(&mut self, begin: u64, end: u64, cb: F) -> Result<()>
+    where
+        F: for<'a, 'b> FnMut(&'a mut Unicorn<'b, ()>, MemType, u64, usize, i64) -> bool
+            + 'static,
+    {
+        self.emu
+            .add_mem_hook(HookType::MEM_READ | HookType::MEM_WRITE, begin, end, cb)?;
         Ok(())
     }
 

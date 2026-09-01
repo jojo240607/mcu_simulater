@@ -1,7 +1,9 @@
 //! 外设接口与注册表。
 //!
 //! 任何外设实现 [`Peripheral`] trait 即可挂载到内存总线。
-//! M0 仅定义接口，具体外设（GPIO/UART/TIM/NVIC/MPU…）在 M2/M3 实现。
+//! M0 仅定义接口，M1 落地总线转发链路，具体外设（GPIO/UART/TIM/NVIC/MPU…）在 M2/M3 实现。
+
+pub mod scb;
 
 /// 总线访问错误
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,12 +12,17 @@ pub enum BusError {
     Unmapped(u32),
     /// 访问越界（超出外设寄存器区间）
     OutOfRange,
+    /// 注册区间与已有区间重叠
+    Overlap,
     /// 未实现的操作
     NotImplemented,
 }
 
-/// 外设统一接口
-pub trait Peripheral {
+/// 外设统一接口。
+///
+/// `Send + Sync` 约束保证外设可通过 `Arc<Mutex<dyn Peripheral>>` 跨线程共享
+/// （GDB/monitor 独立线程读取寄存器状态，以及 mem hook 闭包内转发访问）。
+pub trait Peripheral: Send + Sync {
     /// 外设名称（调试/日志用）
     fn name(&self) -> &str;
 

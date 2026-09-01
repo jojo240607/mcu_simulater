@@ -44,7 +44,7 @@ impl Bus {
         if self.regions.iter().any(|r| {
             base < r.base + r.size && r.base < base + size
         }) {
-            return Err(BusError::NotImplemented); // 占位：后续用明确错误类型
+            return Err(BusError::Overlap);
         }
         self.regions.push(Region {
             base,
@@ -89,3 +89,64 @@ impl Bus {
         &self.regions
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peripheral::{BusError, Peripheral};
+
+    /// 测试用寄存器文件外设
+    struct TestRam(Vec<u32>);
+
+    impl Peripheral for TestRam {
+        fn name(&self) -> &str {
+            "test-ram"
+        }
+
+        fn read(&mut self, offset: u32, size: u32) -> Result<u32, BusError> {
+            assert_eq!(size, 4);
+            let idx = (offset / 4) as usize;
+            self.0.get(idx).copied().ok_or(BusError::OutOfRange)
+        }
+
+        fn write(&mut self, offset: u32, size: u32, value: u32) -> Result<(), BusError> {
+            assert_eq!(size, 4);
+            let idx = (offset / 4) as usize;
+            let slot = self.0.get_mut(idx).ok_or(BusError::OutOfRange)?;
+            *slot = value;
+            Ok(())
+        }
+    }
+
+    fn reg(regs: Vec<u32>) -> Arc<Mutex<dyn Peripheral>> {
+        Arc::new(Mutex::new(TestRam(regs)))
+    }
+
+    #[test]
+    fn attach_and_dispatch() {
+        let mut bus = Bus::new();
+        let r = reg(vec![0u32; 16]);
+        bus.attach(0x4000_0000, 0x100, "test", r).unwrap();
+
+        // 写 → 读 往返
+        bus.write(0x4000_0004, 4, 0xDEAD_BEEF).unwrap();
+        assert_eq!(bus.read(0x4000_0004, 4).unwrap(), 0xDEAD_BEEF);
+
+        // 越界（区间外）→ Unmapped；区间内超寄存器范围 → OutOfRange
+        assert!(matches!(
+            bus.read(0x4000_0200, 4),
+            Err(BusError::Unmapped(_))
+        ));
+        assert!(matches!(
+            bus.read(0x4000_0040, 4),
+            Err(BusError::OutOfRange)
+        ));
+
+        // 区间重叠 → 拒绝
+        assert!(matches!(
+            bus.attach(0x4000_0000, 0x10, "dup", reg(vec![0; 16])),
+            Err(BusError::Overlap)
+        ));
+    }
+}
+
