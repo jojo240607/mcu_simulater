@@ -5,8 +5,11 @@
 
 use std::fmt;
 
-use unicorn_engine::{uc_error, Arch, ArmCpuModel, HookType, MemType, Mode, Prot, RegisterARM, Unicorn};
+use unicorn_engine::{
+    uc_error, Arch, ArmCpuModel, HookType, MemType, Mode, Prot, RegisterARM, UcHookId, Unicorn,
+};
 
+use crate::peripheral::mpu::MemManageKind;
 use crate::peripheral::BusError;
 
 /// CPU 错误
@@ -18,6 +21,8 @@ pub enum CoreError {
     Bus(BusError),
     /// I/O 错误（固件加载等）
     Io(String),
+    /// MPU 违规触发的 MemManage fault
+    MemManageFault { addr: u32, kind: MemManageKind },
 }
 
 impl fmt::Display for CoreError {
@@ -26,6 +31,9 @@ impl fmt::Display for CoreError {
             CoreError::Unicorn(e) => write!(f, "unicorn: {e}"),
             CoreError::Bus(e) => write!(f, "bus: {e:?}"),
             CoreError::Io(e) => write!(f, "io: {e}"),
+            CoreError::MemManageFault { addr, kind } => {
+                write!(f, "memmanage fault @0x{addr:08X}: {kind:?}")
+            }
         }
     }
 }
@@ -137,6 +145,35 @@ impl Cpu {
         self.emu
             .add_mem_hook(HookType::MEM_READ | HookType::MEM_WRITE, begin, end, cb)?;
         Ok(())
+    }
+
+    /// 注册通用内存访问 hook（供 MPU 数据访问控制等使用）。
+    ///
+    /// `hook_type` 指定监听的事件（`HookType::MEM_READ`/`MEM_WRITE` 等），
+    /// 回调语义同 [`Cpu::add_mmio_hook`]：返回 `true` 表示已处理（阻断该次访问）。
+    pub fn add_mem_hook<F>(
+        &mut self,
+        hook_type: HookType,
+        begin: u64,
+        end: u64,
+        cb: F,
+    ) -> Result<UcHookId>
+    where
+        F: for<'a, 'b> FnMut(&'a mut Unicorn<'b, ()>, MemType, u64, usize, i64) -> bool
+            + 'static,
+    {
+        Ok(self.emu.add_mem_hook(hook_type, begin, end, cb)?)
+    }
+
+    /// 注册代码执行 hook（供 MPU 取指 XN 检查等使用）。
+    ///
+    /// 回调签名：`(uc, address, size)`。`begin/end` 为指令地址区间，
+    /// 传 `begin=1, end=0` 表示全范围（Unicorn 约定）。
+    pub fn add_code_hook<F>(&mut self, begin: u64, end: u64, cb: F) -> Result<UcHookId>
+    where
+        F: for<'b> FnMut(&mut Unicorn<'b, ()>, u64, u32) + 'static,
+    {
+        Ok(self.emu.add_code_hook(begin, end, cb)?)
     }
 
     /// 底层访问（供 M1 注册 hook 使用）
