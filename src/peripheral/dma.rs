@@ -1,10 +1,13 @@
-//! DMA1 直接内存访问控制器（STM32F407，M4）。
+//! DMA1/DMA2 直接内存访问控制器（STM32F407，M4）。
+//!
+//! 同一实现参数化挂载两份：DMA1 @ 0x40026000、DMA2 @ 0x40026400（各 8 流，
+//! 寄存器布局一致，仅流中断号不同）。
 //!
 //! M4 语义（内存到内存端到端）：
 //! - 寄存器文件镜像：LISR/HISR/LIFCR/HIFCR + 8 流 × (CR/NDTR/PAR/M0AR/M1AR/FCR)；
 //! - [`Peripheral::tick`]：对 EN 且 DIR=内存到内存（bit7:6=10）的流，首个 tick 判定
 //!   传输完成——NDTR 清零、LISR/HISR.TCIF 置位、TCIE 使能时向共享 NVIC 置挂起
-//!   （DMA1_StreamN 中断，见 [`DMA1_STREAM_IRQ`]）、EN 自动清零，
+//!   （DMAx_StreamN 中断，见 [`DMA1_STREAM_IRQ`]/[`DMA2_STREAM_IRQ`]）、EN 自动清零，
 //!   并把流登记到“待搬运”位图；
 //! - [`Dma::process`]：Machine::run 在 CPU 空闲间隙（每次 emu_start 返回后）调用，
 //!   对登记流执行真实内存搬运（PAR → M0AR，按 PSIZE 读 / 按 MSIZE 写，
@@ -12,7 +15,7 @@
 //!   纯内存目标（SRAM/Flash），外设目标（如 USART DR）留待后续；
 //! - 状态位 rc_w1：写 LIFCR/HIFCR 对应位 = 1 清除 LISR/HISR。
 //!
-//! 地址映射（offset 相对 DMA1 基址 0x40026000）：
+//! 地址映射（offset 相对 DMAx 基址）：
 //! - LISR 0x00 / HISR 0x04 / LIFCR 0x08 / HIFCR 0x0C
 //! - S0CR 0x10, S0NDTR 0x14, S0PAR 0x18, S0M0AR 0x1C, S0M1AR 0x20, S0FCR 0x24；
 //!   流间隔 0x18（S1@0x28 … S7@0xD0）。
@@ -27,8 +30,12 @@ use crate::peripheral::{BusError, Peripheral};
 
 /// DMA1 基址
 pub const DMA1_BASE: u32 = 0x4002_6000;
+/// DMA2 基址
+pub const DMA2_BASE: u32 = 0x4002_6400;
 /// DMA1 各流中断号（Stream0..7）
 pub const DMA1_STREAM_IRQ: [u32; 8] = [11, 12, 13, 14, 24, 25, 26, 27];
+/// DMA2 各流中断号（Stream0..7，F407：Stream0-4=56-60，Stream5-7=68-70）
+pub const DMA2_STREAM_IRQ: [u32; 8] = [56, 57, 58, 59, 60, 68, 69, 70];
 
 /// CR 控制位
 const CR_EN: u32 = 1 << 0; // 使能
@@ -56,8 +63,12 @@ fn stream_cr_idx(s: usize) -> usize {
     (OFF_CR as usize / 4) + s * 6
 }
 
-/// DMA1 外设
+/// DMA1/DMA2 外设（同一实现，name + 流中断表参数化）
 pub struct Dma {
+    /// 外设名（DMA1/DMA2，供日志/识别）
+    name: &'static str,
+    /// 各流中断号（DMA1 或 DMA2 表）
+    stream_irq: [u32; 8],
     /// 寄存器文件
     regs: [u32; REG_COUNT],
     /// 共享 NVIC（传输完成 → 置挂起对应流中断）
@@ -69,8 +80,10 @@ pub struct Dma {
 }
 
 impl Dma {
-    pub fn new(nvic: Arc<Mutex<Nvic>>) -> Self {
+    pub fn new(nvic: Arc<Mutex<Nvic>>, name: &'static str, stream_irq: [u32; 8]) -> Self {
         Self {
+            name,
+            stream_irq,
             regs: [0; REG_COUNT],
             nvic,
             pending_transfer: 0,
@@ -150,7 +163,7 @@ impl Dma {
 
 impl Peripheral for Dma {
     fn name(&self) -> &str {
-        "DMA1"
+        self.name
     }
 
     fn read(&mut self, offset: u32, size: u32) -> Result<u32, BusError> {
@@ -210,7 +223,7 @@ impl Peripheral for Dma {
             self.set_stream_reg(s, 0, cr & !CR_EN);
             self.set_stream_flag(s, FLAG_TCIF);
             if cr & CR_TCIE != 0 {
-                self.nvic.lock().unwrap().set_pending(DMA1_STREAM_IRQ[s]);
+                self.nvic.lock().unwrap().set_pending(self.stream_irq[s]);
             }
             if ndtr != 0 {
                 self.pending_transfer |= 1 << s;
@@ -227,7 +240,7 @@ mod tests {
 
     fn dma() -> Dma {
         let nvic = Arc::new(Mutex::new(Nvic::new()));
-        Dma::new(nvic)
+        Dma::new(nvic, "DMA1", DMA1_STREAM_IRQ)
     }
 
     /// 便利：把 CR/NDTR/PAR/M0AR 写入流 0
@@ -338,5 +351,24 @@ mod tests {
         assert_eq!(d.regs[0] & (1 << 5), 0, "LIFCR 写 1 应清除 TCIF0");
         // 读 LIFCR 回 0
         assert_eq!(d.read(OFF_LIFCR, 4).unwrap(), 0);
+    }
+
+    #[test]
+    fn dma2_instance_uses_own_irq_table() {
+        // DMA2 实例：Stream0 完成 → 挂起 IRQ56（非 DMA1 的 IRQ11）
+        let nvic = Arc::new(Mutex::new(Nvic::new()));
+        let mut d = Dma::new(nvic.clone(), "DMA2", DMA2_STREAM_IRQ);
+        assert_eq!(d.name(), "DMA2");
+
+        cfg_stream(&mut d, CR_EN | CR_DIR_MM | CR_TCIE, 2, 0x2000_0100, 0x2000_0200);
+        d.tick(1);
+        assert!(
+            nvic.lock().unwrap().is_pending(56),
+            "DMA2 Stream0 完成应挂起 IRQ56"
+        );
+        assert!(
+            !nvic.lock().unwrap().is_pending(11),
+            "DMA2 不应挂起 DMA1 的 IRQ11"
+        );
     }
 }

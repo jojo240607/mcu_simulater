@@ -15,7 +15,7 @@ use crate::bus::Bus;
 use crate::core::{CoreError, Cpu, Result};
 use crate::events::{Event, EventBus};
 use crate::peripheral::console::Console;
-use crate::peripheral::dma::{Dma, DMA1_BASE};
+use crate::peripheral::dma::{Dma, DMA1_BASE, DMA1_STREAM_IRQ, DMA2_BASE, DMA2_STREAM_IRQ};
 use crate::peripheral::exti::{Exti, EXTI_BASE};
 use crate::peripheral::gpio::Gpio;
 use crate::peripheral::mpu::{Access, MemManageFault, Mpu};
@@ -50,8 +50,9 @@ pub struct Machine {
     pub clock: Arc<Mutex<VirtualClock>>,
     /// 时钟外设列表（block hook 按块 tick 推进）
     timers: Arc<Mutex<Vec<Arc<Mutex<dyn Peripheral>>>>>,
-    /// DMA1（tick 判传输完成；run 间隙 process 执行内存搬运）
+    /// DMA1/DMA2（tick 判传输完成；run 间隙 process 执行内存搬运）
     dma: Arc<Mutex<Dma>>,
+    dma2: Arc<Mutex<Dma>>,
     /// RCC（看门狗复位时置 CSR 复位标志）
     rcc: Arc<Mutex<Rcc>>,
     /// IWDG 独立看门狗（系统复位时复位外设，避免复位后立即再次超时）
@@ -71,7 +72,8 @@ impl Machine {
     pub fn new_m4f() -> Result<Self> {
         let cpu = Cpu::new_m4f()?;
         let nvic = Arc::new(Mutex::new(Nvic::new()));
-        let dma = Arc::new(Mutex::new(Dma::new(nvic.clone())));
+        let dma = Arc::new(Mutex::new(Dma::new(nvic.clone(), "DMA1", DMA1_STREAM_IRQ)));
+        let dma2 = Arc::new(Mutex::new(Dma::new(nvic.clone(), "DMA2", DMA2_STREAM_IRQ)));
         let wdog_req = Arc::new(WdogResetReq::new());
         Ok(Self {
             cpu,
@@ -83,6 +85,7 @@ impl Machine {
             clock: Arc::new(Mutex::new(VirtualClock::new())),
             timers: Arc::new(Mutex::new(Vec::new())),
             dma,
+            dma2,
             rcc: Arc::new(Mutex::new(Rcc::new())),
             iwdg: Arc::new(Mutex::new(Iwdg::new(wdog_req.clone()))),
             wwdg: Arc::new(Mutex::new(Wwdg::new(
@@ -230,10 +233,14 @@ impl Machine {
         self.bus.lock().unwrap().attach(0x4000_0000, 0x400, "TIM2", tim2.clone())?;
         self.timers.lock().unwrap().push(tim2);
 
-        // M4-DMA1（MEM2MEM 传输 + TC 中断；tick 判完成，run 间隙 process 搬运）
+        // M4-DMA1/DMA2（MEM2MEM 传输 + TC 中断；tick 判完成，run 间隙 process 搬运）
         let dma = self.dma.clone();
         self.bus.lock().unwrap().attach(DMA1_BASE, 0x400, "DMA1", dma.clone())?;
         self.timers.lock().unwrap().push(dma);
+
+        let dma2 = self.dma2.clone();
+        self.bus.lock().unwrap().attach(DMA2_BASE, 0x400, "DMA2", dma2.clone())?;
+        self.timers.lock().unwrap().push(dma2);
 
         // M4-看门狗：IWDG（独立，@0x40003000）+ WWDG（窗口，@0x40002C00）
         // 共享复位请求：超时/违规 → block hook 停机 → run() 执行系统复位。
@@ -294,7 +301,7 @@ impl Machine {
             false
         })?;
 
-        log::info!("T1 外设已挂载：GPIOA-E + USART1-3 + TIM2 + RCC + SYSCFG/EXTI + DMA1 + Console @ 0x{periph_base:08X} +0x{periph_size:X}");
+        log::info!("T1 外设已挂载：GPIOA-E + USART1-3 + TIM2 + RCC + SYSCFG/EXTI + DMA1/DMA2 + Console @ 0x{periph_base:08X} +0x{periph_size:X}");
         Ok(())
     }
 
@@ -474,6 +481,7 @@ impl Machine {
 
             // DMA 内存搬运：CPU 空闲间隙执行（tick 已把完成流登记到待搬运位图）
             self.dma.lock().unwrap().process(&mut self.cpu);
+            self.dma2.lock().unwrap().process(&mut self.cpu);
 
             let reason = self.nvic.lock().unwrap().take_stop_reason();
             match reason {
