@@ -16,7 +16,7 @@ use crate::core::{CoreError, Cpu, Result};
 use crate::events::{Event, EventBus};
 use crate::peripheral::console::Console;
 use crate::peripheral::terminal::Terminal;
-use crate::peripheral::dma::{Dma, DMA1_BASE, DMA1_STREAM_IRQ, DMA2_BASE, DMA2_STREAM_IRQ};
+use crate::peripheral::dma::{Dma, DmaDir, DMA1_BASE, DMA1_STREAM_IRQ, DMA2_BASE, DMA2_STREAM_IRQ};
 use crate::peripheral::exti::{Exti, EXTI_BASE};
 use crate::peripheral::gpio::Gpio;
 use crate::peripheral::mpu::{Access, MemManageFault, Mpu};
@@ -241,13 +241,34 @@ impl Machine {
                 .lock()
                 .unwrap()
                 .attach(base, 0x400, format!("USART{port}"), uart.clone())?;
-            // 虚拟终端/测试发布 UartRx → 对应端口 feed_rx
+            // 注册 USART 句柄到 DMA1/DMA2（外设方向搬运经句柄直接读写 DR）
+            self.dma.lock().unwrap().register_usart(port, uart.clone());
+            self.dma2.lock().unwrap().register_usart(port, uart.clone());
+            // 虚拟终端/测试发布 UartRx → 对应端口 feed_rx；
+            // RX DMA 请求在 feed_rx 之后直接路由（不能在 feed_rx 内二次 publish，
+            // 否则事件分发回调中同线程重入 events.lock() 死锁，见 [`Usart::dma_rx_pending`]）
             let u = uart.clone();
+            let dma1 = self.dma.clone();
+            let dma2 = self.dma2.clone();
             events.lock().unwrap().subscribe(Arc::new(Mutex::new(
                 move |ev: &Event| {
                     if let Event::UartRx { port: p, byte } = ev {
                         if *p == u.lock().unwrap().port {
                             u.lock().unwrap().feed_rx(*byte);
+                            if u.lock().unwrap().dma_rx_pending() {
+                                // 外设→内存：DMAR 使能且 RXNE 置位 → 登记 DMA 搬运
+                                //（映射与 UartDma 订阅一致，F407 HAL 默认流）
+                                let (ctrl, stream, channel) = match *p {
+                                    1 => (dma2.clone(), 2, 4),
+                                    2 => (dma1.clone(), 5, 4),
+                                    3 => (dma1.clone(), 1, 4),
+                                    4 => (dma1.clone(), 2, 4),
+                                    5 => (dma1.clone(), 0, 4),
+                                    6 => (dma2.clone(), 1, 5),
+                                    _ => return,
+                                };
+                                ctrl.lock().unwrap().service_stream(stream, channel, DmaDir::PeriphToMem, *p);
+                            }
                         }
                     }
                 },
@@ -267,6 +288,39 @@ impl Machine {
         let dma2 = self.dma2.clone();
         self.bus.lock().unwrap().attach(DMA2_BASE, 0x400, "DMA2", dma2.clone())?;
         self.timers.lock().unwrap().push(dma2);
+
+        // USART DMA 请求路由（F407 固定映射：port + 方向 → DMAx_StreamN_ChannelM，
+        // 采用 HAL 默认流，见 STM32F4xx_hal_uart.c UART_DMA_GetConfig）。
+        let dma1 = self.dma.clone();
+        let dma2 = self.dma2.clone();
+        events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+            move |ev: &Event| {
+                if let Event::UartDma { port, dir } = ev {
+                    let (ctrl, stream, channel) = match (*port, *dir) {
+                        // USART1：DMA2_Stream7_Channel4(TX) / DMA2_Stream2_Channel4(RX)
+                        (1, DmaDir::MemToPeriph) => (dma2.clone(), 7, 4),
+                        (1, DmaDir::PeriphToMem) => (dma2.clone(), 2, 4),
+                        // USART2：DMA1_Stream6_Channel4(TX) / DMA1_Stream5_Channel4(RX)
+                        (2, DmaDir::MemToPeriph) => (dma1.clone(), 6, 4),
+                        (2, DmaDir::PeriphToMem) => (dma1.clone(), 5, 4),
+                        // USART3：DMA1_Stream3_Channel4(TX) / DMA1_Stream1_Channel4(RX)
+                        (3, DmaDir::MemToPeriph) => (dma1.clone(), 3, 4),
+                        (3, DmaDir::PeriphToMem) => (dma1.clone(), 1, 4),
+                        // UART4：DMA1_Stream4_Channel4(TX) / DMA1_Stream2_Channel4(RX)
+                        (4, DmaDir::MemToPeriph) => (dma1.clone(), 4, 4),
+                        (4, DmaDir::PeriphToMem) => (dma1.clone(), 2, 4),
+                        // UART5：DMA1_Stream7_Channel4(TX) / DMA1_Stream0_Channel4(RX)
+                        (5, DmaDir::MemToPeriph) => (dma1.clone(), 7, 4),
+                        (5, DmaDir::PeriphToMem) => (dma1.clone(), 0, 4),
+                        // USART6：DMA2_Stream6_Channel5(TX) / DMA2_Stream1_Channel5(RX)
+                        (6, DmaDir::MemToPeriph) => (dma2.clone(), 6, 5),
+                        (6, DmaDir::PeriphToMem) => (dma2.clone(), 1, 5),
+                        _ => return,
+                    };
+                    ctrl.lock().unwrap().service_stream(stream, channel, *dir, *port);
+                }
+            },
+        )));
 
         // M4-看门狗：IWDG（独立，@0x40003000）+ WWDG（窗口，@0x40002C00）
         // 共享复位请求：超时/违规 → block hook 停机 → run() 执行系统复位。

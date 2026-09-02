@@ -5,6 +5,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::peripheral::dma::DmaDir;
+
 /// 事件类型（M0 占位，M3 起按外设扩展）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -12,6 +14,8 @@ pub enum Event {
     UartByte { port: u8, byte: u8 },
     /// UART 接收一字节（虚拟终端/测试 → USART RX，驱动 RXNE/中断）
     UartRx { port: u8, byte: u8 },
+    /// UART DMA 请求（USART → DMA 控制器，触发外设↔内存搬运）
+    UartDma { port: u8, dir: DmaDir },
     /// GPIO 电平变化
     GpioLevel { port: u8, pin: u8, level: bool },
     /// 占位：其它事件后续按需扩展

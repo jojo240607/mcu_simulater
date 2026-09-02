@@ -20,7 +20,6 @@
 
 use std::path::Path;
 
-use mcu_simulater::events::Event;
 use mcu_simulater::machine::{ConnectSource, ConnectTarget, Machine};
 
 const G_TX4: u32 = 0x2000_0000;

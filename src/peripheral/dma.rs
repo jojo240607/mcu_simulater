@@ -15,6 +15,15 @@
 //!   纯内存目标（SRAM/Flash），外设目标（如 USART DR）留待后续；
 //! - 状态位 rc_w1：写 LIFCR/HIFCR 对应位 = 1 清除 LISR/HISR。
 //!
+//! M5 扩展（外设↔内存，USART DMA 传输）：
+//! - USART 使能 DMAR/DMAT 后在 RXNE/TXE 触发 [`crate::events::Event::UartDma`]，
+//!   Machine 按固定映射表（port, 方向）路由到 DMAx_StreamN_ChannelM 并调用
+//!   [`Dma::service_stream`] 登记待搬运（校验 CHSEL/DIR/EN）；
+//! - 外设方向搬运经已注册的 USART 句柄直接读写 DR（[`Usart::dma_read_dr`] /
+//!   [`Usart::dma_write_dr`]），避免 Unicorn CPU 内存 API 不触发 MMIO hook 的限制；
+//! - 外设→内存（RX）：每收 1 字节搬 1 次；内存→外设（TX）：TXE 就绪一次搬完 NDTR，
+//!   完成后 NDTR 清零、EN 自动清零、TCIF 置位、TCIE 使能时挂起对应流中断。
+//!
 //! 地址映射（offset 相对 DMAx 基址）：
 //! - LISR 0x00 / HISR 0x04 / LIFCR 0x08 / HIFCR 0x0C
 //! - S0CR 0x10, S0NDTR 0x14, S0PAR 0x18, S0M0AR 0x1C, S0M1AR 0x20, S0FCR 0x24；
@@ -26,16 +35,35 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::Cpu;
 use crate::peripheral::nvic::Nvic;
+use crate::peripheral::usart::Usart;
 use crate::peripheral::{BusError, Peripheral};
 
 /// DMA1 基址
 pub const DMA1_BASE: u32 = 0x4002_6000;
 /// DMA2 基址
 pub const DMA2_BASE: u32 = 0x4002_6400;
-/// DMA1 各流中断号（Stream0..7）
-pub const DMA1_STREAM_IRQ: [u32; 8] = [11, 12, 13, 14, 24, 25, 26, 27];
+/// DMA1 各流中断号（Stream0..7，F407：流0-3=11-14、流4-6=15-17、流7=47）
+pub const DMA1_STREAM_IRQ: [u32; 8] = [11, 12, 13, 14, 15, 16, 17, 47];
 /// DMA2 各流中断号（Stream0..7，F407：Stream0-4=56-60，Stream5-7=68-70）
 pub const DMA2_STREAM_IRQ: [u32; 8] = [56, 57, 58, 59, 60, 68, 69, 70];
+
+/// DMA 传输方向（CR.DIR bit7:6）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmaDir {
+    /// 外设 → 内存（DIR=00，如 USART RX）
+    PeriphToMem,
+    /// 内存 → 外设（DIR=01，如 USART TX）
+    MemToPeriph,
+}
+
+impl DmaDir {
+    fn bits(self) -> u32 {
+        match self {
+            DmaDir::PeriphToMem => 0,
+            DmaDir::MemToPeriph => 1,
+        }
+    }
+}
 
 /// CR 控制位
 const CR_EN: u32 = 1 << 0; // 使能
@@ -44,6 +72,8 @@ const CR_PINC: u32 = 1 << 9; // 外设地址递增
 const CR_MINC: u32 = 1 << 10; // 内存地址递增
 // DIR bit7:6：00=外设→内存, 01=内存→外设, 10=内存→内存
 const CR_DIR_MM: u32 = 2 << 6;
+/// 通道选择（CHSEL bit28:25）
+const CR_CHSEL_SHIFT: u32 = 25;
 
 /// 状态位
 const FLAG_TCIF: u32 = 5; // 传输完成
@@ -77,6 +107,10 @@ pub struct Dma {
     pending_transfer: u32,
     /// 各流待搬运项数（tick 完成时记录，process 消费）
     pending_items: [u32; 8],
+    /// 各流待搬运的 USART 端口（0 = 非外设方向/未登记）
+    pending_port: [u8; 8],
+    /// 注册的 USART 句柄（index 0..5 = USART1..6，外设方向搬运直接读写 DR）
+    usart_handles: [Option<Arc<Mutex<Usart>>>; 6],
 }
 
 impl Dma {
@@ -88,7 +122,47 @@ impl Dma {
             nvic,
             pending_transfer: 0,
             pending_items: [0; 8],
+            pending_port: [0; 8],
+            usart_handles: Default::default(),
         }
+    }
+
+    /// 注册 USART 句柄（供外设方向搬运读写 DR）。
+    ///
+    /// Machine 挂载 USART1-6 时对 DMA1/DMA2 各调用一次；`port` 取值 1..6。
+    pub fn register_usart(&mut self, port: u8, usart: Arc<Mutex<Usart>>) {
+        if (1..=6).contains(&port) {
+            self.usart_handles[(port - 1) as usize] = Some(usart);
+        }
+    }
+
+    /// 处理 USART 发布的 DMA 请求（经 [`crate::events::Event::UartDma`] 路由）。
+    ///
+    /// 校验流 CR：EN 置位、CHSEL 与请求通道一致、DIR 与请求方向一致后登记待搬运。
+    /// - 外设→内存（RX）：每收 1 字节触发 1 次搬运（USART 每字节发 1 次请求）；
+    /// - 内存→外设（TX）：TXE 就绪一次搬运整个 NDTR（仿真快速发送一次完成）。
+    pub fn service_stream(&mut self, stream: usize, channel: u32, dir: DmaDir, port: u8) {
+        let cr = self.stream_reg(stream, 0);
+        let ndtr = self.stream_reg(stream, 1);
+        if cr & CR_EN == 0 {
+            return; // 流未使能：忽略请求
+        }
+        if (cr >> CR_CHSEL_SHIFT) & 0x7 != channel {
+            return; // CHSEL 不匹配（本流不服务该外设通道）
+        }
+        if (cr >> 6) & 0x3 != dir.bits() {
+            return; // CR.DIR 与请求方向不一致
+        }
+        let items = match dir {
+            DmaDir::PeriphToMem => 1,     // 每收 1 字节搬 1 项
+            DmaDir::MemToPeriph => ndtr,  // TXE 就绪 → 一次搬完
+        };
+        if items == 0 {
+            return;
+        }
+        self.pending_transfer |= 1 << stream;
+        self.pending_items[stream] = items;
+        self.pending_port[stream] = port;
     }
 
     /// 状态位所属中断状态寄存器索引（低 4 流 → LISR，高 4 流 → HISR）
@@ -120,10 +194,14 @@ impl Dma {
         self.regs[stream_cr_idx(s) + sub] = value;
     }
 
-    /// 执行登记流的内存搬运（PAR → M0AR）。
+    /// 执行登记流的搬运（PAR → M0AR）。
     ///
     /// 仅在 CPU 空闲间隙由 Machine 调用；一次搬运 `items` 项，
     /// 按 PSIZE（源）/MSIZE（目标）取宽，PINC/MINC 决定地址递增。
+    /// - 内存到内存：PAR/M0AR 均为内存，走 CPU 内存 API；
+    /// - 外设方向：内存侧用 CPU 内存 API，外设侧经已注册 USART 句柄直接读写 DR
+    ///   （TX：M0AR → [`Usart::dma_write_dr`]；RX：[`Usart::dma_read_dr`] → M0AR），
+    ///   完成后 NDTR 清零、EN 自动清零、TCIF 置位、TCIE 时挂起流中断。
     pub fn process(&mut self, cpu: &mut Cpu) {
         let mut mask = self.pending_transfer;
         while mask != 0 {
@@ -135,6 +213,7 @@ impl Dma {
                 continue;
             }
             let cr = self.stream_reg(s, 0);
+            let dir = (cr >> 6) & 0x3; // 00=外设→内存, 01=内存→外设, 10=内存→内存
             let psize = ((cr >> 11) & 0x3) as usize; // 0=字节,1=半字,2=字
             let msize = ((cr >> 13) & 0x3) as usize;
             let pw = 1usize << psize;
@@ -143,20 +222,73 @@ impl Dma {
             let minc = cr & CR_MINC != 0;
             let mut src = self.stream_reg(s, 2); // PAR
             let mut dst = self.stream_reg(s, 3); // M0AR
-            let mut buf = [0u8; 4];
-            for _ in 0..items {
-                if let Ok(data) = cpu.mem_read(src as u64, pw) {
-                    buf[..pw].copy_from_slice(&data[..pw]);
-                    let _ = cpu.mem_write(dst as u64, &buf[..mw]);
+
+            if dir == 2 {
+                // 内存到内存：PAR → M0AR（原 M4 路径）
+                let mut buf = [0u8; 4];
+                for _ in 0..items {
+                    if let Ok(data) = cpu.mem_read(src as u64, pw) {
+                        buf[..pw].copy_from_slice(&data[..pw]);
+                        let _ = cpu.mem_write(dst as u64, &buf[..mw]);
+                    }
+                    if pinc {
+                        src += pw as u32;
+                    }
+                    if minc {
+                        dst += mw as u32;
+                    }
                 }
-                if pinc {
-                    src += pw as u32;
+                // 地址回写：PAR/M0AR 随 PINC/MINC 更新（硬件 DMA 寄存器行为）
+                self.set_stream_reg(s, 2, src);
+                self.set_stream_reg(s, 3, dst);
+                self.pending_transfer &= !(1 << s);
+                continue;
+            }
+
+            // 外设方向：经已注册 USART 句柄读写 DR（内存侧走 CPU 内存 API）
+            let port = self.pending_port[s];
+            let handle = self
+                .usart_handles
+                .get((port as usize).wrapping_sub(1))
+                .and_then(|h| h.clone());
+            let Some(usart) = handle else {
+                self.pending_transfer &= !(1 << s); // 未注册句柄（配置异常）：跳过
+                continue;
+            };
+            let ndtr = self.stream_reg(s, 1);
+            let new_ndtr = ndtr.saturating_sub(items);
+            if dir == 1 {
+                // 内存 → 外设（TX）：M0AR → USART DR
+                for _ in 0..items {
+                    if let Ok(data) = cpu.mem_read(dst as u64, mw) {
+                        usart.lock().unwrap().dma_write_dr(data[0]);
+                    }
+                    if minc {
+                        dst += mw as u32;
+                    }
                 }
-                if minc {
-                    dst += mw as u32;
+            } else {
+                // 外设 → 内存（RX）：USART DR → M0AR
+                for _ in 0..items {
+                    let byte = usart.lock().unwrap().dma_read_dr();
+                    let _ = cpu.mem_write(dst as u64, &[byte]);
+                    if minc {
+                        dst += mw as u32;
+                    }
                 }
             }
+            // MINC 地址回写：下次搬运从续接地址开始（外设方向 PAR 固定，仅回写 M0AR）
+            self.set_stream_reg(s, 3, dst);
+            self.set_stream_reg(s, 1, new_ndtr);
             self.pending_transfer &= !(1 << s);
+            if new_ndtr == 0 {
+                // 传输完成：EN 自动清零 + TCIF + 中断
+                self.set_stream_reg(s, 0, cr & !CR_EN);
+                self.set_stream_flag(s, FLAG_TCIF);
+                if cr & CR_TCIE != 0 {
+                    self.nvic.lock().unwrap().set_pending(self.stream_irq[s]);
+                }
+            }
         }
     }
 }

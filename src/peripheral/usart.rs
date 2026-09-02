@@ -8,6 +8,9 @@
 //!   读 DR 清 RXNE；ORE 写 0 清除（rc_w0）；
 //! - 中断：RXNEIE/TCIE/TXEIE 置挂起，NVIC IRQ 映射 USART1-3 = IRQ37-39、UART4/5 = IRQ52/53、
 //!   USART6 = IRQ71；CR1 中断使能位拉高而标志已置位时立即挂起（寄存器写副作用，硬件语义）。
+//! - DMA：CR3.DMAT/DMAR 使能后，TXE 就绪（内存→外设）或 RXNE 置位（外设→内存）时发布
+//!   [`crate::events::Event::UartDma`]，由 Machine 路由到对应 DMA 流；DMA 搬运经
+//!   [`Usart::dma_read_dr`]/[`Usart::dma_write_dr`] 直接读写 DR。
 //!
 //! 地址映射（每个 USART 基址不同，`offset` 为相对基址偏移）：
 //! - SR 0x00 / DR 0x04 / BRR 0x08 / CR1 0x0C / CR2 0x10 / CR3 0x14 / GTPR 0x18
@@ -15,6 +18,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::events::{Event, EventBus};
+use crate::peripheral::dma::DmaDir;
 use crate::peripheral::nvic::Nvic;
 use crate::peripheral::{BusError, Peripheral};
 
@@ -40,10 +44,15 @@ const CR1_RXNEIE: u32 = 1 << 5; // RXNE 中断使能
 const CR1_TCIE: u32 = 1 << 6;   // TC 中断使能
 const CR1_TXEIE: u32 = 1 << 7;  // TXE 中断使能
 
+/// CR3 控制位
+const CR3_DMAR: u32 = 1 << 6; // DMA 接收使能（RXNE → DMA 请求）
+const CR3_DMAT: u32 = 1 << 7; // DMA 发送使能（TXE → DMA 请求）
+
 /// 寄存器偏移
 const OFF_SR: u32 = 0x00;
 const OFF_DR: u32 = 0x04;
 const OFF_CR1: u32 = 0x0C;
+const OFF_CR3: u32 = 0x14;
 
 /// USART 外设
 pub struct Usart {
@@ -111,11 +120,60 @@ impl Usart {
         self.rx_byte = byte;
         self.regs[0] |= SR_RXNE;
         self.set_pending_if_rx();
+        // 注意：不在 feed_rx 内发布 UartDma——feed_rx 可能在事件分发回调中被调用，
+        // 此时事件总线锁已被外层 publish 持有，二次 publish 会同线程重入死锁；
+        // RX DMA 请求改由 Machine 的 UartRx 订阅者在 feed_rx 之后直接路由
+        // （见 [`Usart::dma_rx_pending`]）。
+    }
+
+    /// 是否有待 DMA 搬运的接收请求（CR3.DMAR 使能且 RXNE 置位）。
+    ///
+    /// 供 Machine 在 feed_rx 之后直接路由 RX DMA（避免在事件分发内二次 publish）。
+    pub fn dma_rx_pending(&self) -> bool {
+        (self.regs[5] & CR3_DMAR != 0) && (self.regs[0] & SR_RXNE != 0)
     }
 
     /// 发送数据寄存器是否空（固件轮询 TXE）
     pub fn tx_ready(&self) -> bool {
         self.regs[0] & SR_TXE != 0
+    }
+
+    /// DMA 读 DR（外设→内存方向）：返回接收字节并清 RXNE。
+    ///
+    /// 与 CPU 读 DR 同语义（读清 RXNE），供 DMA 控制器搬运调用。
+    pub fn dma_read_dr(&mut self) -> u8 {
+        let byte = self.rx_byte;
+        self.regs[0] &= !SR_RXNE;
+        byte
+    }
+
+    /// DMA 写 DR（内存→外设方向）：发送一字节并置 TXE/TC（仿真快速发送）。
+    ///
+    /// 供 DMA 控制器搬运调用，等价 CPU 写 DR 的发送语义。
+    pub fn dma_write_dr(&mut self, byte: u8) {
+        self.tx(byte);
+        self.regs[0] |= SR_TXE | SR_TC;
+    }
+
+    /// 检查并发布 DMA 请求（CR3.DMAT/DMAR 使能且对应标志置位时）。
+    ///
+    /// - 内存→外设（TX）：DMAT 且 TXE → 发布请求，DMA 一次搬完 NDTR；
+    /// - 外设→内存（RX）：DMAR 且 RXNE → 发布请求，DMA 搬 1 字节。
+    fn check_dma_request(&self) {
+        let cr3 = self.regs[5]; // CR3
+        let sr = self.regs[0];
+        if (cr3 & CR3_DMAT != 0) && (sr & SR_TXE != 0) {
+            self.bus.lock().unwrap().publish(&Event::UartDma {
+                port: self.port,
+                dir: DmaDir::MemToPeriph,
+            });
+        }
+        if (cr3 & CR3_DMAR != 0) && (sr & SR_RXNE != 0) {
+            self.bus.lock().unwrap().publish(&Event::UartDma {
+                port: self.port,
+                dir: DmaDir::PeriphToMem,
+            });
+        }
     }
 }
 
@@ -185,6 +243,10 @@ impl Peripheral for Usart {
                     if want {
                         self.nvic.lock().unwrap().set_pending(self.irq);
                     }
+                }
+                // DMA 使能位（CR1 中断/CR3 DMAT/DMAR）变化后检查是否发布 DMA 请求
+                if offset == OFF_CR1 || offset == OFF_CR3 {
+                    self.check_dma_request();
                 }
                 Ok(())
             }
