@@ -111,6 +111,8 @@ impl Mpu {
     ///
     /// - MPU 未使能 → 放行（不强制）。
     /// - 命中 region：取指仅看 XN；数据访问看 AP（按特权级）。
+    ///   ARMv7-M B3.5.4：地址命中多个 region 时，**最高编号 region 优先**，
+    ///   故从高到低遍历，第一个命中即为优先级最高者（含 sub-region 排除后回退到低编号 region）。
     /// - 未命中（后台 region）：`PRIVDEFENA=1` 且特权 → 放行，否则违规。
     pub fn check(
         &self,
@@ -122,7 +124,7 @@ impl Mpu {
             return Ok(());
         }
 
-        for r in &self.regions {
+        for r in self.regions.iter().rev() {
             if region_contains(r, addr) {
                 // 取指：仅 XN 位决定（AP 不约束取指）
                 if access == Access::Fetch {
@@ -306,25 +308,29 @@ fn region_contains(r: &Region, addr: u32) -> bool {
     if size == 0 {
         return false; // SIZE 字段过小（<32B），语义不确定，视为不覆盖
     }
-    let base = r.rbar & !0x1F; // RBAR.ADDR[31:5]
-    if addr < base || addr >= base + size {
+    // 精确语义：region 基址为 RBAR.ADDR[31:5] 再按 region 大小向下对齐
+    // （ARMv7-M RBAR.ADDR 语义；u64 计算避免 SIZE=31 的 4GB 溢出）。
+    let base = (u64::from(r.rbar) & !0x1F) & !(size - 1);
+    let a = u64::from(addr);
+    if a < base || a >= base + size {
         return false;
     }
     // sub-region：每区 1/8，SRD 位=1 表示禁用
-    let sub = ((addr - base) / (size / 8)) as u32;
+    let sub = ((a - base) / (size / 8)) as u32;
     if r.rasr & (1 << (8 + sub)) != 0 {
         return false;
     }
     true
 }
 
-/// 解码 RASR.SIZE → region 字节数（2^(SIZE+1)），最小 32B
-fn region_size_bytes(rasr: u32) -> u32 {
+/// 解码 RASR.SIZE → region 字节数（2^(SIZE+1)），最小 32B；
+/// 用 u64 表示，SIZE=31 时 4GB 不溢出。
+fn region_size_bytes(rasr: u32) -> u64 {
     let size = (rasr >> 1) & 0x1F;
     if size < 4 {
         0
     } else {
-        1u32 << (size + 1)
+        1u64 << (size + 1)
     }
 }
 
@@ -352,6 +358,19 @@ mod tests {
     /// 程序化 region0：base + size_bytes + ap + xn
     fn prog_region0(m: &mut Mpu, base: u32, size_bytes: u32, ap: u8, xn: bool) {
         let rbar = base | (1 << 4) | 0; // VALID, REGION=0
+        m.write(MPU_RBAR_OFF, 4, rbar).unwrap();
+        let size_field = size_bytes.trailing_zeros() as u32 - 1; // size = 2^(SIZE+1)
+        let mut rasr = (size_field << 1) | 1; // ENABLE
+        rasr |= (ap as u32) << 24;
+        if xn {
+            rasr |= 1 << 28; // RASR.XN（bit28）
+        }
+        m.write(MPU_RASR_OFF, 4, rasr).unwrap();
+    }
+
+    /// 程序化任意 region：base + size_bytes + ap + xn（经 RNR + RBAR/VALID + RASR）
+    fn prog_region(m: &mut Mpu, idx: u8, base: u32, size_bytes: u32, ap: u8, xn: bool) {
+        let rbar = base | (1 << 4) | u32::from(idx); // VALID, REGION=idx
         m.write(MPU_RBAR_OFF, 4, rbar).unwrap();
         let size_field = size_bytes.trailing_zeros() as u32 - 1; // size = 2^(SIZE+1)
         let mut rasr = (size_field << 1) | 1; // ENABLE
@@ -438,6 +457,49 @@ mod tests {
         assert!(m.check(0x2000_0000, Access::Read, true).is_err());
         // sub1（0x20000020）→ 命中 region，AP=011 放行
         assert!(m.check(0x2000_0020, Access::Write, true).is_ok());
+    }
+
+    #[test]
+    fn overlap_higher_region_number_wins() {
+        // ARMv7-M B3.5.4：重叠 region 取最高编号者。
+        // 场景 A：region0 放行（AP=011 全 rw）、region7 只读（AP=101 特权 ro）→ 写应被拒（region7 胜）。
+        let mut m = mpu();
+        prog_region(&mut m, 0, 0x2000_0000, 0x40, 0b011, false);
+        prog_region(&mut m, 7, 0x2000_0000, 0x40, 0b101, false);
+        m.write(MPU_CTRL_OFF, 4, 0x5).unwrap(); // ENABLE + PRIVDEFENA
+
+        assert!(m.check(0x2000_0000, Access::Read, true).is_ok());
+        assert!(matches!(
+            m.check(0x2000_0000, Access::Write, true),
+            Err(MemManageFault { kind: MemManageKind::DataAccess, .. })
+        ), "高编号 region7（只读）应覆盖低编号 region0（rw）");
+
+        // 场景 B：region0 只读、region7 全 rw → 写应放行（region7 胜）。
+        let mut m = mpu();
+        prog_region(&mut m, 0, 0x2000_0000, 0x40, 0b101, false);
+        prog_region(&mut m, 7, 0x2000_0000, 0x40, 0b011, false);
+        m.write(MPU_CTRL_OFF, 4, 0x5).unwrap();
+
+        assert!(m.check(0x2000_0000, Access::Write, true).is_ok());
+    }
+
+    #[test]
+    fn base_aligned_to_region_size() {
+        // 精确语义：RBAR.ADDR 按 region 大小向下对齐。
+        // SIZE=6 → 128B；写入基址 0x20000040（32 对齐但非 128 对齐）→ 有效基址 0x20000000，
+        // region 覆盖 [0x20000000, 0x20000080)。
+        let mut m = mpu();
+        m.write(MPU_RNR_OFF, 4, 0).unwrap();
+        m.write(MPU_RBAR_OFF, 4, 0x2000_0040 | (1 << 4)).unwrap(); // VALID, REGION=0
+        let rasr = (6 << 1) | (0b011 << 24) | 1; // SIZE=6(128B), AP=011, ENABLE
+        m.write(MPU_RASR_OFF, 4, rasr).unwrap();
+        m.write(MPU_CTRL_OFF, 4, 0x1).unwrap(); // ENABLE（无 PRIVDEFENA）
+
+        // 有效基址内的地址命中 region（放行）
+        assert!(m.check(0x2000_0010, Access::Write, true).is_ok());
+        assert!(m.check(0x2000_0070, Access::Write, true).is_ok());
+        // 超出有效 region 范围 → 后台 region（无 PRIVDEFENA）→ 违规
+        assert!(m.check(0x2000_0080, Access::Read, true).is_err());
     }
 
     #[test]
