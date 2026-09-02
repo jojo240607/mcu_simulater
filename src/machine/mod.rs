@@ -25,6 +25,7 @@ use crate::peripheral::scb::SystemControl;
 use crate::peripheral::syscfg::{ExtiPortSelect, Syscfg};
 use crate::peripheral::timer::Tim2;
 use crate::peripheral::usart::Usart;
+use crate::peripheral::wdog::{Iwdg, ResetReason, WdogResetReq, Wwdg};
 use crate::peripheral::{Peripheral};
 use crate::sim::timing::VirtualClock;
 
@@ -51,6 +52,14 @@ pub struct Machine {
     timers: Arc<Mutex<Vec<Arc<Mutex<dyn Peripheral>>>>>,
     /// DMA1（tick 判传输完成；run 间隙 process 执行内存搬运）
     dma: Arc<Mutex<Dma>>,
+    /// RCC（看门狗复位时置 CSR 复位标志）
+    rcc: Arc<Mutex<Rcc>>,
+    /// IWDG 独立看门狗（系统复位时复位外设，避免复位后立即再次超时）
+    iwdg: Arc<Mutex<Iwdg>>,
+    /// WWDG 窗口看门狗（同上）
+    wwdg: Arc<Mutex<Wwdg>>,
+    /// 看门狗复位请求（IWDG/WWDG 置位，block hook 停机，run() 执行系统复位）
+    wdog_req: Arc<WdogResetReq>,
     /// 初始 SP（向量表首字）
     pub initial_sp: u32,
     /// 复位向量（向量表第二字，含 Thumb 位处理见 [`Machine::reset`]）
@@ -63,16 +72,24 @@ impl Machine {
         let cpu = Cpu::new_m4f()?;
         let nvic = Arc::new(Mutex::new(Nvic::new()));
         let dma = Arc::new(Mutex::new(Dma::new(nvic.clone())));
+        let wdog_req = Arc::new(WdogResetReq::new());
         Ok(Self {
             cpu,
             bus: Arc::new(Mutex::new(Bus::new())),
             mpu: Arc::new(Mutex::new(Mpu::new())),
-            nvic,
+            nvic: nvic.clone(),
             events: Arc::new(Mutex::new(EventBus::new())),
             console: Arc::new(Mutex::new(Console::new())),
             clock: Arc::new(Mutex::new(VirtualClock::new())),
             timers: Arc::new(Mutex::new(Vec::new())),
             dma,
+            rcc: Arc::new(Mutex::new(Rcc::new())),
+            iwdg: Arc::new(Mutex::new(Iwdg::new(wdog_req.clone()))),
+            wwdg: Arc::new(Mutex::new(Wwdg::new(
+                nvic.clone(),
+                wdog_req.clone(),
+            ))),
+            wdog_req,
             initial_sp: 0,
             entry: 0,
         })
@@ -191,8 +208,8 @@ impl Machine {
             )));
         }
 
-        // RCC 存根
-        let rcc = Arc::new(Mutex::new(Rcc::new()));
+        // RCC（共享字段：看门狗复位时置 CSR 复位标志）
+        let rcc = self.rcc.clone();
         self.bus.lock().unwrap().attach(0x4002_3800, 0x400, "RCC", rcc)?;
 
         // GPIOA-E（port 0..4）
@@ -217,6 +234,16 @@ impl Machine {
         let dma = self.dma.clone();
         self.bus.lock().unwrap().attach(DMA1_BASE, 0x400, "DMA1", dma.clone())?;
         self.timers.lock().unwrap().push(dma);
+
+        // M4-看门狗：IWDG（独立，@0x40003000）+ WWDG（窗口，@0x40002C00）
+        // 共享复位请求：超时/违规 → block hook 停机 → run() 执行系统复位。
+        let iwdg = self.iwdg.clone();
+        self.bus.lock().unwrap().attach(0x4000_3000, 0x400, "IWDG", iwdg.clone())?;
+        self.timers.lock().unwrap().push(iwdg);
+
+        let wwdg = self.wwdg.clone();
+        self.bus.lock().unwrap().attach(0x4000_2C00, 0x400, "WWDG", wwdg.clone())?;
+        self.timers.lock().unwrap().push(wwdg);
 
         // M4-EXTI：SYSCFG（EXTICR 端口选择） + EXTI（外部中断，GPIO 事件 → NVIC）
         let port_select = Arc::new(Mutex::new(ExtiPortSelect::default()));
@@ -299,13 +326,17 @@ impl Machine {
     /// 1. block hook：每个基本块开头检查是否有更高优先级挂起中断，若有则
     ///    记录停机原因并停止执行（由 [`Machine::run`] 做异常入栈）；
     /// 2. intr hook：捕获 EXC_RETURN（intno=8）异常返回事件，出栈恢复现场。
+    ///
+    /// 看门狗复位：block hook 同时检查共享 [`WdogResetReq`]，有请求即停机
+    /// （不设置中断停机原因，由 [`Machine::run`] 识别复位请求并执行系统复位）。
     fn attach_interrupt_delivery(&mut self) -> Result<()> {
         // 1) block hook：挂起中断抢占检查 + 块级时钟推进（begin=1,end=0 全范围）
         let nvic = self.nvic.clone();
         let clock = self.clock.clone();
         let timers = self.timers.clone();
+        let wdog_req = self.wdog_req.clone();
         self.cpu.add_block_hook(1, 0, move |uc, _addr, size| {
-            // 块级加权周期推进虚拟时钟，并 tick 时钟外设（TIM2…）
+            // 块级加权周期推进虚拟时钟，并 tick 时钟外设（TIM2…，含 IWDG/WWDG）
             let cycles = size as u64 * AVG_CYCLES_PER_INS;
             {
                 let mut c = clock.lock().unwrap();
@@ -314,6 +345,11 @@ impl Machine {
                 for t in timers.iter() {
                     t.lock().unwrap().tick(cycles);
                 }
+            }
+            // 看门狗复位请求：停机（run() 消费请求并执行系统复位）
+            if wdog_req.is_pending() {
+                let _ = uc.emu_stop();
+                return;
             }
             // 挂起中断抢占检查
             let primask = uc.reg_read(RegisterARM::PRIMASK).unwrap_or(0) != 0;
@@ -413,13 +449,20 @@ impl Machine {
     /// 执行期间：
     /// - 触发 MPU MemManage fault → 返回 [`CoreError::MemManageFault`]；
     /// - 挂起中断抢占（block hook 停机）→ 异常入栈并进入 handler；
-    /// - 异常返回（EXC_RETURN，intr hook 停机）→ 现场已恢复，继续。
+    /// - 异常返回（EXC_RETURN，intr hook 停机）→ 现场已恢复，继续；
+    /// - 看门狗复位请求（block hook 停机）→ 记录 RCC_CSR 复位标志 + 系统复位，继续。
     /// `count` 以线程模式指令计：每次 emu_start 命中 `remaining` 即结束。
     pub fn run(&mut self, count: usize) -> Result<()> {
         let remaining = count;
         while remaining > 0 {
             let pc = self.cpu.reg_read_u32(RegisterARM::PC)?;
             self.cpu.emu_start(pc as u64, 0, 0, remaining)?;
+
+            // 看门狗复位请求优先处理：置 CSR 复位标志 + 系统复位（回到复位向量）
+            if let Some(reason) = self.wdog_req.take() {
+                self.system_reset(reason)?;
+                continue;
+            }
 
             // MPU 违规优先返回
             if let Some(f) = self.mpu.lock().unwrap().pending_fault() {
@@ -439,6 +482,26 @@ impl Machine {
                 StopReason::None => break, // 达到指令数上限
             }
         }
+        Ok(())
+    }
+
+    /// 系统复位（看门狗超时/违规触发）：置 RCC_CSR 复位标志，CPU 回到复位向量。
+    ///
+    /// 与 [`Machine::reset`] 不同，这里保留已加载的固件（仅重设 SP/PC），
+    /// 不重载向量表——复位后固件重新从 Reset_Handler 执行。
+    fn system_reset(&mut self, reason: ResetReason) -> Result<()> {
+        // 1) 置 RCC_CSR 复位标志（IWDGRSTF/WWDGRSTF），供固件/测试查询复位原因
+        self.rcc.lock().unwrap().record_reset(reason);
+
+        // 2) 复位看门狗外设（硬件系统复位会停止/复位看门狗；
+        //    否则 IWDG 保持使能且 down=0，复位后每个块立即再次超时 → 死循环）
+        self.iwdg.lock().unwrap().reset();
+        self.wwdg.lock().unwrap().reset();
+
+        // 3) CPU 回到复位向量（SP/PC 重设，等效硬件复位入口）
+        self.reset()?;
+
+        log::info!("看门狗复位：{reason:?} → 系统复位（CSR 复位标志已置位）");
         Ok(())
     }
 

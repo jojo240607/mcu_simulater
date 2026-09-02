@@ -14,6 +14,7 @@ pub mod scb;
 pub mod syscfg;
 pub mod timer;
 pub mod usart;
+pub mod wdog;
 
 /// 总线访问错误
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

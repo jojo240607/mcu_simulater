@@ -11,6 +11,7 @@
 //! 固件经 MMIO read hook 读到的是真实寄存器（含联动位）；测试用 CPU mem_read 读到的是
 //! guest 镜像（固件写入的原始值），故对 RDY/SWS 这类状态位应在固件内观察后写入结果区。
 
+use crate::peripheral::wdog::ResetReason;
 use crate::peripheral::{BusError, Peripheral};
 
 /// HSI 内部 RC 振荡器频率
@@ -53,6 +54,16 @@ const CR_HSERDY: u32 = 1 << 17;
 const CR_PLLON: u32 = 1 << 24;
 const CR_PLLRDY: u32 = 1 << 25;
 
+/// CSR 复位标志位（F407 硬件位）
+/// - bit28 IWDGRSTF：独立看门狗复位标志
+/// - bit27 WWDGRSTF：窗口看门狗复位标志
+/// - bit24 RMVF：清除复位标志（写 1 清除全部复位标志）
+const CSR_IWDGRSTF: u32 = 1 << 28;
+const CSR_WWDGRSTF: u32 = 1 << 27;
+const CSR_RMVF: u32 = 1 << 24;
+/// 全部复位标志（RMVF 写 1 时清除这些位）
+const CSR_RESET_FLAGS: u32 = CSR_IWDGRSTF | CSR_WWDGRSTF;
+
 /// 时钟树推导结果（Hz）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockTree {
@@ -82,6 +93,21 @@ impl Rcc {
         };
         r.reset();
         r
+    }
+
+    /// 记录一次看门狗复位原因（置对应 CSR 复位标志位，供固件/测试查询）。
+    pub fn record_reset(&mut self, reason: ResetReason) {
+        let csr = self.regs[(OFF_CSR / 4) as usize];
+        let flag = match reason {
+            ResetReason::Iwdg => CSR_IWDGRSTF,
+            ResetReason::Wwdg => CSR_WWDGRSTF,
+        };
+        self.regs[(OFF_CSR / 4) as usize] = csr | flag;
+    }
+
+    /// 读取 CSR（供测试/固件查询复位标志）。
+    pub fn csr(&self) -> u32 {
+        self.regs[(OFF_CSR / 4) as usize]
     }
 
     /// 推导当前时钟树。`sysclk` 按 SWS（实际生效源）计算，而非 SW（请求源）。
@@ -168,6 +194,13 @@ impl Peripheral for Rcc {
         }
         let idx = (offset / 4) as usize;
         let slot = self.regs.get_mut(idx).ok_or(BusError::OutOfRange)?;
+        // CSR 只读（除 RMVF 写 1 清除复位标志）：不直接存值
+        if offset == OFF_CSR {
+            if value & CSR_RMVF != 0 {
+                *slot &= !CSR_RESET_FLAGS;
+            }
+            return Ok(());
+        }
         *slot = value;
         match offset {
             // CR：HSEON/PLLON 置位 → HSERDY/PLLRDY 立即置位（简化立即就绪），清位随之清除
