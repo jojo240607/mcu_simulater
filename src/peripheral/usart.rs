@@ -177,6 +177,17 @@ impl Usart {
     }
 }
 
+/// DMA 外设方向搬运接口实现（复用 inherent `dma_read_dr`/`dma_write_dr` 语义）。
+impl crate::peripheral::dma::DmaByteIo for Usart {
+    fn dma_read_dr(&mut self) -> u8 {
+        self.dma_read_dr()
+    }
+
+    fn dma_write_dr(&mut self, byte: u8) {
+        self.dma_write_dr(byte);
+    }
+}
+
 impl Peripheral for Usart {
     fn name(&self) -> &str {
         "USART"

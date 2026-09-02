@@ -16,6 +16,12 @@ pub enum Event {
     UartRx { port: u8, byte: u8 },
     /// UART DMA 请求（USART → DMA 控制器，触发外设↔内存搬运）
     UartDma { port: u8, dir: DmaDir },
+    /// I2C 发送一字节（I2C TX → 虚拟从机/测试订阅）
+    I2cByte { port: u8, byte: u8 },
+    /// I2C 接收一字节（测试/虚拟从机 → I2C RX，驱动 RxNE）
+    I2cRx { port: u8, byte: u8 },
+    /// I2C DMA 请求（I2C → DMA 控制器，触发外设↔内存搬运）
+    I2cDma { port: u8, dir: DmaDir },
     /// GPIO 电平变化
     GpioLevel { port: u8, pin: u8, level: bool },
     /// 占位：其它事件后续按需扩展

@@ -7,6 +7,7 @@ pub mod console;
 pub mod dma;
 pub mod exti;
 pub mod gpio;
+pub mod i2c;
 pub mod mpu;
 pub mod nvic;
 pub mod rcc;

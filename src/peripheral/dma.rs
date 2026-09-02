@@ -34,6 +34,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::core::Cpu;
+use crate::peripheral::i2c::I2c;
 use crate::peripheral::nvic::Nvic;
 use crate::peripheral::usart::Usart;
 use crate::peripheral::{BusError, Peripheral};
@@ -63,6 +64,26 @@ impl DmaDir {
             DmaDir::MemToPeriph => 1,
         }
     }
+}
+
+/// 外设方向 DMA 搬运目标（区分不同外设类型，供 service_stream/process 选择句柄表）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmaTarget {
+    /// USART 外设（port 1..6，DMA 经 [`Usart::dma_read_dr`]/[`Usart::dma_write_dr`] 读写 DR）
+    Usart(u8),
+    /// I2C 外设（port 1..3，DMA 经 [`I2c::dma_read_dr`]/[`I2c::dma_write_dr`] 读写 DR）
+    I2c(u8),
+}
+
+/// 外设方向 DMA 搬运接口：DR 读写（供 DMA `process` 搬运外设↔内存）。
+///
+/// USART/I2C 等数据寄存器型外设实现，`service_stream` 登记的流在 process 中
+/// 经该接口直接读写 DR，绕开 Unicorn CPU 内存 API 不触发 MMIO hook 的限制。
+pub trait DmaByteIo: Send {
+    /// 外设 → 内存（RX）：读数据寄存器并清接收标志
+    fn dma_read_dr(&mut self) -> u8;
+    /// 内存 → 外设（TX）：写数据寄存器（外设侧发送一字节）
+    fn dma_write_dr(&mut self, byte: u8);
 }
 
 /// CR 控制位
@@ -107,10 +128,12 @@ pub struct Dma {
     pending_transfer: u32,
     /// 各流待搬运项数（tick 完成时记录，process 消费）
     pending_items: [u32; 8],
-    /// 各流待搬运的 USART 端口（0 = 非外设方向/未登记）
-    pending_port: [u8; 8],
+    /// 各流待搬运的外设目标（None = 内存方向/未登记）
+    pending_target: [Option<DmaTarget>; 8],
     /// 注册的 USART 句柄（index 0..5 = USART1..6，外设方向搬运直接读写 DR）
     usart_handles: [Option<Arc<Mutex<Usart>>>; 6],
+    /// 注册的 I2C 句柄（index 0..2 = I2C1..3，外设方向搬运直接读写 DR）
+    i2c_handles: [Option<Arc<Mutex<I2c>>>; 3],
 }
 
 impl Dma {
@@ -122,8 +145,9 @@ impl Dma {
             nvic,
             pending_transfer: 0,
             pending_items: [0; 8],
-            pending_port: [0; 8],
+            pending_target: [None; 8],
             usart_handles: Default::default(),
+            i2c_handles: Default::default(),
         }
     }
 
@@ -136,12 +160,21 @@ impl Dma {
         }
     }
 
-    /// 处理 USART 发布的 DMA 请求（经 [`crate::events::Event::UartDma`] 路由）。
+    /// 注册 I2C 句柄（供外设方向搬运读写 DR）。
+    ///
+    /// Machine 挂载 I2C1-3 时对 DMA1 调用；`port` 取值 1..3（I2C DMA 全在 DMA1）。
+    pub fn register_i2c(&mut self, port: u8, i2c: Arc<Mutex<I2c>>) {
+        if (1..=3).contains(&port) {
+            self.i2c_handles[(port - 1) as usize] = Some(i2c);
+        }
+    }
+
+    /// 处理外设发布的 DMA 请求（经 [`crate::events::Event::UartDma`]/[`Event::I2cDma`] 路由）。
     ///
     /// 校验流 CR：EN 置位、CHSEL 与请求通道一致、DIR 与请求方向一致后登记待搬运。
-    /// - 外设→内存（RX）：每收 1 字节触发 1 次搬运（USART 每字节发 1 次请求）；
+    /// - 外设→内存（RX）：每收 1 字节触发 1 次搬运（外设每字节发 1 次请求）；
     /// - 内存→外设（TX）：TXE 就绪一次搬运整个 NDTR（仿真快速发送一次完成）。
-    pub fn service_stream(&mut self, stream: usize, channel: u32, dir: DmaDir, port: u8) {
+    pub fn service_stream(&mut self, stream: usize, channel: u32, dir: DmaDir, target: DmaTarget) {
         let cr = self.stream_reg(stream, 0);
         let ndtr = self.stream_reg(stream, 1);
         if cr & CR_EN == 0 {
@@ -162,7 +195,7 @@ impl Dma {
         }
         self.pending_transfer |= 1 << stream;
         self.pending_items[stream] = items;
-        self.pending_port[stream] = port;
+        self.pending_target[stream] = Some(target);
     }
 
     /// 状态位所属中断状态寄存器索引（低 4 流 → LISR，高 4 流 → HISR）
@@ -245,38 +278,52 @@ impl Dma {
                 continue;
             }
 
-            // 外设方向：经已注册 USART 句柄读写 DR（内存侧走 CPU 内存 API）
-            let port = self.pending_port[s];
-            let handle = self
-                .usart_handles
-                .get((port as usize).wrapping_sub(1))
-                .and_then(|h| h.clone());
-            let Some(usart) = handle else {
+            // 外设方向：经已注册外设句柄读写 DR（内存侧走 CPU 内存 API）。
+            // 按 DmaTarget 选句柄表（USART/I2C 同接口 [`DmaByteIo`]）。
+            let Some(target) = self.pending_target[s] else {
+                self.pending_transfer &= !(1 << s); // 未登记目标（配置异常）：跳过
+                continue;
+            };
+            let handle: Option<Arc<Mutex<dyn DmaByteIo>>> = match target {
+                DmaTarget::Usart(port) => self
+                    .usart_handles
+                    .get((port as usize).wrapping_sub(1))
+                    .and_then(|h| h.clone())
+                    .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),
+                DmaTarget::I2c(port) => self
+                    .i2c_handles
+                    .get((port as usize).wrapping_sub(1))
+                    .and_then(|h| h.clone())
+                    .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),
+            };
+            let Some(dev) = handle else {
                 self.pending_transfer &= !(1 << s); // 未注册句柄（配置异常）：跳过
                 continue;
             };
             let ndtr = self.stream_reg(s, 1);
             let new_ndtr = ndtr.saturating_sub(items);
+            let mut dev = dev.lock().unwrap();
             if dir == 1 {
-                // 内存 → 外设（TX）：M0AR → USART DR
+                // 内存 → 外设（TX）：M0AR → 外设 DR
                 for _ in 0..items {
                     if let Ok(data) = cpu.mem_read(dst as u64, mw) {
-                        usart.lock().unwrap().dma_write_dr(data[0]);
+                        dev.dma_write_dr(data[0]);
                     }
                     if minc {
                         dst += mw as u32;
                     }
                 }
             } else {
-                // 外设 → 内存（RX）：USART DR → M0AR
+                // 外设 → 内存（RX）：外设 DR → M0AR
                 for _ in 0..items {
-                    let byte = usart.lock().unwrap().dma_read_dr();
+                    let byte = dev.dma_read_dr();
                     let _ = cpu.mem_write(dst as u64, &[byte]);
                     if minc {
                         dst += mw as u32;
                     }
                 }
             }
+            drop(dev);
             // MINC 地址回写：下次搬运从续接地址开始（外设方向 PAR 固定，仅回写 M0AR）
             self.set_stream_reg(s, 3, dst);
             self.set_stream_reg(s, 1, new_ndtr);

@@ -19,6 +19,7 @@ use crate::peripheral::terminal::Terminal;
 use crate::peripheral::dma::{Dma, DmaDir, DMA1_BASE, DMA1_STREAM_IRQ, DMA2_BASE, DMA2_STREAM_IRQ};
 use crate::peripheral::exti::{Exti, EXTI_BASE};
 use crate::peripheral::gpio::Gpio;
+use crate::peripheral::i2c::{I2c, I2C1_EV_IRQ, I2C2_EV_IRQ, I2C3_EV_IRQ};
 use crate::peripheral::mpu::{Access, MemManageFault, Mpu};
 use crate::peripheral::nvic::{Nvic, StopReason};
 use crate::peripheral::rcc::Rcc;
@@ -267,7 +268,49 @@ impl Machine {
                                     6 => (dma2.clone(), 1, 5),
                                     _ => return,
                                 };
-                                ctrl.lock().unwrap().service_stream(stream, channel, DmaDir::PeriphToMem, *p);
+                                ctrl.lock().unwrap().service_stream(stream, channel, DmaDir::PeriphToMem, crate::peripheral::dma::DmaTarget::Usart(*p));
+                            }
+                        }
+                    }
+                },
+            )));
+        }
+
+        // I2C1-3（port 1..3；DMA 模式：接 NVIC EV IRQ + 订阅 I2cRx 喂 RX）
+        for (port, base, irq_ev) in [
+            (1u8, 0x4000_5400u32, I2C1_EV_IRQ),
+            (2, 0x4000_5800, I2C2_EV_IRQ),
+            (3, 0x4000_5C00, I2C3_EV_IRQ),
+        ] {
+            let i2c = Arc::new(Mutex::new(I2c::new(port, events.clone(), self.nvic.clone(), irq_ev)));
+            self.bus
+                .lock()
+                .unwrap()
+                .attach(base, 0x400, format!("I2C{port}"), i2c.clone())?;
+            // 注册 I2C 句柄到 DMA1（I2C DMA 全在 DMA1，外设方向搬运经句柄直接读写 DR）
+            self.dma.lock().unwrap().register_i2c(port, i2c.clone());
+            // 测试/虚拟从机发布 I2cRx → 对应端口 feed_rx；
+            // RX DMA 请求在 feed_rx 之后直接路由（不能在 feed_rx 内二次 publish，
+            // 否则事件分发回调中同线程重入 events.lock() 死锁，见 [`I2c::dma_rx_pending`]）
+            let i = i2c.clone();
+            let dma1 = self.dma.clone();
+            events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+                move |ev: &Event| {
+                    if let Event::I2cRx { port: p, byte } = ev {
+                        if *p == i.lock().unwrap().port {
+                            i.lock().unwrap().feed_rx(*byte);
+                            if i.lock().unwrap().dma_rx_pending() {
+                                // 外设→内存：DMAEN 使能且 RxNE 置位 → 登记 DMA 搬运
+                                //（映射与 I2cDma 订阅一致，F407 HAL 默认流）
+                                let (stream, channel) = match *p {
+                                    1 => (0, 1), // I2C1_RX: DMA1_Stream0_Channel1
+                                    2 => (3, 7), // I2C2_RX: DMA1_Stream3_Channel7
+                                    3 => (2, 3), // I2C3_RX: DMA1_Stream2_Channel3
+                                    _ => return,
+                                };
+                                dma1.lock()
+                                    .unwrap()
+                                    .service_stream(stream, channel, DmaDir::PeriphToMem, crate::peripheral::dma::DmaTarget::I2c(*p));
                             }
                         }
                     }
@@ -317,7 +360,34 @@ impl Machine {
                         (6, DmaDir::PeriphToMem) => (dma2.clone(), 1, 5),
                         _ => return,
                     };
-                    ctrl.lock().unwrap().service_stream(stream, channel, *dir, *port);
+                    ctrl.lock()
+                        .unwrap()
+                        .service_stream(stream, channel, *dir, crate::peripheral::dma::DmaTarget::Usart(*port));
+                }
+            },
+        )));
+
+        // I2C DMA 请求路由（F407 固定映射：port + 方向 → DMA1_StreamN_ChannelM，
+        // 采用 HAL 默认流，见 stm32f4xx_hal_i2c.c I2C_DMA_GetConfig）。
+        let dma1 = self.dma.clone();
+        events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+            move |ev: &Event| {
+                if let Event::I2cDma { port, dir } = ev {
+                    let (stream, channel) = match (*port, *dir) {
+                        // I2C1：DMA1_Stream6_Channel1(TX) / DMA1_Stream0_Channel1(RX)
+                        (1, DmaDir::MemToPeriph) => (6, 1),
+                        (1, DmaDir::PeriphToMem) => (0, 1),
+                        // I2C2：DMA1_Stream7_Channel7(TX) / DMA1_Stream3_Channel7(RX)
+                        (2, DmaDir::MemToPeriph) => (7, 7),
+                        (2, DmaDir::PeriphToMem) => (3, 7),
+                        // I2C3：DMA1_Stream4_Channel3(TX) / DMA1_Stream2_Channel3(RX)
+                        (3, DmaDir::MemToPeriph) => (4, 3),
+                        (3, DmaDir::PeriphToMem) => (2, 3),
+                        _ => return,
+                    };
+                    dma1.lock()
+                        .unwrap()
+                        .service_stream(stream, channel, *dir, crate::peripheral::dma::DmaTarget::I2c(*port));
                 }
             },
         )));
