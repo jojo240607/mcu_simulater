@@ -1,37 +1,44 @@
-// M4 demo 固件：验证 DMA2 内存到内存（MEM2MEM）传输 + 传输完成中断。
+// M4 demo 固件：验证 DMA2 四流并发内存到内存（MEM2MEM）传输 + 各自完成中断。
 //
-// 场景（与 dma_demo 完全同构，仅换 DMA2 + IRQ56）：
-// 1. 测试在 SRAM 固定地址预置源数组 SRC（0x20000100，16 个字）；
-// 2. 固件配置 DMA2 Stream0：PAR=SRC（源）、M0AR=DST（目标，0x20000200）、
-//    NDTR=16、字宽（PSIZE=MSIZE=字）、PINC+MINC 地址递增、DIR=内存到内存、
-//    TCIE=1，最后写 CR.EN=1 启动；
-// 3. 仿真器首个块 tick 判定传输完成：置 TCIF、挂起 IRQ56（DMA2_Stream0）、
-//    run 间隙执行真实内存搬运（SRC → DST）；
-// 4. DMA2_Stream0_IRQHandler：校验 DST==SRC → G_DMA_OK；清 LIFCR.TCIF0 → G_DMA_TC++；
-// 5. 主线轮询 G_DMA_TC 达 1 后写完成标记 G_DONE。
+// 场景（四流 Stream0-3 同一 tick 并发完成，互不干扰）：
+// 1. 测试在 SRAM 固定地址预置 4 段源数组 SRC0-3（0x20000100..0x200001C0，各 16 字）；
+// 2. 固件配置 DMA2 Stream0-3（每条流：PAR=SRCn、M0AR=DSTn、NDTR=16、字宽、
+//    PINC+MINC、DIR=内存到内存、TCIE=1，最后写 CR.EN=1 同时启动）；
+// 3. 仿真器首个块 tick 遍历 8 流判定完成：各自置 TCIF、按流挂起 IRQ56-59，
+//    run 间隙按 pending 位图逐流执行真实内存搬运（SRCn → DSTn）；
+// 4. 四个 handler 各自校验 DSTn==SRCn → G_DMA_OK 置对应位；清 LIFCR.TCIFn → G_DMA_TC++；
+// 5. 主线轮询 G_DMA_TC 达 4 后写完成标记 G_DONE。
 //
 // 固定地址结果区（供仿真器校验）：
-//   0x20000000 G_DMA_TC  DMA 完成中断执行次数（期望 1）
-//   0x20000004 G_DMA_OK  DST==SRC 校验结果（期望 1）
+//   0x20000000 G_DMA_TC  DMA 完成中断执行次数（期望 4）
+//   0x20000004 G_DMA_OK  各流 DST==SRC 校验位图（bit0-3，期望 0xF）
 //   0x20000008 G_DONE    主线完成标记（期望 0xAAAAAAAA）
-//   0x20000100 SRC       源数组（测试预置 16 字）
-//   0x20000200 DST       目标数组（DMA 搬运，仿真器直接校验）
+//   0x20000100 SRC0      流0 源数组（测试预置 16 字）
+//   0x20000140 SRC1      流1 源数组
+//   0x20000180 SRC2      流2 源数组
+//   0x200001C0 SRC3      流3 源数组
+//   0x20000200 DST0      流0 目标数组（DMA 搬运，仿真器直接校验）
+//   0x20000240 DST1      流1 目标数组
+//   0x20000280 DST2      流2 目标数组
+//   0x200002C0 DST3      流3 目标数组
 
 #include <stdint.h>
 
-/* DMA2 @ 0x40026400 */
-#define DMA2_LIFCR (*(volatile uint32_t *)0x40026408u) /* TCIF0 = bit5 */
-#define DMA2_S0CR  (*(volatile uint32_t *)0x40026410u)
-#define DMA2_S0NDTR (*(volatile uint32_t *)0x40026414u)
-#define DMA2_S0PAR (*(volatile uint32_t *)0x40026418u)
-#define DMA2_S0M0AR (*(volatile uint32_t *)0x4002641Cu)
+/* DMA2 @ 0x40026400：LIFCR@0x08（TCIFs 偏移 s%4*6+5，写 1 清除）；
+   流 s 寄存器基址 0x40026410 + s*0x18 */
+#define DMA2_LIFCR (*(volatile uint32_t *)0x40026408u)
+#define DMA2_STREAM(s) ((volatile uint32_t *)(0x40026410u + (s) * 0x18u))
+#define DMA2_SsCR(s)  DMA2_STREAM(s)[0]
+#define DMA2_SsNDTR(s) DMA2_STREAM(s)[1]
+#define DMA2_SsPAR(s) DMA2_STREAM(s)[2]
+#define DMA2_SsM0AR(s) DMA2_STREAM(s)[3]
 
-/* NVIC（SCB 基址 0xE000E000）：IRQ56 = DMA2_Stream0
-   ISER1 @ 0xE000E104 bit24（56-32）；IPR14 @ 0xE000E438 字节0（56%4=0 → bits0..7） */
+/* NVIC（SCB 基址 0xE000E000）：IRQ56-59 = DMA2_Stream0-3
+   ISER1 @ 0xE000E104 bit24-27（56-59-32）；IPR14 @ 0xE000E438 字节0-3（56%4=0） */
 #define NVIC_ISER1 (*(volatile uint32_t *)0xE000E104u)
 #define NVIC_IPR14 (*(volatile uint32_t *)0xE000E438u)
 
-/* DMA2 Stream0 CR 位（F407，与 DMA1 相同） */
+/* DMA2 Stream CR 位（F407，与 DMA1 相同） */
 #define DMA_CR_EN    (1u << 0)
 #define DMA_CR_TCIE  (1u << 5)
 #define DMA_CR_DIR_MM (2u << 6)   /* 内存到内存 */
@@ -40,9 +47,9 @@
 #define DMA_CR_PSIZE_W (2u << 11) /* 字 */
 #define DMA_CR_MSIZE_W (2u << 13) /* 字 */
 
-/* 数据区（固定 SRAM 地址） */
-#define SRC ((volatile const uint32_t *)0x20000100u)
-#define DST ((volatile uint32_t *)0x20000200u)
+/* 数据区（固定 SRAM 地址）：流 s 的 SRC/DST */
+#define SRC(s) ((volatile const uint32_t *)(0x20000100u + (s) * 0x40u))
+#define DST(s) ((volatile uint32_t *)(0x20000200u + (s) * 0x40u))
 #define NUM_WORDS 16
 
 /* 结果区 */
@@ -52,6 +59,9 @@
 
 extern void Reset_Handler(void);
 void DMA2_Stream0_IRQHandler(void);
+void DMA2_Stream1_IRQHandler(void);
+void DMA2_Stream2_IRQHandler(void);
+void DMA2_Stream3_IRQHandler(void);
 
 static void Default_Handler(void) {
     for (;;) {}
@@ -68,7 +78,17 @@ static void dma_done_hook(void) {
     __asm volatile("nop" ::: "memory");
 }
 
-/* 向量表：系统异常 + IRQ0..IRQ70（DMA2_Stream0 = IRQ56 → index 72，Stream5-7 → index 84-86） */
+/* 逐字校验 DSTn == SRCn */
+static uint32_t verify_stream(uint32_t s) {
+    for (uint32_t i = 0u; i < NUM_WORDS; i++) {
+        if (DST(s)[i] != SRC(s)[i]) {
+            return 0u;
+        }
+    }
+    return 1u;
+}
+
+/* 向量表：系统异常 + IRQ0..IRQ70（DMA2 Stream0-3 = IRQ56-59 → index 72-75，Stream5-7 → index 84-86） */
 __attribute__((section(".isr_vector"), used))
 const uint32_t vector_table[] = {
     0x20001000u,               /* 0: 初始 SP（SRAM 内） */
@@ -144,9 +164,9 @@ const uint32_t vector_table[] = {
     (uint32_t)Default_Handler, /* 70 */
     (uint32_t)Default_Handler, /* 71 */
     (uint32_t)DMA2_Stream0_IRQHandler, /* 72: IRQ56 = DMA2_Stream0 */
-    (uint32_t)Default_Handler, /* 73: IRQ57 = DMA2_Stream1 */
-    (uint32_t)Default_Handler, /* 74: IRQ58 = DMA2_Stream2 */
-    (uint32_t)Default_Handler, /* 75: IRQ59 = DMA2_Stream3 */
+    (uint32_t)DMA2_Stream1_IRQHandler, /* 73: IRQ57 = DMA2_Stream1 */
+    (uint32_t)DMA2_Stream2_IRQHandler, /* 74: IRQ58 = DMA2_Stream2 */
+    (uint32_t)DMA2_Stream3_IRQHandler, /* 75: IRQ59 = DMA2_Stream3 */
     (uint32_t)Default_Handler, /* 76: IRQ60 = DMA2_Stream4 */
     (uint32_t)Default_Handler, /* 77 */
     (uint32_t)Default_Handler, /* 78 */
@@ -161,37 +181,56 @@ const uint32_t vector_table[] = {
 };
 
 void DMA2_Stream0_IRQHandler(void) {
-    /* 校验 DST == SRC */
-    uint32_t ok = 1u;
-    for (uint32_t i = 0u; i < NUM_WORDS; i++) {
-        if (DST[i] != SRC[i]) {
-            ok = 0u;
-            break;
-        }
+    if (verify_stream(0u)) {
+        G_DMA_OK |= (1u << 0);
     }
-    G_DMA_OK = ok;
-
     DMA2_LIFCR = (1u << 5); /* 写 1 清除 TCIF0 */
     G_DMA_TC++;
 }
 
+void DMA2_Stream1_IRQHandler(void) {
+    if (verify_stream(1u)) {
+        G_DMA_OK |= (1u << 1);
+    }
+    DMA2_LIFCR = (1u << 11); /* 写 1 清除 TCIF1 */
+    G_DMA_TC++;
+}
+
+void DMA2_Stream2_IRQHandler(void) {
+    if (verify_stream(2u)) {
+        G_DMA_OK |= (1u << 2);
+    }
+    DMA2_LIFCR = (1u << 17); /* 写 1 清除 TCIF2 */
+    G_DMA_TC++;
+}
+
+void DMA2_Stream3_IRQHandler(void) {
+    if (verify_stream(3u)) {
+        G_DMA_OK |= (1u << 3);
+    }
+    DMA2_LIFCR = (1u << 23); /* 写 1 清除 TCIF3 */
+    G_DMA_TC++;
+}
+
 void Reset_Handler(void) {
-    /* 1. IRQ56（DMA2_Stream0）优先级 + 使能；IPR14 字节0（bits0..7）= 15 */
-    NVIC_IPR14 = 0xFu << 0;
-    NVIC_ISER1 = (1u << 24);
+    /* 1. IRQ56-59（DMA2_Stream0-3）优先级 + 使能；IPR14 字节0-3 全 15 */
+    NVIC_IPR14 = 0xFFFFFFFFu;
+    NVIC_ISER1 = (1u << 24) | (1u << 25) | (1u << 26) | (1u << 27);
     __asm volatile("cpsie i" ::: "memory");
 
-    /* 2. 配置 DMA2 Stream0：MEM2MEM 16 字，PAR=SRC → M0AR=DST，地址递增 */
-    DMA2_S0PAR = (uint32_t)SRC;
-    DMA2_S0M0AR = (uint32_t)DST;
-    DMA2_S0NDTR = NUM_WORDS;
-    DMA2_S0CR = DMA_CR_EN | DMA_CR_TCIE | DMA_CR_DIR_MM |
-                DMA_CR_PINC | DMA_CR_MINC | DMA_CR_PSIZE_W | DMA_CR_MSIZE_W;
+    /* 2. 配置 DMA2 Stream0-3：MEM2MEM 各 16 字，PAR=SRCn → M0AR=DSTn，地址递增 */
+    for (uint32_t s = 0u; s < 4u; s++) {
+        DMA2_SsPAR(s) = (uint32_t)SRC(s);
+        DMA2_SsM0AR(s) = (uint32_t)DST(s);
+        DMA2_SsNDTR(s) = NUM_WORDS;
+        DMA2_SsCR(s) = DMA_CR_EN | DMA_CR_TCIE | DMA_CR_DIR_MM |
+                       DMA_CR_PINC | DMA_CR_MINC | DMA_CR_PSIZE_W | DMA_CR_MSIZE_W;
+    }
 
     dma_ready_hook();
 
-    /* 3. 主循环：等待 DMA 完成中断（handler 递增 G_DMA_TC） */
-    while (G_DMA_TC == 0u) {}
+    /* 3. 主循环：等待四条流完成中断（handler 各递增 G_DMA_TC） */
+    while (G_DMA_TC != 4u) {}
     dma_done_hook();
     G_DONE = 0xAAAAAAAAu;
 
