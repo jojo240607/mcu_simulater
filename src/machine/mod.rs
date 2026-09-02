@@ -13,9 +13,20 @@ use unicorn_engine::{HookType, MemType, Prot, RegisterARM, Unicorn};
 
 use crate::bus::Bus;
 use crate::core::{CoreError, Cpu, Result};
+use crate::events::{Event, EventBus};
+use crate::peripheral::console::Console;
+use crate::peripheral::gpio::Gpio;
 use crate::peripheral::mpu::{Access, MemManageFault, Mpu};
 use crate::peripheral::nvic::{Nvic, StopReason};
+use crate::peripheral::rcc::Rcc;
 use crate::peripheral::scb::SystemControl;
+use crate::peripheral::timer::Tim2;
+use crate::peripheral::usart::Usart;
+use crate::peripheral::{Peripheral};
+use crate::sim::timing::VirtualClock;
+
+/// 块级加权周期的平均周期/指令（见 [`crate::sim::timing::BlockWeighted`]）
+const AVG_CYCLES_PER_INS: u64 = 3;
 
 /// 一台仿真的 MCU
 pub struct Machine {
@@ -27,6 +38,14 @@ pub struct Machine {
     pub mpu: Arc<Mutex<Mpu>>,
     /// NVIC（嵌套向量中断控制器，挂载于 SCB 窗口，中断投递 hook 共享）
     pub nvic: Arc<Mutex<Nvic>>,
+    /// 事件总线（虚拟外设互联，M3）
+    pub events: Arc<Mutex<EventBus>>,
+    /// 虚拟 Console（订阅 UART TX，M3）
+    pub console: Arc<Mutex<Console>>,
+    /// 共享虚拟时钟（block hook 推进，供 TIM 等外设 tick）
+    pub clock: Arc<Mutex<VirtualClock>>,
+    /// 时钟外设列表（block hook 按块 tick 推进）
+    timers: Arc<Mutex<Vec<Arc<Mutex<dyn Peripheral>>>>>,
     /// 初始 SP（向量表首字）
     pub initial_sp: u32,
     /// 复位向量（向量表第二字，含 Thumb 位处理见 [`Machine::reset`]）
@@ -42,13 +61,17 @@ impl Machine {
             bus: Arc::new(Mutex::new(Bus::new())),
             mpu: Arc::new(Mutex::new(Mpu::new())),
             nvic: Arc::new(Mutex::new(Nvic::new())),
+            events: Arc::new(Mutex::new(EventBus::new())),
+            console: Arc::new(Mutex::new(Console::new())),
+            clock: Arc::new(Mutex::new(VirtualClock::new())),
+            timers: Arc::new(Mutex::new(Vec::new())),
             initial_sp: 0,
             entry: 0,
         })
     }
 
-    /// 映射 STM32F407VET6 基础内存布局（FLASH + SRAM1/SRAM2 + CCM + SCB）。
-    /// M3 起由 DSL 配置驱动，此处为 M0/M1 固化布局。
+    /// 映射 STM32F407VET6 基础内存布局（FLASH + SRAM1/SRAM2 + CCM + SCB + T1 外设区）。
+    /// M3 起由 DSL 配置驱动，此处为 M0/M1/M2 固化布局 + M3 T1 外设集。
     pub fn map_stm32f407_layout(&mut self) -> Result<()> {
         self.cpu.mem_map(0x0800_0000, 0x0008_0000, Prot::ALL)?; // FLASH 512KB
         self.cpu.mem_map(0x2000_0000, 0x0002_0000, Prot::ALL)?; // SRAM1+SRAM2 128KB
@@ -57,6 +80,8 @@ impl Machine {
         // 仍映射为普通内存避免读写异常，同时由 mem hook 转发到总线上的 SCB 外设。
         self.cpu.mem_map(0xE000_E000, 0x0000_1000, Prot::ALL)?;
         self.attach_system_control()?;
+        // M3 T1 外设集：GPIOA-E + USART1-3 + TIM2 + RCC 存根
+        self.attach_t1_peripherals()?;
         Ok(())
     }
 
@@ -133,14 +158,130 @@ impl Machine {
         Ok(())
     }
 
+    /// 挂载 M3 T1 外设集：GPIOA-E + USART1-3 + TIM2 + RCC 存根 + 虚拟 Console。
+    ///
+    /// 外设区 0x40000000..0x40024000 通过 mem hook 转发到总线（MPU 检查 + 读注入），
+    /// 与 SCB 窗口相同的 MMIO 链路。TIM2 加入时钟外设列表由 block hook 推进。
+    fn attach_t1_peripherals(&mut self) -> Result<()> {
+        // 外设区整体映射（含 AHB1 GPIO/RCC、APB1 TIM2/USART2-3、APB2 USART1）
+        let periph_base: u64 = 0x4000_0000;
+        let periph_size: u64 = 0x24000;
+        self.cpu.mem_map(periph_base, periph_size, Prot::ALL)?;
+
+        // 事件互联：USART TX → Console（默认连接，等价 connect uart.tx -> console.rx）
+        let events = self.events.clone();
+        let console = self.console.clone();
+        {
+            let c = console.clone();
+            events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+                move |ev: &Event| {
+                    if let Event::UartByte { byte, .. } = ev {
+                        c.lock().unwrap().write_byte(*byte);
+                    }
+                },
+            )));
+        }
+
+        // RCC 存根
+        let rcc = Arc::new(Mutex::new(Rcc::new()));
+        self.bus.lock().unwrap().attach(0x4002_3800, 0x400, "RCC", rcc)?;
+
+        // GPIOA-E（port 0..4）
+        for port in 0..5u8 {
+            let gpio = Arc::new(Mutex::new(Gpio::new(port, events.clone())));
+            let base = 0x4002_0000 + (port as u32) * 0x400;
+            self.bus.lock().unwrap().attach(base, 0x400, format!("GPIO{}", (b'A' + port) as char), gpio)?;
+        }
+
+        // USART1-3（port 1/2/3）
+        for (port, base) in [(1u8, 0x4001_1000u32), (2, 0x4000_4400), (3, 0x4000_4800)] {
+            let uart = Arc::new(Mutex::new(Usart::new(port, events.clone())));
+            self.bus.lock().unwrap().attach(base, 0x400, format!("USART{port}"), uart)?;
+        }
+
+        // TIM2（tick 推进 + 溢出 → NVIC IRQ28）
+        let tim2 = Arc::new(Mutex::new(Tim2::new(self.nvic.clone())));
+        self.bus.lock().unwrap().attach(0x4000_0000, 0x400, "TIM2", tim2.clone())?;
+        self.timers.lock().unwrap().push(tim2);
+
+        // 外设区 MMIO 转发 hook（MPU 检查 + 读注入 / 写转发）
+        let bus = self.bus.clone();
+        let mpu = self.mpu.clone();
+        self.cpu.add_mmio_hook(periph_base, periph_base + periph_size, move |uc, ty, addr, size, value| {
+            let fault = {
+                let m = mpu.lock().unwrap();
+                match mem_type_to_access(ty) {
+                    Some(access) => m.check(addr as u32, access, cpu_privileged(uc)).err(),
+                    None => None,
+                }
+            };
+            if let Some(f) = fault {
+                fault_and_stop(uc, &mpu, f);
+                return true;
+            }
+            match ty {
+                MemType::READ => {
+                    if let Ok(v) = bus.lock().unwrap().read(addr as u32, size as u32) {
+                        let _ = uc.mem_write(addr, &v.to_le_bytes()[..size]);
+                    }
+                }
+                MemType::WRITE => {
+                    let _ = bus.lock().unwrap().write(addr as u32, size as u32, value as u32);
+                }
+                _ => {}
+            }
+            false
+        })?;
+
+        log::info!("T1 外设已挂载：GPIOA-E + USART1-3 + TIM2 + RCC + Console @ 0x{periph_base:08X} +0x{periph_size:X}");
+        Ok(())
+    }
+
+    /// 外设互联（类 Renode `connect` 语法，M3 DSL 入口）。
+    ///
+    /// 当前支持 `uart.tx -> console.rx`：把指定 USART 端口的 TX 字节
+    /// 事件订阅到虚拟 Console 的接收。
+    pub fn connect(&mut self, src: ConnectSource, dst: ConnectTarget) -> Result<()> {
+        match (src, dst) {
+            (ConnectSource::UartTx(port), ConnectTarget::ConsoleRx) => {
+                let events = self.events.clone();
+                let console = self.console.clone();
+                let c = console.clone();
+                events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+                    move |ev: &Event| {
+                        if let Event::UartByte { port: p, byte } = ev {
+                            if *p == port {
+                                c.lock().unwrap().write_byte(*byte);
+                            }
+                        }
+                    },
+                )));
+                Ok(())
+            }
+        }
+    }
+
     /// 中断投递 hook：
     /// 1. block hook：每个基本块开头检查是否有更高优先级挂起中断，若有则
     ///    记录停机原因并停止执行（由 [`Machine::run`] 做异常入栈）；
     /// 2. intr hook：捕获 EXC_RETURN（intno=8）异常返回事件，出栈恢复现场。
     fn attach_interrupt_delivery(&mut self) -> Result<()> {
-        // 1) block hook：挂起中断抢占检查（begin=1,end=0 全范围）
+        // 1) block hook：挂起中断抢占检查 + 块级时钟推进（begin=1,end=0 全范围）
         let nvic = self.nvic.clone();
-        self.cpu.add_block_hook(1, 0, move |uc, _addr, _size| {
+        let clock = self.clock.clone();
+        let timers = self.timers.clone();
+        self.cpu.add_block_hook(1, 0, move |uc, _addr, size| {
+            // 块级加权周期推进虚拟时钟，并 tick 时钟外设（TIM2…）
+            let cycles = size as u64 * AVG_CYCLES_PER_INS;
+            {
+                let mut c = clock.lock().unwrap();
+                c.advance(cycles);
+                let timers = timers.lock().unwrap();
+                for t in timers.iter() {
+                    t.lock().unwrap().tick(cycles);
+                }
+            }
+            // 挂起中断抢占检查
             let primask = uc.reg_read(RegisterARM::PRIMASK).unwrap_or(0) != 0;
             let basepri = (uc.reg_read(RegisterARM::BASEPRI).unwrap_or(0) & 0xF) as u8;
             let mut n = nvic.lock().unwrap();
@@ -500,4 +641,18 @@ fn exception_return<'b>(
         if return_to_thread { "回线程" } else { "回 handler" }
     );
     Ok(())
+}
+
+/// 外设互联源端（类 Renode `connect` 左侧）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectSource {
+    /// USART 端口的 TX 事件
+    UartTx(u8),
+}
+
+/// 外设互联目标端（类 Renode `connect` 右侧）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectTarget {
+    /// 虚拟 Console 接收
+    ConsoleRx,
 }

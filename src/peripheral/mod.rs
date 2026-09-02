@@ -3,9 +3,14 @@
 //! 任何外设实现 [`Peripheral`] trait 即可挂载到内存总线。
 //! M0 仅定义接口，M1 落地总线转发链路，具体外设（GPIO/UART/TIM/NVIC/MPU…）在 M2/M3 实现。
 
+pub mod console;
+pub mod gpio;
 pub mod mpu;
 pub mod nvic;
+pub mod rcc;
 pub mod scb;
+pub mod timer;
+pub mod usart;
 
 /// 总线访问错误
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

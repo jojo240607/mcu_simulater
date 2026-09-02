@@ -23,8 +23,7 @@
 /* NVIC 寄存器（STM32F407，绝对地址；SCB 基址 0xE000E000） */
 #define NVIC_ISER0 (*(volatile uint32_t *)0xE000E100u)
 #define NVIC_ISPR0 (*(volatile uint32_t *)0xE000E200u)
-#define NVIC_IPR0  (*(volatile uint32_t *)0xE000E400u)
-#define NVIC_IPR1  (*(volatile uint32_t *)0xE000E404u)
+#define NVIC_IPR0  (*(volatile uint32_t *)0xE000E400u) /* 每字节一个 IRQ：byte0=IRQ0, byte1=IRQ1 */
 
 /* 结果区（固定 SRAM 地址） */
 #define G_COUNT0 (*(volatile uint32_t *)0x20000000u)
@@ -88,9 +87,8 @@ void IRQ1_Handler(void) {
 }
 
 void Reset_Handler(void) {
-    /* IRQ0 优先级 5（高），IRQ1 优先级 10（低） */
-    NVIC_IPR0 = 0x5u;
-    NVIC_IPR1 = 0xAu;
+    /* IRQ0 优先级 5（高），IRQ1 优先级 10（低）；IPR0 每字节一个 IRQ */
+    NVIC_IPR0 = 0x00000A05u;
     NVIC_ISER0 = (1u << 0) | (1u << 1); /* 使能 IRQ0/IRQ1 */
     __asm volatile("cpsie i" ::: "memory");
 

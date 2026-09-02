@@ -52,9 +52,12 @@ fn decode(offset: u32) -> Option<(RegBank, usize)> {
         return None;
     }
     let off = offset - NVIC_WIN_START;
-    // IPR：0x300 + 4*irq（字对齐，每 IRQ 一字节）
-    if (0x300..0x300 + 4 * NVIC_IRQ_COUNT as u32).contains(&off) && off % 4 == 0 {
-        return Some((RegBank::Ipr, ((off - 0x300) / 4) as usize));
+    // IPR：0x300 + 4*word，每字 4 字节、每字节一个 IRQ（IRQ = word*4 + byte）
+    // 与硬件一致：IPR0 @ 0xE000E400 含 IRQ0..3，IPR7 @ 0xE000E41C 含 IRQ28..31。
+    let ipr_words = NVIC_IRQ_COUNT.div_ceil(4); // 82 → 21 字
+    if (0x300..0x300 + 4 * ipr_words as u32).contains(&off) && off % 4 == 0 {
+        let word = (off - 0x300) / 4;
+        return Some((RegBank::Ipr, (word * 4) as usize)); // 返回该字起始 IRQ
     }
     let (bank, base) = match off & 0x380 {
         0x00 => (RegBank::Iser, 0x00),
@@ -245,7 +248,17 @@ impl Nvic {
             Some((RegBank::Ispr, w)) => Ok(self.pending[w]),
             Some((RegBank::Icpr, w)) => Ok(self.pending[w]),
             Some((RegBank::Iabr, w)) => Ok(self.active[w]),
-            Some((RegBank::Ipr, irq)) => Ok(self.priority[irq] as u32),
+            Some((RegBank::Ipr, irq_base)) => {
+                // 每字 4 字节、每字节一个 IRQ（超出 IRQ 上限的字节读 0）
+                let mut v = 0u32;
+                for i in 0..4 {
+                    let irq = irq_base + i;
+                    if irq < NVIC_IRQ_COUNT {
+                        v |= (self.priority[irq] as u32 & 0xF) << (8 * i);
+                    }
+                }
+                Ok(v)
+            }
             None => Err(BusError::OutOfRange),
         }
     }
@@ -272,8 +285,14 @@ impl Nvic {
                 Ok(())
             }
             Some((RegBank::Iabr, _)) => Ok(()), // 只读
-            Some((RegBank::Ipr, irq)) => {
-                self.priority[irq] = (value & 0xFF) as u8 & 0xF;
+            Some((RegBank::Ipr, irq_base)) => {
+                // 每字节一个 IRQ，低 4 位有效；超上限字节丢弃
+                for i in 0..4 {
+                    let irq = irq_base + i;
+                    if irq < NVIC_IRQ_COUNT {
+                        self.priority[irq] = ((value >> (8 * i)) & 0xFF) as u8 & 0xF;
+                    }
+                }
                 Ok(())
             }
             None => Err(BusError::OutOfRange),
@@ -324,9 +343,10 @@ mod tests {
     #[test]
     fn priority_selection() {
         let mut n = Nvic::new();
-        // IRQ0 优先级 5（数值小=优先级高），IRQ1 优先级 10
-        n.write(NVIC_WIN_START + 0x300, 4, 0x0000_0005).unwrap(); // IPR0
-        n.write(NVIC_WIN_START + 0x304, 4, 0x0000_000A).unwrap(); // IPR1
+        // IPR 每字节一个 IRQ：IRQ0 优先级 5（数值小=优先级高），IRQ1 优先级 10
+        n.write(NVIC_WIN_START + 0x300, 4, 0x0000_0A05).unwrap(); // IPR0: byte0=IRQ0(5), byte1=IRQ1(10)
+        assert_eq!(n.priority(0), 5);
+        assert_eq!(n.priority(1), 10);
         n.write(NVIC_WIN_START + 0x00, 4, 0x3).unwrap(); // ISER0 使能 0/1
         n.write(NVIC_WIN_START + 0x100, 4, 0x3).unwrap(); // ISPR0 挂起 0/1
 

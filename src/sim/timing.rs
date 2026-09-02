@@ -36,3 +36,20 @@ impl CycleModel for BlockWeighted {
         self.avg_cycles_per_insn
     }
 }
+
+/// 共享虚拟时钟（M3：block hook 按块推进，供 TIM/SysTick 等外设 `tick`）。
+#[derive(Debug, Default)]
+pub struct VirtualClock {
+    /// 已推进的虚拟周期数
+    pub cycles: u64,
+}
+
+impl VirtualClock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn advance(&mut self, cycles: u64) {
+        self.cycles += cycles;
+    }
+}
