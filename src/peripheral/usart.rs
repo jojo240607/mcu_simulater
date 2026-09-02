@@ -6,8 +6,8 @@
 //! - RX：虚拟终端/测试发布 [`crate::events::Event::UartRx`] → [`Usart::feed_rx`]：
 //!   UE+RE 时锁存 DR、置 RXNE（RXNE 已置位再来字节 → ORE）；RXNEIE 置挂起 NVIC 中断；
 //!   读 DR 清 RXNE；ORE 写 0 清除（rc_w0）；
-//! - 中断：RXNEIE/TCIE/TXEIE 置挂起，NVIC IRQ 映射 USART1-3 = IRQ37-39；
-//!   CR1 中断使能位拉高而标志已置位时立即挂起（寄存器写副作用，硬件语义）。
+//! - 中断：RXNEIE/TCIE/TXEIE 置挂起，NVIC IRQ 映射 USART1-3 = IRQ37-39、UART4/5 = IRQ52/53、
+//!   USART6 = IRQ71；CR1 中断使能位拉高而标志已置位时立即挂起（寄存器写副作用，硬件语义）。
 //!
 //! 地址映射（每个 USART 基址不同，`offset` 为相对基址偏移）：
 //! - SR 0x00 / DR 0x04 / BRR 0x08 / CR1 0x0C / CR2 0x10 / CR3 0x14 / GTPR 0x18
@@ -22,6 +22,9 @@ use crate::peripheral::{BusError, Peripheral};
 pub const USART1_IRQ: u32 = 37;
 pub const USART2_IRQ: u32 = 38;
 pub const USART3_IRQ: u32 = 39;
+pub const UART4_IRQ: u32 = 52;
+pub const UART5_IRQ: u32 = 53;
+pub const USART6_IRQ: u32 = 71;
 
 /// SR 状态位
 const SR_TXE: u32 = 1 << 7;  // 发送数据寄存器空
@@ -44,9 +47,9 @@ const OFF_CR1: u32 = 0x0C;
 
 /// USART 外设
 pub struct Usart {
-    /// USART 端口号（1/2/3），用于事件过滤
+    /// USART 端口号（1/2/3/4/5/6），用于事件过滤
     pub port: u8,
-    /// NVIC IRQ 编号（USART1-3 = 37-39）
+    /// NVIC IRQ 编号（USART1-3=37-39、UART4/5=52/53、USART6=71）
     irq: u32,
     /// 寄存器文件（SR/DR/BRR/CR1/CR2/CR3/GTPR）
     regs: [u32; 7],

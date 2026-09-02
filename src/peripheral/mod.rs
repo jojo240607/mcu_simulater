@@ -12,6 +12,7 @@ pub mod nvic;
 pub mod rcc;
 pub mod scb;
 pub mod syscfg;
+pub mod terminal;
 pub mod timer;
 pub mod usart;
 pub mod wdog;

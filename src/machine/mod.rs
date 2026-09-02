@@ -15,6 +15,7 @@ use crate::bus::Bus;
 use crate::core::{CoreError, Cpu, Result};
 use crate::events::{Event, EventBus};
 use crate::peripheral::console::Console;
+use crate::peripheral::terminal::Terminal;
 use crate::peripheral::dma::{Dma, DMA1_BASE, DMA1_STREAM_IRQ, DMA2_BASE, DMA2_STREAM_IRQ};
 use crate::peripheral::exti::{Exti, EXTI_BASE};
 use crate::peripheral::gpio::Gpio;
@@ -24,7 +25,7 @@ use crate::peripheral::rcc::Rcc;
 use crate::peripheral::scb::SystemControl;
 use crate::peripheral::syscfg::{ExtiPortSelect, Syscfg};
 use crate::peripheral::timer::Tim2;
-use crate::peripheral::usart::{Usart, USART1_IRQ, USART2_IRQ, USART3_IRQ};
+use crate::peripheral::usart::{Usart, USART1_IRQ, USART2_IRQ, USART3_IRQ, UART4_IRQ, UART5_IRQ, USART6_IRQ};
 use crate::peripheral::wdog::{Iwdg, ResetReason, WdogResetReq, Wwdg};
 use crate::peripheral::{Peripheral};
 use crate::sim::timing::VirtualClock;
@@ -46,6 +47,8 @@ pub struct Machine {
     pub events: Arc<Mutex<EventBus>>,
     /// 虚拟 Console（订阅 UART TX，M3）
     pub console: Arc<Mutex<Console>>,
+    /// 虚拟终端（M5：双向接线对象，显示缓冲 + 键盘 → UartRx）
+    pub terminal: Arc<Mutex<Terminal>>,
     /// 共享虚拟时钟（block hook 推进，供 TIM 等外设 tick）
     pub clock: Arc<Mutex<VirtualClock>>,
     /// 时钟外设列表（block hook 按块 tick 推进）
@@ -75,13 +78,15 @@ impl Machine {
         let dma = Arc::new(Mutex::new(Dma::new(nvic.clone(), "DMA1", DMA1_STREAM_IRQ)));
         let dma2 = Arc::new(Mutex::new(Dma::new(nvic.clone(), "DMA2", DMA2_STREAM_IRQ)));
         let wdog_req = Arc::new(WdogResetReq::new());
+        let events = Arc::new(Mutex::new(EventBus::new()));
         Ok(Self {
             cpu,
             bus: Arc::new(Mutex::new(Bus::new())),
             mpu: Arc::new(Mutex::new(Mpu::new())),
             nvic: nvic.clone(),
-            events: Arc::new(Mutex::new(EventBus::new())),
+            events: events.clone(),
             console: Arc::new(Mutex::new(Console::new())),
+            terminal: Arc::new(Mutex::new(Terminal::new(events))),
             clock: Arc::new(Mutex::new(VirtualClock::new())),
             timers: Arc::new(Mutex::new(Vec::new())),
             dma,
@@ -186,7 +191,7 @@ impl Machine {
         Ok(())
     }
 
-    /// 挂载外设集：GPIOA-E + USART1-3 + TIM2 + RCC 存根 + SYSCFG/EXTI + 虚拟 Console。
+    /// 挂载外设集：GPIOA-E + USART1-6 + TIM2 + RCC 存根 + SYSCFG/EXTI + 虚拟 Console/Terminal。
     ///
     /// 外设区 0x40000000..0x40024000 通过 mem hook 转发到总线（MPU 检查 + 读注入），
     /// 与 SCB 窗口相同的 MMIO 链路。TIM2 加入时钟外设列表由 block hook 推进；
@@ -222,11 +227,14 @@ impl Machine {
             self.bus.lock().unwrap().attach(base, 0x400, format!("GPIO{}", (b'A' + port) as char), gpio)?;
         }
 
-        // USART1-3（port 1/2/3；M5 串口仿真：接 NVIC IRQ37-39 + 订阅 UartRx 喂 RX）
+        // USART1-6（port 1..6；M5 串口仿真：接 NVIC IRQ37-39/52/53/71 + 订阅 UartRx 喂 RX）
         for (port, base, irq) in [
             (1u8, 0x4001_1000u32, USART1_IRQ),
             (2, 0x4000_4400, USART2_IRQ),
             (3, 0x4000_4800, USART3_IRQ),
+            (4, 0x4000_4C00, UART4_IRQ),
+            (5, 0x4000_5000, UART5_IRQ),
+            (6, 0x4001_1400, USART6_IRQ),
         ] {
             let uart = Arc::new(Mutex::new(Usart::new(port, events.clone(), self.nvic.clone(), irq)));
             self.bus
@@ -319,14 +327,18 @@ impl Machine {
             false
         })?;
 
-        log::info!("T1 外设已挂载：GPIOA-E + USART1-3 + TIM2 + RCC + SYSCFG/EXTI + DMA1/DMA2 + Console @ 0x{periph_base:08X} +0x{periph_size:X}");
+        log::info!("T1 外设已挂载：GPIOA-E + USART1-6 + TIM2 + RCC + SYSCFG/EXTI + DMA1/DMA2 + Console/Terminal @ 0x{periph_base:08X} +0x{periph_size:X}");
         Ok(())
     }
 
     /// 外设互联（类 Renode `connect` 语法，M3 DSL 入口）。
     ///
-    /// 当前支持 `uart.tx -> console.rx`：把指定 USART 端口的 TX 字节
-    /// 事件订阅到虚拟 Console 的接收。
+    /// 当前支持：
+    /// - `uart.tx -> console.rx`：把指定 USART 端口的 TX 字节事件订阅到虚拟 Console；
+    /// - `uart.tx -> terminal.rx`：把指定 USART 端口的 TX 字节事件订阅到虚拟终端显示。
+    ///
+    /// 反向（终端键盘 → UART RX）由 [`crate::peripheral::terminal::Terminal::type_char`]
+    /// 发布 `UartRx` 事件、USART 全局订阅完成，无需显式 connect。
     pub fn connect(&mut self, src: ConnectSource, dst: ConnectTarget) -> Result<()> {
         match (src, dst) {
             (ConnectSource::UartTx(port), ConnectTarget::ConsoleRx) => {
@@ -338,6 +350,21 @@ impl Machine {
                         if let Event::UartByte { port: p, byte } = ev {
                             if *p == port {
                                 c.lock().unwrap().write_byte(*byte);
+                            }
+                        }
+                    },
+                )));
+                Ok(())
+            }
+            (ConnectSource::UartTx(port), ConnectTarget::TerminalRx) => {
+                let events = self.events.clone();
+                let terminal = self.terminal.clone();
+                let t = terminal.clone();
+                events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+                    move |ev: &Event| {
+                        if let Event::UartByte { port: p, byte } = ev {
+                            if *p == port {
+                                t.lock().unwrap().write_display(*byte);
                             }
                         }
                     },
@@ -781,4 +808,6 @@ pub enum ConnectSource {
 pub enum ConnectTarget {
     /// 虚拟 Console 接收
     ConsoleRx,
+    /// 虚拟终端接收（显示）
+    TerminalRx,
 }
