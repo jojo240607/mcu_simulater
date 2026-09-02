@@ -1,0 +1,342 @@
+//! DMA1 直接内存访问控制器（STM32F407，M4）。
+//!
+//! M4 语义（内存到内存端到端）：
+//! - 寄存器文件镜像：LISR/HISR/LIFCR/HIFCR + 8 流 × (CR/NDTR/PAR/M0AR/M1AR/FCR)；
+//! - [`Peripheral::tick`]：对 EN 且 DIR=内存到内存（bit7:6=10）的流，首个 tick 判定
+//!   传输完成——NDTR 清零、LISR/HISR.TCIF 置位、TCIE 使能时向共享 NVIC 置挂起
+//!   （DMA1_StreamN 中断，见 [`DMA1_STREAM_IRQ`]）、EN 自动清零，
+//!   并把流登记到“待搬运”位图；
+//! - [`Dma::process`]：Machine::run 在 CPU 空闲间隙（每次 emu_start 返回后）调用，
+//!   对登记流执行真实内存搬运（PAR → M0AR，按 PSIZE 读 / 按 MSIZE 写，
+//!   PINC/MINC 地址递增）。CPU 空闲时 Unicorn 内存访问不触发 MMIO hook，故仅支持
+//!   纯内存目标（SRAM/Flash），外设目标（如 USART DR）留待后续；
+//! - 状态位 rc_w1：写 LIFCR/HIFCR 对应位 = 1 清除 LISR/HISR。
+//!
+//! 地址映射（offset 相对 DMA1 基址 0x40026000）：
+//! - LISR 0x00 / HISR 0x04 / LIFCR 0x08 / HIFCR 0x0C
+//! - S0CR 0x10, S0NDTR 0x14, S0PAR 0x18, S0M0AR 0x1C, S0M1AR 0x20, S0FCR 0x24；
+//!   流间隔 0x18（S1@0x28 … S7@0xD0）。
+//! 状态位每流 6 位（FEIF=0, DMEIF=2, TEIF=3, HTIF=4, TCIF=5），低 4 流在 LISR/LIFCR、
+//! 高 4 流在 HISR/HIFCR，流内偏移 = (流 % 4) × 6。
+
+use std::sync::{Arc, Mutex};
+
+use crate::core::Cpu;
+use crate::peripheral::nvic::Nvic;
+use crate::peripheral::{BusError, Peripheral};
+
+/// DMA1 基址
+pub const DMA1_BASE: u32 = 0x4002_6000;
+/// DMA1 各流中断号（Stream0..7）
+pub const DMA1_STREAM_IRQ: [u32; 8] = [11, 12, 13, 14, 24, 25, 26, 27];
+
+/// CR 控制位
+const CR_EN: u32 = 1 << 0; // 使能
+const CR_TCIE: u32 = 1 << 5; // 传输完成中断使能
+const CR_PINC: u32 = 1 << 9; // 外设地址递增
+const CR_MINC: u32 = 1 << 10; // 内存地址递增
+// DIR bit7:6：00=外设→内存, 01=内存→外设, 10=内存→内存
+const CR_DIR_MM: u32 = 2 << 6;
+
+/// 状态位
+const FLAG_TCIF: u32 = 5; // 传输完成
+
+/// 寄存器偏移
+const OFF_LISR: u32 = 0x00;
+const OFF_HISR: u32 = 0x04;
+const OFF_LIFCR: u32 = 0x08;
+const OFF_HIFCR: u32 = 0x0C;
+const OFF_CR: u32 = 0x10; // S0CR 起始；流间隔 0x18
+
+/// 寄存器文件总长（4 + 8 × 6 = 52 个 32 位寄存器）
+const REG_COUNT: usize = 52;
+
+/// 流 s 的 CR 在 regs 中的索引（S0CR@0x10 → idx 4）
+fn stream_cr_idx(s: usize) -> usize {
+    (OFF_CR as usize / 4) + s * 6
+}
+
+/// DMA1 外设
+pub struct Dma {
+    /// 寄存器文件
+    regs: [u32; REG_COUNT],
+    /// 共享 NVIC（传输完成 → 置挂起对应流中断）
+    nvic: Arc<Mutex<Nvic>>,
+    /// 待搬运流位图（tick 判定完成，run 间隙 process 执行搬运）
+    pending_transfer: u32,
+    /// 各流待搬运项数（tick 完成时记录，process 消费）
+    pending_items: [u32; 8],
+}
+
+impl Dma {
+    pub fn new(nvic: Arc<Mutex<Nvic>>) -> Self {
+        Self {
+            regs: [0; REG_COUNT],
+            nvic,
+            pending_transfer: 0,
+            pending_items: [0; 8],
+        }
+    }
+
+    /// 状态位所属中断状态寄存器索引（低 4 流 → LISR，高 4 流 → HISR）
+    fn isr_idx(s: usize) -> usize {
+        if s < 4 {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// 流 s 状态位在 ISR/IFCR 内的偏移（流内 6 位）
+    fn flag_offset(s: usize) -> u32 {
+        ((s % 4) as u32) * 6
+    }
+
+    /// 置位流状态位
+    fn set_stream_flag(&mut self, s: usize, flag: u32) {
+        self.regs[Self::isr_idx(s)] |= 1u32 << (Self::flag_offset(s) + flag);
+    }
+
+    /// 读流寄存器
+    fn stream_reg(&self, s: usize, sub: usize) -> u32 {
+        self.regs[stream_cr_idx(s) + sub]
+    }
+
+    /// 写流寄存器
+    fn set_stream_reg(&mut self, s: usize, sub: usize, value: u32) {
+        self.regs[stream_cr_idx(s) + sub] = value;
+    }
+
+    /// 执行登记流的内存搬运（PAR → M0AR）。
+    ///
+    /// 仅在 CPU 空闲间隙由 Machine 调用；一次搬运 `items` 项，
+    /// 按 PSIZE（源）/MSIZE（目标）取宽，PINC/MINC 决定地址递增。
+    pub fn process(&mut self, cpu: &mut Cpu) {
+        let mut mask = self.pending_transfer;
+        while mask != 0 {
+            let s = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let items = std::mem::take(&mut self.pending_items[s]);
+            if items == 0 {
+                self.pending_transfer &= !(1 << s);
+                continue;
+            }
+            let cr = self.stream_reg(s, 0);
+            let psize = ((cr >> 11) & 0x3) as usize; // 0=字节,1=半字,2=字
+            let msize = ((cr >> 13) & 0x3) as usize;
+            let pw = 1usize << psize;
+            let mw = 1usize << msize;
+            let pinc = cr & CR_PINC != 0;
+            let minc = cr & CR_MINC != 0;
+            let mut src = self.stream_reg(s, 2); // PAR
+            let mut dst = self.stream_reg(s, 3); // M0AR
+            let mut buf = [0u8; 4];
+            for _ in 0..items {
+                if let Ok(data) = cpu.mem_read(src as u64, pw) {
+                    buf[..pw].copy_from_slice(&data[..pw]);
+                    let _ = cpu.mem_write(dst as u64, &buf[..mw]);
+                }
+                if pinc {
+                    src += pw as u32;
+                }
+                if minc {
+                    dst += mw as u32;
+                }
+            }
+            self.pending_transfer &= !(1 << s);
+        }
+    }
+}
+
+impl Peripheral for Dma {
+    fn name(&self) -> &str {
+        "DMA1"
+    }
+
+    fn read(&mut self, offset: u32, size: u32) -> Result<u32, BusError> {
+        if size != 4 {
+            return Err(BusError::NotImplemented);
+        }
+        let idx = (offset / 4) as usize;
+        if idx < REG_COUNT {
+            // LIFCR/HIFCR 只写（rc_w1），读回 0
+            if idx == (OFF_LIFCR / 4) as usize || idx == (OFF_HIFCR / 4) as usize {
+                return Ok(0);
+            }
+            Ok(self.regs[idx])
+        } else {
+            Err(BusError::OutOfRange)
+        }
+    }
+
+    fn write(&mut self, offset: u32, size: u32, value: u32) -> Result<(), BusError> {
+        if size != 4 {
+            return Err(BusError::NotImplemented);
+        }
+        let idx = (offset / 4) as usize;
+        match idx {
+            // LISR/HISR 只读：忽略写
+            i if i == (OFF_LISR / 4) as usize || i == (OFF_HISR / 4) as usize => Ok(()),
+            // LIFCR/HIFCR：写 1 清除 LISR/HISR 对应位（rc_w1）
+            i if i == (OFF_LIFCR / 4) as usize => {
+                self.regs[0] &= !value;
+                Ok(())
+            }
+            i if i == (OFF_HIFCR / 4) as usize => {
+                self.regs[1] &= !value;
+                Ok(())
+            }
+            i if i < REG_COUNT => {
+                self.regs[i] = value;
+                Ok(())
+            }
+            _ => Err(BusError::OutOfRange),
+        }
+    }
+
+    fn tick(&mut self, _cycles: u64) {
+        for s in 0..8usize {
+            let cr = self.stream_reg(s, 0);
+            if cr & CR_EN == 0 {
+                continue;
+            }
+            // M4 仅支持内存到内存（DIR=10）
+            if (cr >> 6) & 0x3 != CR_DIR_MM >> 6 {
+                continue;
+            }
+            // 一次性完成：NDTR 清零、TCIF 置位、EN 自动清零、登记待搬运
+            let ndtr = self.stream_reg(s, 1);
+            self.set_stream_reg(s, 1, 0);
+            self.set_stream_reg(s, 0, cr & !CR_EN);
+            self.set_stream_flag(s, FLAG_TCIF);
+            if cr & CR_TCIE != 0 {
+                self.nvic.lock().unwrap().set_pending(DMA1_STREAM_IRQ[s]);
+            }
+            if ndtr != 0 {
+                self.pending_transfer |= 1 << s;
+                self.pending_items[s] = ndtr;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicorn_engine::Prot;
+
+    fn dma() -> Dma {
+        let nvic = Arc::new(Mutex::new(Nvic::new()));
+        Dma::new(nvic)
+    }
+
+    /// 便利：把 CR/NDTR/PAR/M0AR 写入流 0
+    fn cfg_stream(d: &mut Dma, cr: u32, ndtr: u32, par: u32, m0ar: u32) {
+        d.write(OFF_CR, 4, cr).unwrap();
+        d.write(OFF_CR + 4, 4, ndtr).unwrap();
+        d.write(OFF_CR + 8, 4, par).unwrap();
+        d.write(OFF_CR + 0x0C, 4, m0ar).unwrap();
+    }
+
+    #[test]
+    fn register_layout_and_flag_position() {
+        let mut d = dma();
+        // 流 3 的 TCIF 在 LISR bit 5+18=23；流 4 的 TCIF 在 HISR bit5
+        for s in [3usize, 4] {
+            let base = OFF_CR + s as u32 * 0x18;
+            d.write(base, 4, CR_EN | CR_DIR_MM | CR_TCIE).unwrap();
+            d.write(base + 4, 4, 2).unwrap();
+            d.write(base + 8, 4, 0x2000_0100).unwrap();
+            d.write(base + 0x0C, 4, 0x2000_0200).unwrap();
+        }
+        d.tick(1);
+        assert_eq!(d.regs[0] & (1 << 23), 1 << 23, "Stream3 TCIF 应在 LISR bit23");
+        assert_eq!(d.regs[1] & (1 << 5), 1 << 5, "Stream4 TCIF 应在 HISR bit5");
+        assert_eq!(d.regs[0] & (1 << 5), 0, "Stream0 未使能不置 LISR bit5");
+    }
+
+    #[test]
+    fn tick_completes_mem2mem_and_clears_en() {
+        let mut d = dma();
+        cfg_stream(&mut d, CR_EN | CR_DIR_MM | CR_TCIE, 8, 0x2000_0100, 0x2000_0200);
+        d.tick(1);
+        assert_eq!(d.stream_reg(0, 1), 0, "NDTR 完成后清零");
+        assert_eq!(d.stream_reg(0, 0) & CR_EN, 0, "EN 传输完成后自动清零");
+        assert_eq!(d.regs[0] & (1 << 5), 1 << 5, "Stream0 TCIF 置位");
+        assert_eq!(d.pending_transfer, 1 << 0, "流 0 登记待搬运");
+        assert_eq!(d.pending_items[0], 8, "待搬运 8 项");
+        // 二次 tick 不重复（EN 已清）
+        d.tick(1);
+        assert_eq!(d.pending_transfer, 1 << 0, "不重复登记");
+    }
+
+    #[test]
+    fn non_mem2mem_ignored() {
+        let mut d = dma();
+        // DIR=外设→内存（00）：tick 不完成
+        cfg_stream(&mut d, CR_EN | CR_TCIE, 8, 0x2000_0100, 0x2000_0200);
+        d.tick(1);
+        assert_eq!(d.pending_transfer, 0, "非 MEM2MEM 不登记搬运");
+        assert_eq!(d.regs[0] & (1 << 5), 0, "不置 TCIF");
+    }
+
+    #[test]
+    fn process_copies_word_mem2mem() {
+        let mut d = dma();
+        // MEM2MEM：PAR=源、M0AR=目标，PINC+MINC 地址递增，字宽
+        cfg_stream(
+            &mut d,
+            CR_EN | CR_DIR_MM | CR_PINC | CR_MINC | (2 << 13) | (2 << 11),
+            4,
+            0x2000_0100,
+            0x2000_0200,
+        );
+
+        let mut cpu = Cpu::new_m4f().unwrap();
+        cpu.mem_map(0x2000_0000, 0x4000, Prot::ALL).unwrap();
+        let src: [u32; 4] = [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+        for (i, v) in src.iter().enumerate() {
+            cpu.mem_write(0x2000_0100 + i as u64 * 4, &v.to_le_bytes()).unwrap();
+        }
+
+        d.tick(1); // 判定完成 + 登记
+        d.process(&mut cpu); // 空闲间隙搬运
+
+        for (i, v) in src.iter().enumerate() {
+            let got = cpu.mem_read(0x2000_0200 + i as u64 * 4, 4).unwrap();
+            assert_eq!(u32::from_le_bytes(got.try_into().unwrap()), *v, "dst[{i}] 应等于 src[{i}]");
+        }
+        assert_eq!(d.pending_transfer, 0, "搬运后位图清空");
+    }
+
+    #[test]
+    fn process_byte_mode_without_minc() {
+        let mut d = dma();
+        // PSIZE=MSIZE=字节(00)，PINC=1（源递增），MINC=0（目标固定）
+        cfg_stream(&mut d, CR_EN | CR_DIR_MM | CR_PINC, 3, 0x2000_0100, 0x2000_0200);
+
+        let mut cpu = Cpu::new_m4f().unwrap();
+        cpu.mem_map(0x2000_0000, 0x4000, Prot::ALL).unwrap();
+        cpu.mem_write(0x2000_0100, &[0xAA, 0xBB, 0xCC]).unwrap();
+
+        d.tick(1);
+        d.process(&mut cpu);
+
+        // 三次都写到固定目标 0x20000200，最后一次 0xCC
+        let got = cpu.mem_read(0x2000_0200, 1).unwrap();
+        assert_eq!(got[0], 0xCC, "MINC=0 时目标固定，最后写入 0xCC");
+    }
+
+    #[test]
+    fn lifcr_clears_tcif() {
+        let mut d = dma();
+        cfg_stream(&mut d, CR_EN | CR_DIR_MM, 2, 0x2000_0100, 0x2000_0200);
+        d.tick(1);
+        assert_eq!(d.regs[0] & (1 << 5), 1 << 5);
+        // 写 LIFCR bit5 = 1 清除 LISR.TCIF0
+        d.write(OFF_LIFCR, 4, 1 << 5).unwrap();
+        assert_eq!(d.regs[0] & (1 << 5), 0, "LIFCR 写 1 应清除 TCIF0");
+        // 读 LIFCR 回 0
+        assert_eq!(d.read(OFF_LIFCR, 4).unwrap(), 0);
+    }
+}

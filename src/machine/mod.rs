@@ -15,6 +15,7 @@ use crate::bus::Bus;
 use crate::core::{CoreError, Cpu, Result};
 use crate::events::{Event, EventBus};
 use crate::peripheral::console::Console;
+use crate::peripheral::dma::{Dma, DMA1_BASE};
 use crate::peripheral::exti::{Exti, EXTI_BASE};
 use crate::peripheral::gpio::Gpio;
 use crate::peripheral::mpu::{Access, MemManageFault, Mpu};
@@ -48,6 +49,8 @@ pub struct Machine {
     pub clock: Arc<Mutex<VirtualClock>>,
     /// 时钟外设列表（block hook 按块 tick 推进）
     timers: Arc<Mutex<Vec<Arc<Mutex<dyn Peripheral>>>>>,
+    /// DMA1（tick 判传输完成；run 间隙 process 执行内存搬运）
+    dma: Arc<Mutex<Dma>>,
     /// 初始 SP（向量表首字）
     pub initial_sp: u32,
     /// 复位向量（向量表第二字，含 Thumb 位处理见 [`Machine::reset`]）
@@ -58,15 +61,18 @@ impl Machine {
     /// 创建 Cortex-M4F 机器
     pub fn new_m4f() -> Result<Self> {
         let cpu = Cpu::new_m4f()?;
+        let nvic = Arc::new(Mutex::new(Nvic::new()));
+        let dma = Arc::new(Mutex::new(Dma::new(nvic.clone())));
         Ok(Self {
             cpu,
             bus: Arc::new(Mutex::new(Bus::new())),
             mpu: Arc::new(Mutex::new(Mpu::new())),
-            nvic: Arc::new(Mutex::new(Nvic::new())),
+            nvic,
             events: Arc::new(Mutex::new(EventBus::new())),
             console: Arc::new(Mutex::new(Console::new())),
             clock: Arc::new(Mutex::new(VirtualClock::new())),
             timers: Arc::new(Mutex::new(Vec::new())),
+            dma,
             initial_sp: 0,
             entry: 0,
         })
@@ -166,9 +172,9 @@ impl Machine {
     /// 与 SCB 窗口相同的 MMIO 链路。TIM2 加入时钟外设列表由 block hook 推进；
     /// EXTI 订阅 GPIO 电平事件作为外部输入（M4）。
     fn attach_t1_peripherals(&mut self) -> Result<()> {
-        // 外设区整体映射（含 AHB1 GPIO/RCC、APB1 TIM2/USART2-3、APB2 USART1）
+        // 外设区整体映射（含 AHB1 GPIO/RCC/DMA、APB1 TIM2/USART2-3、APB2 USART1）
         let periph_base: u64 = 0x4000_0000;
-        let periph_size: u64 = 0x24000;
+        let periph_size: u64 = 0x40000; // 覆盖至 DMA2 区（0x40026400+0x400）
         self.cpu.mem_map(periph_base, periph_size, Prot::ALL)?;
 
         // 事件互联：USART TX → Console（默认连接，等价 connect uart.tx -> console.rx）
@@ -206,6 +212,11 @@ impl Machine {
         let tim2 = Arc::new(Mutex::new(Tim2::new(self.nvic.clone())));
         self.bus.lock().unwrap().attach(0x4000_0000, 0x400, "TIM2", tim2.clone())?;
         self.timers.lock().unwrap().push(tim2);
+
+        // M4-DMA1（MEM2MEM 传输 + TC 中断；tick 判完成，run 间隙 process 搬运）
+        let dma = self.dma.clone();
+        self.bus.lock().unwrap().attach(DMA1_BASE, 0x400, "DMA1", dma.clone())?;
+        self.timers.lock().unwrap().push(dma);
 
         // M4-EXTI：SYSCFG（EXTICR 端口选择） + EXTI（外部中断，GPIO 事件 → NVIC）
         let port_select = Arc::new(Mutex::new(ExtiPortSelect::default()));
@@ -256,7 +267,7 @@ impl Machine {
             false
         })?;
 
-        log::info!("T1 外设已挂载：GPIOA-E + USART1-3 + TIM2 + RCC + SYSCFG/EXTI + Console @ 0x{periph_base:08X} +0x{periph_size:X}");
+        log::info!("T1 外设已挂载：GPIOA-E + USART1-3 + TIM2 + RCC + SYSCFG/EXTI + DMA1 + Console @ 0x{periph_base:08X} +0x{periph_size:X}");
         Ok(())
     }
 
@@ -417,6 +428,9 @@ impl Machine {
                     kind: f.kind,
                 });
             }
+
+            // DMA 内存搬运：CPU 空闲间隙执行（tick 已把完成流登记到待搬运位图）
+            self.dma.lock().unwrap().process(&mut self.cpu);
 
             let reason = self.nvic.lock().unwrap().take_stop_reason();
             match reason {
