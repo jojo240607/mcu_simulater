@@ -13,7 +13,9 @@
 use std::sync::{Arc, Mutex};
 
 use super::mpu::{MMFAR_OFF, MMFSR_OFF, MPU_WIN_END, MPU_WIN_START, Mpu};
-use super::nvic::{NVIC_WIN_END, NVIC_WIN_START, Nvic};
+use super::nvic::{
+    AIRCR_OFF, NVIC_WIN_END, NVIC_WIN_START, SHPR1_OFF, SHPR_END, Nvic,
+};
 use super::{BusError, Peripheral};
 
 /// 该偏移是否属于 MPU 委托窗口（MMFSR/MMFAR + MPU 寄存器区间）
@@ -26,6 +28,11 @@ fn is_mpu_offset(offset: u32) -> bool {
 /// 该偏移是否属于 NVIC 委托窗口（0xE100-0xE4FF）
 fn is_nvic_offset(offset: u32) -> bool {
     offset >= NVIC_WIN_START && offset < NVIC_WIN_END
+}
+
+/// 该偏移是否属于 NVIC 额外委托（AIRCR 优先级分组 + SHPR 系统异常优先级）
+fn is_nvic_extra_offset(offset: u32) -> bool {
+    offset == AIRCR_OFF || (offset >= SHPR1_OFF && offset < SHPR_END)
 }
 
 /// SCB 外设：寄存器文件式镜像 + MPU/NVIC 寄存器窗口委托。
@@ -80,7 +87,7 @@ impl Peripheral for SystemControl {
             }
         }
         if let Some(nvic) = &self.nvic {
-            if is_nvic_offset(offset) {
+            if is_nvic_offset(offset) || is_nvic_extra_offset(offset) {
                 return nvic.lock().unwrap().read(offset, size);
             }
         }
@@ -98,7 +105,7 @@ impl Peripheral for SystemControl {
             }
         }
         if let Some(nvic) = &self.nvic {
-            if is_nvic_offset(offset) {
+            if is_nvic_offset(offset) || is_nvic_extra_offset(offset) {
                 return nvic.lock().unwrap().write(offset, size, value);
             }
         }
