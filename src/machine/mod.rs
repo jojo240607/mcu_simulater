@@ -24,7 +24,7 @@ use crate::peripheral::rcc::Rcc;
 use crate::peripheral::scb::SystemControl;
 use crate::peripheral::syscfg::{ExtiPortSelect, Syscfg};
 use crate::peripheral::timer::Tim2;
-use crate::peripheral::usart::Usart;
+use crate::peripheral::usart::{Usart, USART1_IRQ, USART2_IRQ, USART3_IRQ};
 use crate::peripheral::wdog::{Iwdg, ResetReason, WdogResetReq, Wwdg};
 use crate::peripheral::{Peripheral};
 use crate::sim::timing::VirtualClock;
@@ -222,10 +222,28 @@ impl Machine {
             self.bus.lock().unwrap().attach(base, 0x400, format!("GPIO{}", (b'A' + port) as char), gpio)?;
         }
 
-        // USART1-3（port 1/2/3）
-        for (port, base) in [(1u8, 0x4001_1000u32), (2, 0x4000_4400), (3, 0x4000_4800)] {
-            let uart = Arc::new(Mutex::new(Usart::new(port, events.clone())));
-            self.bus.lock().unwrap().attach(base, 0x400, format!("USART{port}"), uart)?;
+        // USART1-3（port 1/2/3；M5 串口仿真：接 NVIC IRQ37-39 + 订阅 UartRx 喂 RX）
+        for (port, base, irq) in [
+            (1u8, 0x4001_1000u32, USART1_IRQ),
+            (2, 0x4000_4400, USART2_IRQ),
+            (3, 0x4000_4800, USART3_IRQ),
+        ] {
+            let uart = Arc::new(Mutex::new(Usart::new(port, events.clone(), self.nvic.clone(), irq)));
+            self.bus
+                .lock()
+                .unwrap()
+                .attach(base, 0x400, format!("USART{port}"), uart.clone())?;
+            // 虚拟终端/测试发布 UartRx → 对应端口 feed_rx
+            let u = uart.clone();
+            events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+                move |ev: &Event| {
+                    if let Event::UartRx { port: p, byte } = ev {
+                        if *p == u.lock().unwrap().port {
+                            u.lock().unwrap().feed_rx(*byte);
+                        }
+                    }
+                },
+            )));
         }
 
         // TIM2（tick 推进 + 溢出 → NVIC IRQ28）

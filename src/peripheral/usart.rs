@@ -1,10 +1,13 @@
-//! USART 外设（STM32F407，M3 T1 集：USART1-3）。
+//! USART 外设（STM32F407，M5 串口仿真模块，在 M3 TX 简化版之上补齐接收与中断）。
 //!
-//! M3 语义简化（面向 printf demo）：
-//! - 寄存器文件镜像：SR/DR/BRR/CR1/CR2/CR3/GTPR；
-//! - 发送：TE+UE 使能后写 DR → 发布 [`crate::events::Event::UartByte`]
-//!   （虚拟 Console 订阅），并立即置 SR.TXE（仿真快速发送，固件轮询 TXE 即通过）；
-//! - 接收/错误/中断（RXNE/ORE/TC/TXEIE…）留待 M4。
+//! M5 完整语义：
+//! - TX：TE+UE 写 DR → 发布 [`crate::events::Event::UartByte`]（虚拟 Console 订阅），
+//!   立即置 TXE/TC（仿真快速发送）；TXEIE/TCIE 可触发 NVIC 中断；
+//! - RX：虚拟终端/测试发布 [`crate::events::Event::UartRx`] → [`Usart::feed_rx`]：
+//!   UE+RE 时锁存 DR、置 RXNE（RXNE 已置位再来字节 → ORE）；RXNEIE 置挂起 NVIC 中断；
+//!   读 DR 清 RXNE；ORE 写 0 清除（rc_w0）；
+//! - 中断：RXNEIE/TCIE/TXEIE 置挂起，NVIC IRQ 映射 USART1-3 = IRQ37-39；
+//!   CR1 中断使能位拉高而标志已置位时立即挂起（寄存器写副作用，硬件语义）。
 //!
 //! 地址映射（每个 USART 基址不同，`offset` 为相对基址偏移）：
 //! - SR 0x00 / DR 0x04 / BRR 0x08 / CR1 0x0C / CR2 0x10 / CR3 0x14 / GTPR 0x18
@@ -12,35 +15,63 @@
 use std::sync::{Arc, Mutex};
 
 use crate::events::{Event, EventBus};
+use crate::peripheral::nvic::Nvic;
 use crate::peripheral::{BusError, Peripheral};
 
+/// USART NVIC IRQ（STM32F407）
+pub const USART1_IRQ: u32 = 37;
+pub const USART2_IRQ: u32 = 38;
+pub const USART3_IRQ: u32 = 39;
+
 /// SR 状态位
-const SR_TXE: u32 = 1 << 7; // 发送数据寄存器空
+const SR_TXE: u32 = 1 << 7;  // 发送数据寄存器空
+const SR_TC: u32 = 1 << 6;   // 发送完成
+const SR_RXNE: u32 = 1 << 5; // 接收数据寄存器非空
+const SR_ORE: u32 = 1 << 3;  // 过载错误
 
 /// CR1 控制位
-const CR1_UE: u32 = 1 << 13; // 使能
-const CR1_TE: u32 = 1 << 3;  // 发送使能
+const CR1_UE: u32 = 1 << 13;    // 使能
+const CR1_RE: u32 = 1 << 2;     // 接收使能
+const CR1_TE: u32 = 1 << 3;     // 发送使能
+const CR1_RXNEIE: u32 = 1 << 5; // RXNE 中断使能
+const CR1_TCIE: u32 = 1 << 6;   // TC 中断使能
+const CR1_TXEIE: u32 = 1 << 7;  // TXE 中断使能
 
 /// 寄存器偏移
 const OFF_SR: u32 = 0x00;
 const OFF_DR: u32 = 0x04;
+const OFF_CR1: u32 = 0x0C;
 
 /// USART 外设
 pub struct Usart {
     /// USART 端口号（1/2/3），用于事件过滤
     pub port: u8,
-    /// 寄存器文件
+    /// NVIC IRQ 编号（USART1-3 = 37-39）
+    irq: u32,
+    /// 寄存器文件（SR/DR/BRR/CR1/CR2/CR3/GTPR）
     regs: [u32; 7],
+    /// 最近接收字节（读 DR 返回）
+    rx_byte: u8,
     /// 事件总线（发布 UartByte）
     bus: Arc<Mutex<EventBus>>,
+    /// NVIC（RXNE/TC/TXE → 置挂起）
+    nvic: Arc<Mutex<Nvic>>,
 }
 
 impl Usart {
-    pub fn new(port: u8, bus: Arc<Mutex<EventBus>>) -> Self {
+    pub fn new(
+        port: u8,
+        bus: Arc<Mutex<EventBus>>,
+        nvic: Arc<Mutex<Nvic>>,
+        irq: u32,
+    ) -> Self {
         Self {
             port,
+            irq,
             regs: [0; 7],
+            rx_byte: 0,
             bus,
+            nvic,
         }
     }
 
@@ -51,6 +82,32 @@ impl Usart {
             byte,
         };
         self.bus.lock().unwrap().publish(&ev);
+    }
+
+    /// RXNE/ORE 置位后按 RXNEIE 挂起中断（RM：RXNE 中断事件含 ORE）
+    fn set_pending_if_rx(&self) {
+        if self.regs[3] & CR1_RXNEIE != 0 {
+            self.nvic.lock().unwrap().set_pending(self.irq);
+        }
+    }
+
+    /// 注入接收字节（虚拟终端/测试经 [`Event::UartRx`] 调用）。
+    ///
+    /// UE+RE 时：RXNE 已置位 → ORE（新字节丢弃）；否则锁存 DR + 置 RXNE。
+    /// RXNEIE 使能 → 挂起 NVIC 中断。
+    pub fn feed_rx(&mut self, byte: u8) {
+        let cr1 = self.regs[3];
+        if (cr1 & (CR1_UE | CR1_RE)) != (CR1_UE | CR1_RE) {
+            return; // 未使能接收，字节丢弃
+        }
+        if self.regs[0] & SR_RXNE != 0 {
+            self.regs[0] |= SR_ORE; // 过载：上次数据未读走
+            self.set_pending_if_rx();
+            return;
+        }
+        self.rx_byte = byte;
+        self.regs[0] |= SR_RXNE;
+        self.set_pending_if_rx();
     }
 
     /// 发送数据寄存器是否空（固件轮询 TXE）
@@ -70,7 +127,12 @@ impl Peripheral for Usart {
         }
         match offset {
             OFF_SR => Ok(self.regs[0]),
-            OFF_DR => Ok(0), // 接收未实现，读回 0
+            OFF_DR => {
+                // 读 DR 返回接收字节并清 RXNE
+                let v = self.rx_byte as u32;
+                self.regs[0] &= !SR_RXNE;
+                Ok(v)
+            }
             0x08..=0x18 => Ok(self.regs[(offset / 4) as usize]),
             _ => Err(BusError::OutOfRange),
         }
@@ -82,25 +144,44 @@ impl Peripheral for Usart {
         }
         match offset {
             OFF_SR => {
-                // 状态位写 0 清除（rc_w0 语义）；TXE 可被写 1 清除（写 0 保留）
-                self.regs[0] &= value;
+                // rc_w0：写 0 清除 TC/ORE；TXE/RXNE 只读（不受 SR 写影响）
+                let clear = !value & (SR_TC | SR_ORE);
+                self.regs[0] &= !clear;
                 Ok(())
             }
             OFF_DR => {
-                // 发送数据寄存器：TE+UE 使能时发布 TX 事件
-                let cr1 = self.regs[3]; // CR1 = regs 索引 3
+                let cr1 = self.regs[3];
                 if (cr1 & (CR1_UE | CR1_TE)) == (CR1_UE | CR1_TE) {
+                    // 发送：发布事件 + 快速完成（TXE/TC 置位），TCIE/TXEIE 挂起
                     self.tx((value & 0xFF) as u8);
+                    self.regs[0] |= SR_TXE | SR_TC;
+                    let mut n = self.nvic.lock().unwrap();
+                    if cr1 & CR1_TCIE != 0 {
+                        n.set_pending(self.irq);
+                    } else if cr1 & CR1_TXEIE != 0 {
+                        n.set_pending(self.irq);
+                    }
+                } else {
+                    // 未使能发送：数据丢弃，TXE 保持置位
+                    self.regs[0] |= SR_TXE;
                 }
-                // 仿真快速发送：数据立即被取走 → TXE 重新置位
-                self.regs[0] |= SR_TXE;
                 Ok(())
             }
             0x08..=0x18 => {
                 self.regs[(offset / 4) as usize] = value;
-                // CR1 使能 TE 上升沿 → TXE 置位（首字符轮询即可通过）
-                if offset == 0x0C && (value & CR1_TE) != 0 && (value & CR1_UE) != 0 {
-                    self.regs[0] |= SR_TXE;
+                if offset == OFF_CR1 {
+                    // TE+UE 使能上升沿 → TXE/TC 置位（首个字符轮询即可通过）
+                    if (value & CR1_TE) != 0 && (value & CR1_UE) != 0 {
+                        self.regs[0] |= SR_TXE | SR_TC;
+                    }
+                    // 中断使能位拉高而标志已置位 → 立即挂起
+                    let sr = self.regs[0];
+                    let want = (value & CR1_RXNEIE != 0 && sr & SR_RXNE != 0)
+                        || (value & CR1_TCIE != 0 && sr & SR_TC != 0)
+                        || (value & CR1_TXEIE != 0 && sr & SR_TXE != 0);
+                    if want {
+                        self.nvic.lock().unwrap().set_pending(self.irq);
+                    }
                 }
                 Ok(())
             }
@@ -110,22 +191,25 @@ impl Peripheral for Usart {
 
     fn reset(&mut self) {
         self.regs = [0; 7];
+        self.rx_byte = 0;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peripheral::nvic::Nvic;
 
-    fn usart() -> (Usart, Arc<Mutex<EventBus>>) {
+    fn usart() -> (Usart, Arc<Mutex<EventBus>>, Arc<Mutex<Nvic>>) {
         let bus = Arc::new(Mutex::new(EventBus::new()));
-        let u = Usart::new(2, bus.clone());
-        (u, bus)
+        let nvic = Arc::new(Mutex::new(Nvic::new()));
+        let u = Usart::new(2, bus.clone(), nvic.clone(), USART2_IRQ);
+        (u, bus, nvic)
     }
 
     #[test]
     fn tx_publishes_uart_byte_events() {
-        let (mut u, bus) = usart();
+        let (mut u, bus, _) = usart();
         let got = Arc::new(Mutex::new(Vec::new()));
         let g = got.clone();
         bus.lock()
@@ -151,5 +235,62 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0], Event::UartByte { port: 2, byte: b'H' });
         assert_eq!(got[1], Event::UartByte { port: 2, byte: b'i' });
+    }
+
+    #[test]
+    fn rx_feed_sets_rxne_and_pends_nvic() {
+        let (mut u, _, nvic) = usart();
+
+        // 未使能接收：注入丢弃
+        u.feed_rx(b'X');
+        assert_eq!(u.read(OFF_SR, 4).unwrap() & SR_RXNE, 0);
+
+        // UE+RE 使能后注入
+        u.write(OFF_CR1, 4, CR1_UE | CR1_RE | CR1_RXNEIE).unwrap();
+        u.feed_rx(b'A');
+        assert_ne!(u.read(OFF_SR, 4).unwrap() & SR_RXNE, 0, "RXNE 应置位");
+
+        // RXNE 未清再注入 → ORE，新字节丢弃（DR 保留旧字节 'A'）
+        u.feed_rx(b'B');
+        assert_ne!(u.read(OFF_SR, 4).unwrap() & SR_ORE, 0, "过载应置位 ORE");
+        assert_eq!(u.read(OFF_DR, 4).unwrap(), b'A' as u32, "过载时新字节丢弃，DR 保留旧字节");
+        assert_eq!(u.read(OFF_SR, 4).unwrap() & SR_RXNE, 0, "读 DR 应清 RXNE");
+        assert_ne!(u.read(OFF_SR, 4).unwrap() & SR_ORE, 0, "读 DR 不应清 ORE（写 0 才清）");
+
+        // 写 0 清 ORE 后再注入 → 正常置 RXNE + 挂起 NVIC（IRQ38 = USART2）
+        u.write(OFF_SR, 4, 0u32).unwrap();
+        u.feed_rx(b'C');
+        assert_eq!(u.read(OFF_DR, 4).unwrap(), b'C' as u32, "ORE 清除后新字节正常锁存");
+        assert!(nvic.lock().unwrap().is_pending(USART2_IRQ), "RXNEIE 应挂起 USART2 IRQ");
+    }
+
+    #[test]
+    fn sr_rc_w0_clears_ore_but_not_txe() {
+        let (mut u, _, _) = usart();
+        u.write(OFF_CR1, 4, CR1_UE | CR1_RE).unwrap();
+        u.feed_rx(b'Z'); // RXNE 置位
+        u.feed_rx(b'Y'); // ORE 置位
+        let sr = u.read(OFF_SR, 4).unwrap();
+        assert_ne!(sr & SR_ORE, 0);
+
+        // 写 0 清 ORE（写 1 保留）
+        u.write(OFF_SR, 4, !0u32).unwrap(); // 全 1：无清除
+        assert_ne!(u.read(OFF_SR, 4).unwrap() & SR_ORE, 0, "写 1 不应清 ORE");
+        u.write(OFF_SR, 4, 0u32).unwrap(); // 全 0：清 ORE（TXE 本就不置位）
+        assert_eq!(u.read(OFF_SR, 4).unwrap() & SR_ORE, 0, "写 0 应清 ORE");
+
+        // TXE 不受 SR 写影响
+        u.write(OFF_CR1, 4, CR1_UE | CR1_TE).unwrap();
+        assert_ne!(u.read(OFF_SR, 4).unwrap() & SR_TXE, 0);
+        u.write(OFF_SR, 4, 0u32).unwrap();
+        assert_ne!(u.read(OFF_SR, 4).unwrap() & SR_TXE, 0, "TXE 只读");
+    }
+
+    #[test]
+    fn tx_tcie_pends_on_send() {
+        let (mut u, _, nvic) = usart();
+        u.write(OFF_CR1, 4, CR1_UE | CR1_TE | CR1_TCIE).unwrap();
+        u.write(OFF_DR, 4, b'A' as u32).unwrap();
+        assert!(nvic.lock().unwrap().is_pending(USART2_IRQ), "TCIE 使能时发送应挂起中断");
     }
 }

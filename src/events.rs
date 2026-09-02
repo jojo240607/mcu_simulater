@@ -8,8 +8,10 @@ use std::sync::{Arc, Mutex};
 /// 事件类型（M0 占位，M3 起按外设扩展）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// UART 收到/发送一字节
+    /// UART 发送一字节（USART TX → 虚拟终端/Console 订阅）
     UartByte { port: u8, byte: u8 },
+    /// UART 接收一字节（虚拟终端/测试 → USART RX，驱动 RXNE/中断）
+    UartRx { port: u8, byte: u8 },
     /// GPIO 电平变化
     GpioLevel { port: u8, pin: u8, level: bool },
     /// 占位：其它事件后续按需扩展
