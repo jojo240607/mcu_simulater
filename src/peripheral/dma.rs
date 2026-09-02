@@ -34,6 +34,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::core::Cpu;
+use crate::peripheral::adc::Adc;
 use crate::peripheral::i2c::I2c;
 use crate::peripheral::nvic::Nvic;
 use crate::peripheral::spi::Spi;
@@ -76,17 +77,20 @@ pub enum DmaTarget {
     I2c(u8),
     /// SPI 外设（port 1..3，DMA 经 [`Spi::dma_read_dr`]/[`Spi::dma_write_dr`] 读写 DR）
     Spi(u8),
+    /// ADC 外设（port 1..3，DMA 经 [`Adc::dma_read_dr`] 读 DR，12 位采样值）
+    Adc(u8),
 }
 
 /// 外设方向 DMA 搬运接口：DR 读写（供 DMA `process` 搬运外设↔内存）。
 ///
-/// USART/I2C 等数据寄存器型外设实现，`service_stream` 登记的流在 process 中
+/// USART/I2C/SPI/ADC 等数据寄存器型外设实现，`service_stream` 登记的流在 process 中
 /// 经该接口直接读写 DR，绕开 Unicorn CPU 内存 API 不触发 MMIO hook 的限制。
+/// 值按 u32 携带，实际取宽由流 MSIZE 决定（ADC 12 位采样走半字，串口走字节）。
 pub trait DmaByteIo: Send {
     /// 外设 → 内存（RX）：读数据寄存器并清接收标志
-    fn dma_read_dr(&mut self) -> u8;
-    /// 内存 → 外设（TX）：写数据寄存器（外设侧发送一字节）
-    fn dma_write_dr(&mut self, byte: u8);
+    fn dma_read_dr(&mut self) -> u32;
+    /// 内存 → 外设（TX）：写数据寄存器（外设侧发送数据）
+    fn dma_write_dr(&mut self, value: u32);
 }
 
 /// CR 控制位
@@ -139,6 +143,8 @@ pub struct Dma {
     i2c_handles: [Option<Arc<Mutex<I2c>>>; 3],
     /// 注册的 SPI 句柄（index 0..2 = SPI1..3，外设方向搬运直接读写 DR）
     spi_handles: [Option<Arc<Mutex<Spi>>>; 3],
+    /// 注册的 ADC 句柄（index 0..2 = ADC1..3，外设→内存搬运直接读 DR）
+    adc_handles: [Option<Arc<Mutex<Adc>>>; 3],
 }
 
 impl Dma {
@@ -154,6 +160,7 @@ impl Dma {
             usart_handles: Default::default(),
             i2c_handles: Default::default(),
             spi_handles: Default::default(),
+            adc_handles: Default::default(),
         }
     }
 
@@ -182,6 +189,15 @@ impl Dma {
     pub fn register_spi(&mut self, port: u8, spi: Arc<Mutex<Spi>>) {
         if (1..=3).contains(&port) {
             self.spi_handles[(port - 1) as usize] = Some(spi);
+        }
+    }
+
+    /// 注册 ADC 句柄（供外设→内存搬运读 DR）。
+    ///
+    /// Machine 挂载 ADC1-3 时对 DMA2 调用；`port` 取值 1..3（ADC DMA 全在 DMA2）。
+    pub fn register_adc(&mut self, port: u8, adc: Arc<Mutex<Adc>>) {
+        if (1..=3).contains(&port) {
+            self.adc_handles[(port - 1) as usize] = Some(adc);
         }
     }
 
@@ -316,6 +332,11 @@ impl Dma {
                     .get((port as usize).wrapping_sub(1))
                     .and_then(|h| h.clone())
                     .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),
+                DmaTarget::Adc(port) => self
+                    .adc_handles
+                    .get((port as usize).wrapping_sub(1))
+                    .and_then(|h| h.clone())
+                    .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),
             };
             let Some(dev) = handle else {
                 self.pending_transfer &= !(1 << s); // 未注册句柄（配置异常）：跳过
@@ -325,20 +346,24 @@ impl Dma {
             let new_ndtr = ndtr.saturating_sub(items);
             let mut dev = dev.lock().unwrap();
             if dir == 1 {
-                // 内存 → 外设（TX）：M0AR → 外设 DR
+                // 内存 → 外设（TX）：M0AR → 外设 DR（按 MSIZE 取宽拼 u32）
                 for _ in 0..items {
                     if let Ok(data) = cpu.mem_read(dst as u64, mw) {
-                        dev.dma_write_dr(data[0]);
+                        let mut value = 0u32;
+                        for (i, b) in data[..mw].iter().enumerate() {
+                            value |= (*b as u32) << (8 * i);
+                        }
+                        dev.dma_write_dr(value);
                     }
                     if minc {
                         dst += mw as u32;
                     }
                 }
             } else {
-                // 外设 → 内存（RX）：外设 DR → M0AR
+                // 外设 → 内存（RX）：外设 DR → M0AR（按 MSIZE 取宽写内存）
                 for _ in 0..items {
-                    let byte = dev.dma_read_dr();
-                    let _ = cpu.mem_write(dst as u64, &[byte]);
+                    let value = dev.dma_read_dr().to_le_bytes();
+                    let _ = cpu.mem_write(dst as u64, &value[..mw]);
                     if minc {
                         dst += mw as u32;
                     }

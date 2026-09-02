@@ -28,6 +28,8 @@ pub enum Event {
     SpiRx { port: u8, byte: u8 },
     /// SPI DMA 请求（SPI → DMA 控制器，触发外设↔内存搬运）
     SpiDma { port: u8, dir: DmaDir },
+    /// ADC 模拟采样（测试/虚拟传感器 → ADC，驱动一次转换：DR 锁存 + EOC + DMA 请求）
+    AdcValue { port: u8, channel: u8, value: u16 },
     /// GPIO 电平变化
     GpioLevel { port: u8, pin: u8, level: bool },
     /// 占位：其它事件后续按需扩展

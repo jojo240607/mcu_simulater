@@ -14,6 +14,7 @@ use unicorn_engine::{HookType, MemType, Prot, RegisterARM, Unicorn};
 use crate::bus::Bus;
 use crate::core::{CoreError, Cpu, Result};
 use crate::events::{Event, EventBus};
+use crate::peripheral::adc::{Adc, ADC_IRQ};
 use crate::peripheral::console::Console;
 use crate::peripheral::terminal::Terminal;
 use crate::peripheral::dma::{Dma, DmaDir, DMA1_BASE, DMA1_STREAM_IRQ, DMA2_BASE, DMA2_STREAM_IRQ};
@@ -363,6 +364,52 @@ impl Machine {
             )));
         }
 
+        // ADC1-3（port 1..3；DMA 模式：接 NVIC IRQ18（共享）+ 订阅 AdcValue 喂采样值。
+        // ADC DMA 全在 DMA2，见 F407 请求映射：ADC1→Stream0_Ch0、ADC2→Stream2_Ch1、
+        // ADC3→Stream1_Ch2）
+        for (port, base) in [
+            (1u8, 0x4001_2000u32), // ADC1
+            (2, 0x4001_2100),      // ADC2
+            (3, 0x4001_2200),      // ADC3
+        ] {
+            let adc = Arc::new(Mutex::new(Adc::new(port, events.clone(), self.nvic.clone(), ADC_IRQ)));
+            // 注意 size=0x100：ADC1/2/3 基址相邻仅差 0x100（0x40012000/0x40012100/0x40012200），
+            // 用 0x400 会与相邻 ADC 区间重叠（寄存器仅到 DR@0x4C，0x100 足够）
+            self.bus
+                .lock()
+                .unwrap()
+                .attach(base, 0x100, format!("ADC{port}"), adc.clone())?;
+            // 注册 ADC 句柄到 DMA2（外设→内存搬运经句柄直接读 DR）
+            self.dma2.lock().unwrap().register_adc(port, adc.clone());
+            // 测试/虚拟传感器发布 AdcValue → 对应端口 feed_value；
+            // DMA 请求在 feed_value 之后直接路由（不能在 feed_value 内二次 publish，
+            // 否则事件分发回调中同线程重入 events.lock() 死锁，见 [`Adc::dma_pending`]）
+            let i = adc.clone();
+            let dma2 = self.dma2.clone();
+            events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+                move |ev: &Event| {
+                    if let Event::AdcValue { port: p, value, .. } = ev {
+                        if *p == i.lock().unwrap().port {
+                            i.lock().unwrap().feed_value(*value);
+                            if i.lock().unwrap().dma_pending() {
+                                // 外设→内存：CR2.DMA 使能且 EOC 置位 → 登记 DMA 搬运
+                                //（HAL 默认流，全在 DMA2）
+                                let (stream, channel) = match *p {
+                                    1 => (0, 0), // ADC1: DMA2_Stream0_Channel0
+                                    2 => (2, 1), // ADC2: DMA2_Stream2_Channel1
+                                    3 => (1, 2), // ADC3: DMA2_Stream1_Channel2
+                                    _ => return,
+                                };
+                                dma2.lock()
+                                    .unwrap()
+                                    .service_stream(stream, channel, DmaDir::PeriphToMem, crate::peripheral::dma::DmaTarget::Adc(*p));
+                            }
+                        }
+                    }
+                },
+            )));
+        }
+
         // TIM2（tick 推进 + 溢出 → NVIC IRQ28）
         let tim2 = Arc::new(Mutex::new(Tim2::new(self.nvic.clone())));
         self.bus.lock().unwrap().attach(0x4000_0000, 0x400, "TIM2", tim2.clone())?;
@@ -522,7 +569,7 @@ impl Machine {
             false
         })?;
 
-        log::info!("T1 外设已挂载：GPIOA-E + USART1-6 + TIM2 + RCC + SYSCFG/EXTI + DMA1/DMA2 + Console/Terminal @ 0x{periph_base:08X} +0x{periph_size:X}");
+        log::info!("T1 外设已挂载：GPIOA-E + USART1-6 + I2C1-3 + SPI1-3 + ADC1-3 + TIM2 + RCC + SYSCFG/EXTI + DMA1/DMA2 + Console/Terminal @ 0x{periph_base:08X} +0x{periph_size:X}");
         Ok(())
     }
 

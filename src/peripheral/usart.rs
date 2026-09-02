@@ -141,17 +141,17 @@ impl Usart {
     /// DMA 读 DR（外设→内存方向）：返回接收字节并清 RXNE。
     ///
     /// 与 CPU 读 DR 同语义（读清 RXNE），供 DMA 控制器搬运调用。
-    pub fn dma_read_dr(&mut self) -> u8 {
+    pub fn dma_read_dr(&mut self) -> u32 {
         let byte = self.rx_byte;
         self.regs[0] &= !SR_RXNE;
-        byte
+        byte as u32
     }
 
     /// DMA 写 DR（内存→外设方向）：发送一字节并置 TXE/TC（仿真快速发送）。
     ///
     /// 供 DMA 控制器搬运调用，等价 CPU 写 DR 的发送语义。
-    pub fn dma_write_dr(&mut self, byte: u8) {
-        self.tx(byte);
+    pub fn dma_write_dr(&mut self, value: u32) {
+        self.tx(value as u8);
         self.regs[0] |= SR_TXE | SR_TC;
     }
 
@@ -179,12 +179,12 @@ impl Usart {
 
 /// DMA 外设方向搬运接口实现（复用 inherent `dma_read_dr`/`dma_write_dr` 语义）。
 impl crate::peripheral::dma::DmaByteIo for Usart {
-    fn dma_read_dr(&mut self) -> u8 {
+    fn dma_read_dr(&mut self) -> u32 {
         self.dma_read_dr()
     }
 
-    fn dma_write_dr(&mut self, byte: u8) {
-        self.dma_write_dr(byte);
+    fn dma_write_dr(&mut self, value: u32) {
+        self.dma_write_dr(value);
     }
 }
 
