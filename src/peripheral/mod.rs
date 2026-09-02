@@ -12,6 +12,7 @@ pub mod mpu;
 pub mod nvic;
 pub mod rcc;
 pub mod scb;
+pub mod spi;
 pub mod syscfg;
 pub mod terminal;
 pub mod timer;

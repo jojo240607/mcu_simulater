@@ -22,6 +22,12 @@ pub enum Event {
     I2cRx { port: u8, byte: u8 },
     /// I2C DMA 请求（I2C → DMA 控制器，触发外设↔内存搬运）
     I2cDma { port: u8, dir: DmaDir },
+    /// SPI 发送一字节（SPI TX → 虚拟从机/测试订阅）
+    SpiByte { port: u8, byte: u8 },
+    /// SPI 接收一字节（测试/虚拟从机 → SPI RX，驱动 RXNE）
+    SpiRx { port: u8, byte: u8 },
+    /// SPI DMA 请求（SPI → DMA 控制器，触发外设↔内存搬运）
+    SpiDma { port: u8, dir: DmaDir },
     /// GPIO 电平变化
     GpioLevel { port: u8, pin: u8, level: bool },
     /// 占位：其它事件后续按需扩展

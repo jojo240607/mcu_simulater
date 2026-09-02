@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use crate::core::Cpu;
 use crate::peripheral::i2c::I2c;
 use crate::peripheral::nvic::Nvic;
+use crate::peripheral::spi::Spi;
 use crate::peripheral::usart::Usart;
 use crate::peripheral::{BusError, Peripheral};
 
@@ -73,6 +74,8 @@ pub enum DmaTarget {
     Usart(u8),
     /// I2C 外设（port 1..3，DMA 经 [`I2c::dma_read_dr`]/[`I2c::dma_write_dr`] 读写 DR）
     I2c(u8),
+    /// SPI 外设（port 1..3，DMA 经 [`Spi::dma_read_dr`]/[`Spi::dma_write_dr`] 读写 DR）
+    Spi(u8),
 }
 
 /// 外设方向 DMA 搬运接口：DR 读写（供 DMA `process` 搬运外设↔内存）。
@@ -134,6 +137,8 @@ pub struct Dma {
     usart_handles: [Option<Arc<Mutex<Usart>>>; 6],
     /// 注册的 I2C 句柄（index 0..2 = I2C1..3，外设方向搬运直接读写 DR）
     i2c_handles: [Option<Arc<Mutex<I2c>>>; 3],
+    /// 注册的 SPI 句柄（index 0..2 = SPI1..3，外设方向搬运直接读写 DR）
+    spi_handles: [Option<Arc<Mutex<Spi>>>; 3],
 }
 
 impl Dma {
@@ -148,6 +153,7 @@ impl Dma {
             pending_target: [None; 8],
             usart_handles: Default::default(),
             i2c_handles: Default::default(),
+            spi_handles: Default::default(),
         }
     }
 
@@ -166,6 +172,16 @@ impl Dma {
     pub fn register_i2c(&mut self, port: u8, i2c: Arc<Mutex<I2c>>) {
         if (1..=3).contains(&port) {
             self.i2c_handles[(port - 1) as usize] = Some(i2c);
+        }
+    }
+
+    /// 注册 SPI 句柄（供外设方向搬运读写 DR）。
+    ///
+    /// Machine 挂载 SPI1-3 时对对应 DMA 控制器调用；`port` 取值 1..3
+    /// （SPI1 → DMA2、SPI2/3 → DMA1，见 F407 请求映射）。
+    pub fn register_spi(&mut self, port: u8, spi: Arc<Mutex<Spi>>) {
+        if (1..=3).contains(&port) {
+            self.spi_handles[(port - 1) as usize] = Some(spi);
         }
     }
 
@@ -292,6 +308,11 @@ impl Dma {
                     .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),
                 DmaTarget::I2c(port) => self
                     .i2c_handles
+                    .get((port as usize).wrapping_sub(1))
+                    .and_then(|h| h.clone())
+                    .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),
+                DmaTarget::Spi(port) => self
+                    .spi_handles
                     .get((port as usize).wrapping_sub(1))
                     .and_then(|h| h.clone())
                     .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),

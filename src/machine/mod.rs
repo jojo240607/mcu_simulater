@@ -24,6 +24,7 @@ use crate::peripheral::mpu::{Access, MemManageFault, Mpu};
 use crate::peripheral::nvic::{Nvic, StopReason};
 use crate::peripheral::rcc::Rcc;
 use crate::peripheral::scb::SystemControl;
+use crate::peripheral::spi::{Spi, SPI1_IRQ, SPI2_IRQ, SPI3_IRQ};
 use crate::peripheral::syscfg::{ExtiPortSelect, Syscfg};
 use crate::peripheral::timer::Tim2;
 use crate::peripheral::usart::{Usart, USART1_IRQ, USART2_IRQ, USART3_IRQ, UART4_IRQ, UART5_IRQ, USART6_IRQ};
@@ -318,6 +319,50 @@ impl Machine {
             )));
         }
 
+        // SPI1-3（port 1..3；DMA 模式：接 NVIC IRQ + 订阅 SpiRx 喂 RX。
+        // SPI1 DMA 在 DMA2、SPI2/3 在 DMA1，见 F407 请求映射）
+        for (port, base, irq, dma_ctrl) in [
+            (1u8, 0x4001_3000u32, SPI1_IRQ, true),  // SPI1 → DMA2
+            (2, 0x4000_3800, SPI2_IRQ, false),      // SPI2 → DMA1
+            (3, 0x4000_3C00, SPI3_IRQ, false),      // SPI3 → DMA1
+        ] {
+            let spi = Arc::new(Mutex::new(Spi::new(port, events.clone(), self.nvic.clone(), irq)));
+            self.bus
+                .lock()
+                .unwrap()
+                .attach(base, 0x400, format!("SPI{port}"), spi.clone())?;
+            // 注册 SPI 句柄到对应 DMA 控制器（外设方向搬运经句柄直接读写 DR）
+            let reg_ctrl = if dma_ctrl { self.dma2.clone() } else { self.dma.clone() };
+            reg_ctrl.lock().unwrap().register_spi(port, spi.clone());
+            // 测试/虚拟从机发布 SpiRx → 对应端口 feed_rx；
+            // RX DMA 请求在 feed_rx 之后直接路由（不能在 feed_rx 内二次 publish，
+            // 否则事件分发回调中同线程重入 events.lock() 死锁，见 [`Spi::dma_rx_pending`]）
+            let i = spi.clone();
+            let ctrl = if dma_ctrl { self.dma2.clone() } else { self.dma.clone() };
+            events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+                move |ev: &Event| {
+                    if let Event::SpiRx { port: p, byte } = ev {
+                        if *p == i.lock().unwrap().port {
+                            i.lock().unwrap().feed_rx(*byte);
+                            if i.lock().unwrap().dma_rx_pending() {
+                                // 外设→内存：RXDMAEN 使能且 RXNE 置位 → 登记 DMA 搬运
+                                //（映射与 SpiDma 订阅一致，F407 HAL 默认流）
+                                let (stream, channel) = match *p {
+                                    1 => (0, 3), // SPI1_RX: DMA2_Stream0_Channel3
+                                    2 => (3, 0), // SPI2_RX: DMA1_Stream3_Channel0
+                                    3 => (0, 0), // SPI3_RX: DMA1_Stream0_Channel0
+                                    _ => return,
+                                };
+                                ctrl.lock()
+                                    .unwrap()
+                                    .service_stream(stream, channel, DmaDir::PeriphToMem, crate::peripheral::dma::DmaTarget::Spi(*p));
+                            }
+                        }
+                    }
+                },
+            )));
+        }
+
         // TIM2（tick 推进 + 溢出 → NVIC IRQ28）
         let tim2 = Arc::new(Mutex::new(Tim2::new(self.nvic.clone())));
         self.bus.lock().unwrap().attach(0x4000_0000, 0x400, "TIM2", tim2.clone())?;
@@ -388,6 +433,32 @@ impl Machine {
                     dma1.lock()
                         .unwrap()
                         .service_stream(stream, channel, *dir, crate::peripheral::dma::DmaTarget::I2c(*port));
+                }
+            },
+        )));
+
+        // SPI DMA 请求路由（F407 固定映射：port + 方向 → DMAx_StreamN_ChannelM，
+        // 采用 HAL 默认流，见 stm32f4xx_hal_spi.c SPI_DMA_GetConfig）。
+        let dma1 = self.dma.clone();
+        let dma2 = self.dma2.clone();
+        events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+            move |ev: &Event| {
+                if let Event::SpiDma { port, dir } = ev {
+                    let (ctrl, stream, channel) = match (*port, *dir) {
+                        // SPI1：DMA2_Stream3_Channel3(TX) / DMA2_Stream0_Channel3(RX)
+                        (1, DmaDir::MemToPeriph) => (dma2.clone(), 3, 3),
+                        (1, DmaDir::PeriphToMem) => (dma2.clone(), 0, 3),
+                        // SPI2：DMA1_Stream4_Channel0(TX) / DMA1_Stream3_Channel0(RX)
+                        (2, DmaDir::MemToPeriph) => (dma1.clone(), 4, 0),
+                        (2, DmaDir::PeriphToMem) => (dma1.clone(), 3, 0),
+                        // SPI3：DMA1_Stream7_Channel0(TX) / DMA1_Stream0_Channel0(RX)
+                        (3, DmaDir::MemToPeriph) => (dma1.clone(), 7, 0),
+                        (3, DmaDir::PeriphToMem) => (dma1.clone(), 0, 0),
+                        _ => return,
+                    };
+                    ctrl.lock()
+                        .unwrap()
+                        .service_stream(stream, channel, *dir, crate::peripheral::dma::DmaTarget::Spi(*port));
                 }
             },
         )));
