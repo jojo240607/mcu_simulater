@@ -68,7 +68,7 @@ static void dma_done_hook(void) {
     __asm volatile("nop" ::: "memory");
 }
 
-/* 向量表：系统异常 + IRQ0..IRQ56（DMA2_Stream0 = IRQ56 → index 72） */
+/* 向量表：系统异常 + IRQ0..IRQ70（DMA2_Stream0 = IRQ56 → index 72，Stream5-7 → index 84-86） */
 __attribute__((section(".isr_vector"), used))
 const uint32_t vector_table[] = {
     0x20001000u,               /* 0: 初始 SP（SRAM 内） */
@@ -144,6 +144,20 @@ const uint32_t vector_table[] = {
     (uint32_t)Default_Handler, /* 70 */
     (uint32_t)Default_Handler, /* 71 */
     (uint32_t)DMA2_Stream0_IRQHandler, /* 72: IRQ56 = DMA2_Stream0 */
+    (uint32_t)Default_Handler, /* 73: IRQ57 = DMA2_Stream1 */
+    (uint32_t)Default_Handler, /* 74: IRQ58 = DMA2_Stream2 */
+    (uint32_t)Default_Handler, /* 75: IRQ59 = DMA2_Stream3 */
+    (uint32_t)Default_Handler, /* 76: IRQ60 = DMA2_Stream4 */
+    (uint32_t)Default_Handler, /* 77 */
+    (uint32_t)Default_Handler, /* 78 */
+    (uint32_t)Default_Handler, /* 79 */
+    (uint32_t)Default_Handler, /* 80 */
+    (uint32_t)Default_Handler, /* 81 */
+    (uint32_t)Default_Handler, /* 82 */
+    (uint32_t)Default_Handler, /* 83 */
+    (uint32_t)Default_Handler, /* 84: IRQ68 = DMA2_Stream5 */
+    (uint32_t)Default_Handler, /* 85: IRQ69 = DMA2_Stream6 */
+    (uint32_t)Default_Handler, /* 86: IRQ70 = DMA2_Stream7 */
 };
 
 void DMA2_Stream0_IRQHandler(void) {
