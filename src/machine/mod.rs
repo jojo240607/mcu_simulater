@@ -15,11 +15,13 @@ use crate::bus::Bus;
 use crate::core::{CoreError, Cpu, Result};
 use crate::events::{Event, EventBus};
 use crate::peripheral::console::Console;
+use crate::peripheral::exti::{Exti, EXTI_BASE};
 use crate::peripheral::gpio::Gpio;
 use crate::peripheral::mpu::{Access, MemManageFault, Mpu};
 use crate::peripheral::nvic::{Nvic, StopReason};
 use crate::peripheral::rcc::Rcc;
 use crate::peripheral::scb::SystemControl;
+use crate::peripheral::syscfg::{ExtiPortSelect, Syscfg};
 use crate::peripheral::timer::Tim2;
 use crate::peripheral::usart::Usart;
 use crate::peripheral::{Peripheral};
@@ -158,10 +160,11 @@ impl Machine {
         Ok(())
     }
 
-    /// 挂载 M3 T1 外设集：GPIOA-E + USART1-3 + TIM2 + RCC 存根 + 虚拟 Console。
+    /// 挂载外设集：GPIOA-E + USART1-3 + TIM2 + RCC 存根 + SYSCFG/EXTI + 虚拟 Console。
     ///
     /// 外设区 0x40000000..0x40024000 通过 mem hook 转发到总线（MPU 检查 + 读注入），
-    /// 与 SCB 窗口相同的 MMIO 链路。TIM2 加入时钟外设列表由 block hook 推进。
+    /// 与 SCB 窗口相同的 MMIO 链路。TIM2 加入时钟外设列表由 block hook 推进；
+    /// EXTI 订阅 GPIO 电平事件作为外部输入（M4）。
     fn attach_t1_peripherals(&mut self) -> Result<()> {
         // 外设区整体映射（含 AHB1 GPIO/RCC、APB1 TIM2/USART2-3、APB2 USART1）
         let periph_base: u64 = 0x4000_0000;
@@ -204,6 +207,26 @@ impl Machine {
         self.bus.lock().unwrap().attach(0x4000_0000, 0x400, "TIM2", tim2.clone())?;
         self.timers.lock().unwrap().push(tim2);
 
+        // M4-EXTI：SYSCFG（EXTICR 端口选择） + EXTI（外部中断，GPIO 事件 → NVIC）
+        let port_select = Arc::new(Mutex::new(ExtiPortSelect::default()));
+        let syscfg = Arc::new(Mutex::new(Syscfg::new(port_select.clone())));
+        self.bus.lock().unwrap().attach(0x4001_3800, 0x400, "SYSCFG", syscfg)?;
+
+        let exti = Arc::new(Mutex::new(Exti::new(port_select.clone(), self.nvic.clone())));
+        self.bus.lock().unwrap().attach(EXTI_BASE, 0x400, "EXTI", exti.clone())?;
+
+        // GPIO 电平事件 → EXTI 输入（模拟外部驱动；EXTI 侧做端口/沿/屏蔽过滤）
+        {
+            let exti2 = exti.clone();
+            events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+                move |ev: &Event| {
+                    if let Event::GpioLevel { port, pin, level } = ev {
+                        exti2.lock().unwrap().feed_gpio(*port, *pin, *level);
+                    }
+                },
+            )));
+        }
+
         // 外设区 MMIO 转发 hook（MPU 检查 + 读注入 / 写转发）
         let bus = self.bus.clone();
         let mpu = self.mpu.clone();
@@ -233,7 +256,7 @@ impl Machine {
             false
         })?;
 
-        log::info!("T1 外设已挂载：GPIOA-E + USART1-3 + TIM2 + RCC + Console @ 0x{periph_base:08X} +0x{periph_size:X}");
+        log::info!("T1 外设已挂载：GPIOA-E + USART1-3 + TIM2 + RCC + SYSCFG/EXTI + Console @ 0x{periph_base:08X} +0x{periph_size:X}");
         Ok(())
     }
 
