@@ -15,6 +15,10 @@
 //!   CCxIE 使能时置挂起捕获/比较中断；
 //! - PWM 模式（OCxM=110 模式1：CNT<CCR 输出高；OCxM=111 模式2：CNT>=CCR 输出高）：
 //!   计算 OCxREF 电平，变化时发布 [`Event::TimPwm`]（供未来 GPIO/虚拟示波器接线）；
+//! - 互补输出/死区（高级）：CCER.CCxNE 使能 OCxN（= !OCxREF）；BDTR.DTG 死区
+//!   延迟仅作用于"变有效"沿（OCx/OCxN 上升沿延迟 DTG、下降沿立即），死区窗口内
+//!   两路同为无效电平（防直通）；BDTR.MOE 主输出门控，MOE=0 强制两路无效电平，
+//!   刹车（BKE/BG）即触发该门控，AOE 更新事件恢复 MOE 并再同步输出；
 //! - 输入捕获（CCxS!=00）：外部边沿经 [`Timer::feed_edge`]（或
 //!   [`Event::TimEdge`] 注入）锁存 CNT→CCRx 并置 CCxIF + CCxIE 中断。
 //!
@@ -136,6 +140,20 @@ const REG_COUNT: usize = 20;
 const DCR_DBL_MASK: u32 = 0x1F; // DBL[4:0]：突发长度（传输个数 = DBL+1）
 const DCR_DBA_SHIFT: u32 = 8; // DBA[4:0]：突发基址（字偏移）
 
+/// 死区计时器：记录一次被死区延迟的输出跳变（仅高级定时器使用）。
+///
+/// 死区语义（RM0090 §20.3.4）：互补输出切换时"变为有效"的一方被死区延迟，
+/// "变为无效"的一方立即切换——从而在死区窗口内主/互补输出同为无效电平，
+/// 避免半桥直通。等效模型：OCx 与 OCxN 的**上升沿（变有效）延迟 DTG，
+/// 下降沿（变无效）立即**。
+#[derive(Clone, Copy, Default)]
+struct DeadTimer {
+    /// 剩余 timer 内核时钟周期（0 = 空闲/已生效）
+    remaining: u32,
+    /// 死区结束后到达的目标电平
+    target: bool,
+}
+
 /// 通用定时器外设（TIM1-8）
 pub struct Timer {
     /// 端口号（TIM1..8 = 1..8，用于事件过滤 / DMA 句柄索引）
@@ -156,9 +174,21 @@ pub struct Timer {
     dma_burst_index: u32,
     /// 重复计数（高级 RCR 影子：向下计数，归零后生成更新事件）
     rep_counter: u32,
-    /// 各通道 OCxREF 输出电平（PWM 比较结果，仅输出模式；供事件/测试查询）
+    /// 各通道 OCxREF 原始比较电平（PWM 比较结果，MOE 门控前的源信号；
+    /// 供互补输出死区调度判定边沿）
+    ocx_ref: [bool; 4],
+    /// 各通道 OCx 实际驱动输出电平（受 MOE 门控；变化时发布 [`Event::TimPwm`]）
     oc_ref: [bool; 4],
-    /// 事件总线（更新事件 + UDE → 发布 TimUpdate；OCxREF 变化 → TimPwm）
+    /// 各通道 OCxN 互补驱动输出电平（受 MOE 门控 + 死区延迟；
+    /// 变化时以通道号 ch+4 发布 [`Event::TimPwm`]）
+    ocn_ref: [bool; 4],
+    /// 主输出 OCx 的待生效跳变（变有效沿经死区延迟）
+    dead_main: [DeadTimer; 4],
+    /// 互补输出 OCxN 的待生效跳变（变有效沿经死区延迟）
+    dead_comp: [DeadTimer; 4],
+    /// 上次已知 MOE 状态（检测 0→1 上升沿以再同步输出；高级定时器）
+    moe_state: bool,
+    /// 事件总线（更新事件 + UDE → 发布 TimUpdate；OCx/OCxN 电平变化 → TimPwm）
     bus: Arc<Mutex<EventBus>>,
     /// 共享 NVIC（更新事件 → 更新中断；CC 匹配/捕获 → CC 中断；刹车 → 刹车中断）
     nvic: Arc<Mutex<Nvic>>,
@@ -176,7 +206,12 @@ impl Timer {
             prescaler_remainder: 0,
             dma_burst_index: 0,
             rep_counter: 0,
+            ocx_ref: [false; 4],
             oc_ref: [false; 4],
+            ocn_ref: [false; 4],
+            dead_main: [DeadTimer::default(); 4],
+            dead_comp: [DeadTimer::default(); 4],
+            moe_state: false,
             bus,
             nvic,
         };
@@ -278,6 +313,9 @@ impl Timer {
     }
 
     /// 刹车事件（仅高级）：清 MOE（主输出关闭）、置 BIF、挂起刹车中断。
+    ///
+    /// MOE 清零同时把主/互补输出强制为无效电平（发布低电平事件）——
+    /// 半桥在刹车后两路输出同时关断（RM0090 §20.3.11，OSSI=0 简化）。
     fn break_event(&mut self) {
         if self.kind != TimerKind::Advanced {
             return;
@@ -285,6 +323,19 @@ impl Timer {
         self.regs[OFF_BDTR as usize / 4] &= !BDTR_MOE;
         self.regs[OFF_SR as usize / 4] |= SR_BIF;
         self.nvic.lock().unwrap().set_pending(self.irq.brk);
+        // MOE 清零：取消进行中的死区跳变，主/互补输出强制无效电平
+        for ch in 0..self.channels() {
+            self.dead_main[ch].remaining = 0;
+            self.dead_comp[ch].remaining = 0;
+            if self.oc_ref[ch] {
+                self.oc_ref[ch] = false;
+                self.publish_pwm(ch as u8, false);
+            }
+            if self.ocn_ref[ch] {
+                self.ocn_ref[ch] = false;
+                self.publish_pwm(ch as u8 + 4, false);
+            }
+        }
     }
 
     /// 当前 CNT 值（测试读取用）
@@ -292,9 +343,70 @@ impl Timer {
         self.regs[OFF_CNT as usize / 4]
     }
 
-    /// 通道 ch 的 OCxREF 输出电平（PWM/输出比较结果，测试/外部接线查询用）
+    /// 通道 ch 的 OCx 输出电平（PWM/输出比较结果，受 MOE 门控，测试/外部接线查询用）
     pub fn oc_ref(&self, ch: usize) -> bool {
         self.oc_ref.get(ch).copied().unwrap_or(false)
+    }
+
+    /// 通道 ch 的 OCxN 互补输出电平（受 MOE 门控 + 死区延迟，测试/外部接线查询用）
+    pub fn ocn_ref(&self, ch: usize) -> bool {
+        self.ocn_ref.get(ch).copied().unwrap_or(false)
+    }
+
+    /// 发布通道电平变化事件（主通道 0-3，互补通道 4-7）。
+    /// 调用方须先更新输出电平再发布（电平未变时不发布，避免事件噪声）。
+    fn publish_pwm(&self, channel: u8, level: bool) {
+        self.bus
+            .lock()
+            .unwrap()
+            .publish(&Event::TimPwm { port: self.port, channel, level });
+    }
+
+    /// 设置主输出 OCx 电平并发布（MOE=0 时强制无效电平）。
+    fn set_main_level(&mut self, ch: usize, level: bool, moe: bool) {
+        let level = if moe { level } else { false };
+        if level != self.oc_ref[ch] {
+            self.oc_ref[ch] = level;
+            self.publish_pwm(ch as u8, level);
+        }
+    }
+
+    /// 设置互补输出 OCxN 电平并发布（MOE=0 时强制无效电平；通道号 +4）。
+    fn set_comp_level(&mut self, ch: usize, level: bool, moe: bool) {
+        let level = if moe { level } else { false };
+        if level != self.ocn_ref[ch] {
+            self.ocn_ref[ch] = level;
+            self.publish_pwm(ch as u8 + 4, level);
+        }
+    }
+
+    /// 推进死区计时器（timer 内核时钟周期计数）：剩余周期递减，
+    /// 归零后把延迟的跳变写入输出并发布。每 tick 调用一次（含 CNT 未步进的周期）。
+    fn advance_dead_time(&mut self, cycles: u64) {
+        if cycles == 0 {
+            return;
+        }
+        let moe = if self.kind == TimerKind::Advanced {
+            self.regs[OFF_BDTR as usize / 4] & BDTR_MOE != 0
+        } else {
+            true
+        };
+        for ch in 0..self.channels() {
+            if self.dead_main[ch].remaining > 0 {
+                self.dead_main[ch].remaining =
+                    self.dead_main[ch].remaining.saturating_sub(cycles as u32);
+                if self.dead_main[ch].remaining == 0 {
+                    self.set_main_level(ch, self.dead_main[ch].target, moe);
+                }
+            }
+            if self.dead_comp[ch].remaining > 0 {
+                self.dead_comp[ch].remaining =
+                    self.dead_comp[ch].remaining.saturating_sub(cycles as u32);
+                if self.dead_comp[ch].remaining == 0 {
+                    self.set_comp_level(ch, self.dead_comp[ch].target, moe);
+                }
+            }
+        }
     }
 
     /// BDTR.DTG 死区时长（timer 时钟周期数，RM0090 分段公式；非高级定时器为 0）
@@ -339,15 +451,45 @@ impl Timer {
         self.set_cc_if(ch);
     }
 
-    /// 按 CCx 配置计算并更新各通道 OCxREF（PWM 电平 / 输出比较匹配标志）。
+    /// 按 CCx 配置计算并更新各通道输出（PWM 电平 / 输出比较匹配标志）。
     /// 仅在 tick 推进 CNT 后调用（寄存器写路径不重入，避免事件发布重入）。
+    ///
+    /// 输出波形模型（高级定时器互补 + 死区，RM0090 §20.3.4）：
+    /// - OCx 跟随 OCxREF；OCxN 为 OCxREF 反相；
+    /// - 死区延迟仅作用于"变为有效"沿（OCx/OCxN 的上升沿延迟 DTG），
+    ///   "变为无效"沿立即切换 → 死区窗口内两路同为无效电平（避免直通）；
+    /// - MOE=0 时主/互补输出均强制无效电平（set_*_level 内门控）。
     fn check_compare(&mut self) {
         let ccer = self.regs[OFF_CCER as usize / 4];
         let cnt = self.regs[OFF_CNT as usize / 4] & self.cnt_mask();
+        let is_adv = self.kind == TimerKind::Advanced;
+        let moe = if is_adv {
+            self.regs[OFF_BDTR as usize / 4] & BDTR_MOE != 0
+        } else {
+            true // 非高级定时器无 MOE，输出始终使能
+        };
+        let dt = self.dead_time(); // 高级定时器死区（timer 内核时钟周期）；否则 0
+
+        // MOE 重新使能（0→1，如 AOE 更新事件恢复）：把主/互补输出再同步到
+        // 当前 OCxREF（刹车期间被强制无效电平；无待生效死区跳变时立即恢复）
+        if is_adv && moe && !self.moe_state {
+            for ch in 0..self.channels() {
+                let out_en = ccer & (CCER_CC1E << (ch * 4)) != 0;
+                let outn_en = is_adv && ccer & (CCER_CC1NE << (ch * 4)) != 0;
+                if out_en && self.dead_main[ch].remaining == 0 {
+                    self.set_main_level(ch, self.ocx_ref[ch], moe);
+                }
+                if outn_en && self.dead_comp[ch].remaining == 0 {
+                    self.set_comp_level(ch, !self.ocx_ref[ch], moe);
+                }
+            }
+        }
+        self.moe_state = moe;
+
         for ch in 0..self.channels() {
             let (ccs, ocm) = self.cc_config(ch);
             let out_en = ccer & (CCER_CC1E << (ch * 4)) != 0;
-            let outn_en = self.kind == TimerKind::Advanced && ccer & (CCER_CC1NE << (ch * 4)) != 0;
+            let outn_en = is_adv && ccer & (CCER_CC1NE << (ch * 4)) != 0;
             if ccs != 0 || (!out_en && !outn_en) {
                 continue; // 输入模式或输出未使能
             }
@@ -360,15 +502,36 @@ impl Timer {
                     if cnt == ccr && ocm < 0b100 {
                         self.set_cc_if(ch);
                     }
-                    self.oc_ref[ch] // 电平保持（强制/冻结模式）
+                    self.ocx_ref[ch] // 电平保持（强制/冻结模式）
                 }
             };
-            if new_ref != self.oc_ref[ch] {
-                self.oc_ref[ch] = new_ref;
-                self.bus
-                    .lock()
-                    .unwrap()
-                    .publish(&Event::TimPwm { port: self.port, channel: ch as u8, level: new_ref });
+            let prev_ref = self.ocx_ref[ch];
+            let rise = new_ref && !prev_ref; // OCxREF 变有效（低→高）
+            let fall = !new_ref && prev_ref; // OCxREF 变无效（高→低）
+            if rise || fall {
+                self.ocx_ref[ch] = new_ref;
+                // 主输出 OCx：跟随 OCxREF，上升沿（变有效）延迟死区，下降沿立即
+                if out_en {
+                    if fall {
+                        self.dead_main[ch].remaining = 0; // 取消未生效的上升跳变
+                        self.set_main_level(ch, false, moe);
+                    } else if dt == 0 {
+                        self.set_main_level(ch, true, moe);
+                    } else {
+                        self.dead_main[ch] = DeadTimer { remaining: dt, target: true };
+                    }
+                }
+                // 互补输出 OCxN：= !OCxREF，其上升沿（变有效）延迟死区，下降沿立即
+                if outn_en {
+                    if rise {
+                        self.dead_comp[ch].remaining = 0; // 取消未生效的上升跳变
+                        self.set_comp_level(ch, false, moe);
+                    } else if dt == 0 {
+                        self.set_comp_level(ch, true, moe);
+                    } else {
+                        self.dead_comp[ch] = DeadTimer { remaining: dt, target: true };
+                    }
+                }
             }
         }
     }
@@ -484,6 +647,16 @@ impl Peripheral for Timer {
                 self.regs[(offset / 4) as usize] = value & self.cnt_mask();
                 Ok(())
             }
+            OFF_BDTR => {
+                // 高级：刹车/死区/主输出使能。软件直写 MOE 时同步 moe_state，
+                // 避免首次 check_compare 把 MOE 由 0→1 误判为刹车恢复而做无意义
+                // 的再同步（初始化直接置 MOE 时 OCxREF 尚为低，不应让 OCxN 假高）。
+                // 刹车清 MOE 与 AOE 更新恢复 MOE 走内部路径（break_event/update_event），
+                // moe_state 分别由 check_compare 与这里按实际写入值维护。
+                self.regs[OFF_BDTR as usize / 4] = value;
+                self.moe_state = value & BDTR_MOE != 0;
+                Ok(())
+            }
             _ => {
                 let idx = (offset / 4) as usize;
                 let slot = self.regs.get_mut(idx).ok_or(BusError::OutOfRange)?;
@@ -502,6 +675,10 @@ impl Peripheral for Timer {
         let psc = (self.regs[OFF_PSC as usize / 4] & self.cnt_mask()) as u64 + 1;
         let arr = self.regs[OFF_ARR as usize / 4] & self.cnt_mask();
         let period = arr as u64 + 1;
+
+        // 死区计时按 timer 内核时钟周期推进（与 PSC 分频无关），
+        // 须在 CNT 未步进（steps==0）时也推进，保证延迟按时钟到期
+        self.advance_dead_time(cycles);
 
         // 分频：累积周期，按 (PSC+1) 折算计数器步进
         self.prescaler_remainder += cycles;
@@ -546,7 +723,12 @@ impl Peripheral for Timer {
         self.prescaler_remainder = 0;
         self.dma_burst_index = 0;
         self.rep_counter = 0;
+        self.ocx_ref = [false; 4];
         self.oc_ref = [false; 4];
+        self.ocn_ref = [false; 4];
+        self.dead_main = [DeadTimer::default(); 4];
+        self.dead_comp = [DeadTimer::default(); 4];
+        self.moe_state = false;
     }
 }
 
@@ -885,6 +1067,71 @@ mod tests {
         let (mut t2, _, _) = tim2();
         t2.write(OFF_BDTR, 4, 0x7F).unwrap();
         assert_eq!(t2.dead_time(), 0, "非高级定时器死区恒为 0");
+    }
+
+    #[test]
+    fn advanced_complementary_dead_time_waveform() {
+        let (mut t, _, bus) = tim1();
+        // 收集 TimPwm 事件（ch0 主 OCx / ch4 互补 OCxN）
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        bus.lock()
+            .unwrap()
+            .subscribe(Arc::new(Mutex::new(move |ev: &Event| {
+                if let Event::TimPwm { port: 1, channel, level } = ev {
+                    g.lock().unwrap().push((*channel, *level));
+                }
+            })));
+        // PWM 模式1（CNT<CCR1 时 OC1REF 高）+ 互补输出 CC1E|CC1NE + DTG=5 + MOE；
+        // ARR=100、CCR1=8（测试窗口内无回绕）
+        t.write(OFF_CCMR1, 4, 0b110 << 4).unwrap();
+        t.write(OFF_CCER, 4, CCER_CC1E | CCER_CC1NE).unwrap();
+        t.write(OFF_BDTR, 4, 5 | BDTR_MOE).unwrap();
+        t.write(OFF_ARR, 4, 100).unwrap();
+        t.write(OFF_CCR1, 4, 8).unwrap();
+        t.write(OFF_CR1, 4, CR1_CEN).unwrap();
+        assert_eq!(t.dead_time(), 5, "DTG=5 → 死区 5 个内核时钟周期");
+
+        // 手动推导时间线（每 tick(1) 推进 1 个 CNT，死区按内核时钟提前推进）：
+        //   tick1  CNT=1  OC1REF↑ → OCx 变有效沿调度死区 5
+        //   tick6  CNT=6  死区到 → OCx=1（OCx 上升沿延迟 DTG=5）
+        //   tick8  CNT=8  OC1REF↓ → OCx=0 立即；OCxN 变有效沿调度死区 5
+        //   tick13 CNT=13 死区到 → OCxN=1（互补上升沿延迟 DTG=5）
+        //   tick14 CNT=14 OCx=0 / OCxN=1 → 反相有效区间
+        // 死区窗口（CNT=8..12）：两路同为低，防半桥直通。
+        for _ in 0..5 {
+            t.tick(1);
+        }
+        assert_eq!((t.oc_ref(0), t.ocn_ref(0)), (false, false), "tick5：OCx 尚处死区延迟");
+        t.tick(1); // CNT=6
+        assert_eq!((t.oc_ref(0), t.ocn_ref(0)), (true, false), "tick6：OCx 死区后变高");
+        t.tick(1); // CNT=7
+        assert_eq!((t.oc_ref(0), t.ocn_ref(0)), (true, false), "tick7：OCx 保持高（CNT<CCR1）");
+        t.tick(1); // CNT=8
+        assert_eq!((t.oc_ref(0), t.ocn_ref(0)), (false, false), "tick8：OC1REF 变低，OCx 立即低、进入死区");
+        for _ in 0..4 {
+            t.tick(1); // CNT=9..12
+        }
+        assert_eq!((t.oc_ref(0), t.ocn_ref(0)), (false, false), "tick12：死区窗口内两路同为低（防直通）");
+        t.tick(1); // CNT=13
+        assert_eq!((t.oc_ref(0), t.ocn_ref(0)), (false, true), "tick13：OCxN 死区后变高");
+        t.tick(1); // CNT=14
+        assert_eq!((t.oc_ref(0), t.ocn_ref(0)), (false, true), "tick14：OCx 低 / OCxN 高（反相有效）");
+
+        // 事件流：主通道 ch0 与互补通道 ch4 都发布高电平；且按序回放永不两路同高
+        let evs = got.lock().unwrap();
+        assert!(evs.iter().any(|(ch, l)| *ch == 0 && *l), "应发布主通道 OCx 高电平事件");
+        assert!(evs.iter().any(|(ch, l)| *ch == 4 && *l), "应发布互补通道 OCxN 高电平事件");
+        let mut oc = false;
+        let mut ocn = false;
+        for (ch, l) in evs.iter() {
+            match ch {
+                0 => oc = *l,
+                4 => ocn = *l,
+                _ => {}
+            }
+            assert!(!(oc && ocn), "事件回放中主/互补输出不得同时为高");
+        }
     }
 
     #[test]

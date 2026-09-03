@@ -5,9 +5,11 @@
 //!    互补输出、BDTR.DTG=20 死区 + MOE、UIE 更新中断）与 TIM3 通用（UIE 更新中断），
 //!    NVIC 使能 IRQ24/25/29 后启动计数；
 //! 2. PWM 运行中 TIM1/TIM3 各自溢出 → 更新中断执行（G_T1_UEV/G_T3_UEV++），
-//!    TIM1 OCxREF 变化经 Event::TimPwm 发布（测试订阅校验 PWM 波形/互补使能）；
-//!    两定时器各累计 ≥4 次更新后固件关闭 UIE（PWM 波形经 TimPwm 继续输出）——
-//!    中断风暴停止后 run() 才能自然到达指令上限返回（与 M2/M5 固件语义一致）；
+//!    TIM1 OCx/OCxN 变化经 Event::TimPwm 发布（测试订阅校验：主通道 25% 占空比
+//!    波形、互补通道 ch4 反相、死区防直通——两路任何时刻不同时高、刹车后 MOE
+//!    门控两路强制无效电平）；两定时器各累计 ≥4 次更新后固件关闭 UIE
+//!    （PWM 波形经 TimPwm 继续输出）——中断风暴停止后 run() 才能自然到达指令
+//!    上限返回（与 M2/M5 固件语义一致）；
 //! 3. 测试写 G_TRIGGER_BREAK=1 → 固件软件刹车 EGR.BG → BDTR.MOE 清零、SR.BIF 置位、
 //!    IRQ24（TIM1_BRK）执行 → G_T1_BRK++；随后记录 G_MOE=0/G_BIF=1/G_DONE。
 //!
@@ -63,12 +65,14 @@ fn read_u32(m: &mut Machine, addr: u32) -> u32 {
 fn m6_tim_advanced_end_to_end() {
     let mut m = load_machine();
 
-    // 订阅 TIM1 OCxREF（ch0 = OC1）PWM 电平变化事件
-    let pwm = Arc::new(Mutex::new(Vec::new()));
-    let p = pwm.clone();
+    // 订阅 TIM1 主通道 OCx（ch0）与互补通道 OCxN（ch4）PWM 电平变化事件（按序记录）
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let tr = trace.clone();
     m.events.lock().unwrap().subscribe(Arc::new(Mutex::new(move |ev: &Event| {
-        if let Event::TimPwm { port: 1, channel: 0, level } = ev {
-            p.lock().unwrap().push(*level);
+        if let Event::TimPwm { port: 1, channel, level } = ev {
+            if *channel == 0 || *channel == 4 {
+                tr.lock().unwrap().push((*channel, *level));
+            }
         }
     })));
 
@@ -92,14 +96,35 @@ fn m6_tim_advanced_end_to_end() {
     assert_eq!(bdtr & 0xFF, BDTR_DTG20, "TIM1 BDTR.DTG 应为 20（死区 20×tCK）");
     assert_ne!(bdtr & BDTR_MOE, 0, "TIM1 BDTR.MOE 应置位（主输出使能）");
 
-    // 3) PWM 波形：ARR=999/CCR1=250 → 每周期应有上升沿与下降沿（25% 高电平）
-    let evs = pwm.lock().unwrap();
-    assert!(!evs.is_empty(), "应发布 TimPwm 电平事件");
-    let has_high = evs.iter().any(|l| *l);
-    let has_low = evs.iter().any(|l| !*l);
+    // 3) PWM 波形：ARR=999/CCR1=250 → 主通道应有上升沿与下降沿（25% 高电平）
+    let evs = trace.lock().unwrap();
+    let ch0: Vec<bool> = evs.iter().filter(|(c, _)| *c == 0).map(|(_, l)| *l).collect();
+    let ch4: Vec<bool> = evs.iter().filter(|(c, _)| *c == 4).map(|(_, l)| *l).collect();
+    assert!(!ch0.is_empty(), "应发布主通道 TimPwm 电平事件");
+    assert!(!ch4.is_empty(), "应发布互补通道 TimPwm 电平事件（CC1NE 使能）");
+    let has_high = ch0.iter().any(|l| *l);
+    let has_low = ch0.iter().any(|l| !*l);
     assert!(has_high && has_low, "PWM 波形应含高/低电平（25% 占空比）");
-    let transitions = evs.windows(2).filter(|w| w[0] != w[1]).count();
+    let transitions = ch0.windows(2).filter(|w| w[0] != w[1]).count();
     assert!(transitions >= 2, "PWM 波形应有电平翻转（实际 {transitions} 次）");
+    // 互补通道（ch4）也应含高/低电平（与主通道反相的有效区间）
+    assert!(ch4.iter().any(|l| *l) && ch4.iter().any(|l| !*l), "互补通道应含高/低电平");
+    // 死区防直通：按事件序回放主/互补电平，任何时刻两路不得同时为高
+    let mut oc = false;
+    let mut ocn = false;
+    let mut both_low = false;
+    for (c, l) in evs.iter() {
+        match c {
+            0 => oc = *l,
+            4 => ocn = *l,
+            _ => {}
+        }
+        assert!(!(oc && ocn), "死区防直通：主/互补输出不得同时为高");
+        if !oc && !ocn {
+            both_low = true;
+        }
+    }
+    assert!(both_low, "死区窗口内应存在两路同为低的时刻");
     drop(evs);
 
     // 阶段二：软件刹车。写 G_TRIGGER_BREAK=1 → 固件 EGR.BG → MOE 清零/BIF 置位/IRQ24。
@@ -111,4 +136,17 @@ fn m6_tim_advanced_end_to_end() {
     assert_eq!(read_u32(&mut m, G_MOE), 0, "刹车后 BDTR.MOE 应清零");
     assert_eq!(read_u32(&mut m, G_BIF), 1, "刹车后 SR.BIF 应置位");
     assert_eq!(read_u32(&mut m, G_DONE), 0xAAAA_AAAA, "主线应完成（写 G_DONE）");
+
+    // 5) MOE 门控：刹车后 MOE=0 → 主/互补输出均强制无效电平（事件流末尾两路同为低）
+    let evs = trace.lock().unwrap();
+    let mut oc = false;
+    let mut ocn = false;
+    for (c, l) in evs.iter() {
+        match c {
+            0 => oc = *l,
+            4 => ocn = *l,
+            _ => {}
+        }
+    }
+    assert!(!oc && !ocn, "刹车后（MOE=0）主/互补输出应强制为无效电平");
 }
