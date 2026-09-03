@@ -3,10 +3,10 @@
 // 场景（TIM2 DIER.UDE + DCR 突发，接 DMA1 默认流）：
 //   TIM2 更新事件（DIER.UDE 使能）→ 发布 TimUpdate → Machine 路由
 //   DMA1_Stream5_Channel5（TIM2_UP，HAL 默认流）→ 内存→外设：把内存 CCR 表
-//   经 DMAR 突发（DCR.DBA=13/DBL=4）依次写入 CCR1..CCR4。
+//   经 DMAR 突发（DCR.DBA=13/DBL=3，突发长度 = 3+1 = 4）依次写入 CCR1..CCR4。
 // 1. RCC 使能 TIM2（APB1ENR bit0）+ DMA1（AHB1ENR bit21，镜像）；
 // 2. 准备 CCR 表（SRAM 固定地址 0x20000300：{0x1111,0x2222,0x3333,0x4444}）；
-// 3. 配置 TIM2：ARR=1000、DCR=(13<<8)|4（DBA=13=CCR1，DBL=4）、DIER.UDE、CR1.CEN；
+// 3. 配置 TIM2：ARR=1000、DCR=(13<<8)|3（DBA=13=CCR1，DBL=3）、DIER.UDE、CR1.CEN；
 // 4. 配置 DMA1_Stream5（TX）：DIR=内存→外设(01)、CHSEL=5、PAR=TIM2_DMAR、
 //    M0AR=CCR_TABLE、NDTR=4、MSIZE=字(10)、MINC、TCIE，写 EN 启动；
 // 5. NVIC 使能 IRQ16（DMA1_Stream5）；cpsie i；
@@ -54,7 +54,7 @@
 #define TIM_DIER_UDE (1u << 8) /* 更新 DMA 请求使能 */
 #define TIM_CR1_CEN  (1u << 0)
 #define TIM_DCR_DBA_CCR1 (13u << 8) /* DBA=13：CCR1 字偏移 */
-#define TIM_DCR_DBL_4    (4u)       /* DBL=4：CCR1..CCR4 */
+#define TIM_DCR_DBL_3    (3u)       /* DBL=3：突发长度 = 3+1 = 4（CCR1..CCR4） */
 
 /* DMA CR 位（F407） */
 #define DMA_CR_EN       (1u << 0)
@@ -163,7 +163,7 @@ void Reset_Handler(void) {
     /* 3. 配置 TIM2：ARR=1000、DCR 突发基址/长度、UDE、CEN */
     TIM2_PSC = 0u;
     TIM2_ARR = 1000u;
-    TIM2_DCR = TIM_DCR_DBA_CCR1 | TIM_DCR_DBL_4;
+    TIM2_DCR = TIM_DCR_DBA_CCR1 | TIM_DCR_DBL_3;
     TIM2_DIER = TIM_DIER_UDE;
     TIM2_EGR = 1u; /* UG：软件更新（准备） */
     TIM2_CR1 = TIM_CR1_CEN;

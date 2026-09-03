@@ -1,14 +1,14 @@
 //! M6 验收测试：TIM2 更新事件 → DMA1 内存→外设突发装载 CCR 表端到端。
 //!
 //! 复用 firmware/tim_dma_demo 固件（场景见其 main.c 注释）：
-//! 1. 固件配置 TIM2（ARR=1000、DCR.DBA=13/DBL=4、DIER.UDE、CR1.CEN）+ 接
-//!    DMA1_Stream5_Ch5（TX：内存→外设，字宽，MINC，TCIE），NVIC 使能 IRQ15；
+//! 1. 固件配置 TIM2（ARR=1000、DCR.DBA=13/DBL=3、DIER.UDE、CR1.CEN）+ 接
+//!    DMA1_Stream5_Ch5（TX：内存→外设，字宽，MINC，TCIE），NVIC 使能 IRQ16；
 //! 2. TIM2 计数溢出（tick 推进）→ 更新事件 + UDE → 发布 TimUpdate → Machine 路由
 //!    service_stream(5,5,MemToPeriph,Tim(2)) 登记待搬运（NDTR=4）；
 //! 3. run 间隙 Dma::process：从 CCR_TABLE 依次读 4 字 → Tim2::dma_write_dr 按
-//!    DCR.DBA/DBL 突发写入 CCR1..CCR4；NDTR 归零 → EN 自清 + TCIF → IRQ15 →
-//!    DMA1_Stream5_IRQHandler 校验 CCR1..CCR4 == {0x1111,0x2222,0x3333,0x4444} →
-//!    G_DMA_TC++；
+//!    DCR.DBA/DBL（突发长度 = DBL+1 = 4）写入 CCR1..CCR4；NDTR 归零 → EN 自清 +
+//!    TCIF → IRQ16 → DMA1_Stream5_IRQHandler 校验 CCR1..CCR4 ==
+//!    {0x1111,0x2222,0x3333,0x4444} → G_DMA_TC++；
 //! 4. 主线轮询 G_DMA_TC 达 1 → 写 G_DONE。
 //!
 //! 期望结果区：

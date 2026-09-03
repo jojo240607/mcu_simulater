@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 
 use mcu_simulater::events::Event;
 use mcu_simulater::machine::Machine;
-use mcu_simulater::peripheral::timer::TIM2_IRQ;
+
+/// TIM2 更新中断号（M3 起 Timer 重构为 TimerIrq 表，此处用字面量）
+const TIM2_IRQ: u32 = 28;
 
 const G_LED: u32 = 0x2000_0000;
 const G_UART: u32 = 0x2000_0004;

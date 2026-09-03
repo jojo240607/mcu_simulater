@@ -38,7 +38,7 @@ use crate::peripheral::adc::Adc;
 use crate::peripheral::i2c::I2c;
 use crate::peripheral::nvic::Nvic;
 use crate::peripheral::spi::Spi;
-use crate::peripheral::timer::Tim2;
+use crate::peripheral::timer::Timer;
 use crate::peripheral::usart::Usart;
 use crate::peripheral::{BusError, Peripheral};
 
@@ -80,7 +80,7 @@ pub enum DmaTarget {
     Spi(u8),
     /// ADC 外设（port 1..3，DMA 经 [`Adc::dma_read_dr`] 读 DR，12 位采样值）
     Adc(u8),
-    /// TIM 外设（port 2，DMA 经 [`Tim2::dma_write_dr`]/[`Tim2::dma_read_dr`] 按
+    /// TIM 外设（port 1..8，DMA 经 [`Timer::dma_write_dr`]/[`Timer::dma_read_dr`] 按
     /// DCR.DBA/DBL 突发访问 DMAR 目标寄存器）
     Tim(u8),
 }
@@ -149,8 +149,8 @@ pub struct Dma {
     spi_handles: [Option<Arc<Mutex<Spi>>>; 3],
     /// 注册的 ADC 句柄（index 0..2 = ADC1..3，外设→内存搬运直接读 DR）
     adc_handles: [Option<Arc<Mutex<Adc>>>; 3],
-    /// 注册的 TIM 句柄（index 0 = TIM2，DMA 经 [`Tim2::dma_write_dr`] 写 DR）
-    tim_handles: [Option<Arc<Mutex<Tim2>>>; 1],
+    /// 注册的 TIM 句柄（index 0..7 = TIM1..8，DMA 经 [`Timer::dma_write_dr`] 写 DR）
+    tim_handles: [Option<Arc<Mutex<Timer>>>; 8],
 }
 
 impl Dma {
@@ -210,10 +210,11 @@ impl Dma {
 
     /// 注册 TIM 句柄（供外设方向搬运按 DCR 突发读写 DMAR）。
     ///
-    /// Machine 挂载 TIM2 时对 DMA1 调用；`port` 取值 2（TIM2_UP → DMA1_Stream5_Ch5）。
-    pub fn register_tim(&mut self, port: u8, tim: Arc<Mutex<Tim2>>) {
-        if port == 2 {
-            self.tim_handles[0] = Some(tim);
+    /// Machine 挂载 TIM1-8 时对对应 DMA 控制器调用；`port` 取值 1..8
+    /// （TIM1/8 → DMA2、TIM2-7 → DMA1，见 F407 请求映射/HAL 默认流）。
+    pub fn register_tim(&mut self, port: u8, tim: Arc<Mutex<Timer>>) {
+        if (1..=8).contains(&port) {
+            self.tim_handles[(port - 1) as usize] = Some(tim);
         }
     }
 
@@ -363,12 +364,11 @@ impl Dma {
                     .get((port as usize).wrapping_sub(1))
                     .and_then(|h| h.clone())
                     .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),
-                DmaTarget::Tim(2) => self
+                DmaTarget::Tim(port) => self
                     .tim_handles
-                    .get(0)
+                    .get((port as usize).wrapping_sub(1))
                     .and_then(|h| h.clone())
                     .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),
-                DmaTarget::Tim(_) => None,
             };
             let Some(dev) = handle else {
                 self.pending_transfer &= !(1 << s); // 未注册句柄（配置异常）：跳过

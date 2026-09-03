@@ -33,6 +33,8 @@ pub enum Event {
     /// TIM 更新事件（TIM 计数溢出/软件更新 → Machine 路由 DMA 请求。
     /// 仅 DIER.UDE 使能时发布，等价硬件"更新事件 → DMA 请求"）
     TimUpdate { port: u8 },
+    /// TIM PWM/输出比较电平变化（OCxREF 变化 → 虚拟示波器/GPIO 接线订阅）
+    TimPwm { port: u8, channel: u8, level: bool },
     /// GPIO 电平变化
     GpioLevel { port: u8, pin: u8, level: bool },
     /// 占位：其它事件后续按需扩展

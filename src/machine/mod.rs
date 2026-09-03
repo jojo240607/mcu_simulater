@@ -27,7 +27,7 @@ use crate::peripheral::rcc::Rcc;
 use crate::peripheral::scb::SystemControl;
 use crate::peripheral::spi::{Spi, SPI1_IRQ, SPI2_IRQ, SPI3_IRQ};
 use crate::peripheral::syscfg::{ExtiPortSelect, Syscfg};
-use crate::peripheral::timer::Tim2;
+use crate::peripheral::timer::{Timer, TimerConfig, TimerIrq, TimerKind};
 use crate::peripheral::usart::{Usart, USART1_IRQ, USART2_IRQ, USART3_IRQ, UART4_IRQ, UART5_IRQ, USART6_IRQ};
 use crate::peripheral::wdog::{Iwdg, ResetReason, WdogResetReq, Wwdg};
 use crate::peripheral::{Peripheral};
@@ -410,26 +410,69 @@ impl Machine {
             )));
         }
 
-        // TIM2（tick 推进 + 溢出 → NVIC IRQ28；DIER.UDE → 更新事件 DMA 请求）
-        let tim2 = Arc::new(Mutex::new(Tim2::new(2, events.clone(), self.nvic.clone())));
-        self.bus.lock().unwrap().attach(0x4000_0000, 0x400, "TIM2", tim2.clone())?;
-        // 注册 TIM 句柄到 DMA1（内存→外设搬运经句柄按 DCR 突发写 DMAR）
-        self.dma.lock().unwrap().register_tim(2, tim2.clone());
-        self.timers.lock().unwrap().push(tim2);
+        // TIM1-8（tick 推进 + 溢出 → NVIC 更新中断；DIER.UDE → 更新事件 DMA 请求）。
+        // 类别/位宽/中断号按 F407 硬件：TIM1/8 高级 16 位，TIM2/5 通用 32 位，
+        // TIM3/4 通用 16 位，TIM6/7 基本 16 位（无捕获/比较通道）。
+        // 更新事件 DMA 映射采用 HAL 默认流（TIM1/8 → DMA2，TIM2-7 → DMA1）。
+        let tim_cfgs: &[(u8, u32, &str, TimerKind, u32, TimerIrq)] = &[
+            // (port, base, name, kind, bits, irq)
+            (1, 0x4001_0000, "TIM1", TimerKind::Advanced, 16,
+             TimerIrq { brk: 24, up: 25, trig_com: 26, cc: 27 }),
+            (2, 0x4000_0000, "TIM2", TimerKind::General, 32,
+             TimerIrq { brk: 28, up: 28, trig_com: 28, cc: 28 }),
+            (3, 0x4000_0400, "TIM3", TimerKind::General, 16,
+             TimerIrq { brk: 29, up: 29, trig_com: 29, cc: 29 }),
+            (4, 0x4000_0800, "TIM4", TimerKind::General, 16,
+             TimerIrq { brk: 30, up: 30, trig_com: 30, cc: 30 }),
+            (5, 0x4000_0C00, "TIM5", TimerKind::General, 32,
+             TimerIrq { brk: 50, up: 50, trig_com: 50, cc: 50 }),
+            (6, 0x4000_1000, "TIM6", TimerKind::Basic, 16,
+             TimerIrq { brk: 54, up: 54, trig_com: 54, cc: 54 }),
+            (7, 0x4000_1400, "TIM7", TimerKind::Basic, 16,
+             TimerIrq { brk: 55, up: 55, trig_com: 55, cc: 55 }),
+            (8, 0x4001_0400, "TIM8", TimerKind::Advanced, 16,
+             TimerIrq { brk: 43, up: 44, trig_com: 45, cc: 46 }),
+        ];
+        for (port, base, name, kind, bits, irq) in tim_cfgs {
+            let cfg = TimerConfig { name, kind: *kind, bits: *bits, irq: *irq };
+            let tim = Arc::new(Mutex::new(Timer::new(*port, cfg, events.clone(), self.nvic.clone())));
+            self.bus
+                .lock()
+                .unwrap()
+                .attach(*base, 0x400, format!("{name}"), tim.clone())?;
+            // 注册 TIM 句柄到对应 DMA 控制器（TIM1/8 → DMA2，TIM2-7 → DMA1，
+            // 内存→外设搬运经句柄按 DCR 突发写 DMAR）
+            let reg_ctrl = if *port == 1 || *port == 8 { self.dma2.clone() } else { self.dma.clone() };
+            reg_ctrl.lock().unwrap().register_tim(*port, tim.clone());
+            self.timers.lock().unwrap().push(tim);
+        }
 
-        // TIM2 更新事件 → DMA 请求（F407 固定映射：TIM2_UP → DMA1_Stream5_Channel5，
-        // HAL 默认流；方向按流 CR.DIR 取，支持 PWM 装载（内存→外设）与捕获（外设→内存））
+        // TIM 更新事件 → DMA 请求（F407 固定映射 + HAL 默认流，见
+        // STM32F4xx_hal_tim.c TIM_DMA_GetConfig：TIM1_UP→DMA2_S5_Ch6、
+        // TIM2_UP→DMA1_S5_Ch5、TIM3_UP→DMA1_S3_Ch5、TIM4_UP→DMA1_S3_Ch2、
+        // TIM5_UP→DMA1_S6_Ch6、TIM6_UP→DMA1_S0_Ch7、TIM7_UP→DMA1_S5_Ch4、
+        // TIM8_UP→DMA2_S3_Ch7；方向按流 CR.DIR 取，支持 PWM 装载（内存→外设）
+        // 与捕获（外设→内存））
         let dma1 = self.dma.clone();
+        let dma2 = self.dma2.clone();
         events.lock().unwrap().subscribe(Arc::new(Mutex::new(
             move |ev: &Event| {
                 if let Event::TimUpdate { port } = ev {
-                    if *port == 2 {
-                        let (stream, channel) = (5, 5); // TIM2_UP: DMA1_Stream5_Channel5
-                        let dir = dma1.lock().unwrap().stream_dir(stream);
-                        dma1.lock()
-                            .unwrap()
-                            .service_stream(stream, channel, dir, crate::peripheral::dma::DmaTarget::Tim(*port));
-                    }
+                    let (ctrl, stream, channel) = match *port {
+                        1 => (dma2.clone(), 5, 6), // TIM1_UP: DMA2_Stream5_Channel6
+                        2 => (dma1.clone(), 5, 5), // TIM2_UP: DMA1_Stream5_Channel5
+                        3 => (dma1.clone(), 3, 5), // TIM3_UP: DMA1_Stream3_Channel5
+                        4 => (dma1.clone(), 3, 2), // TIM4_UP: DMA1_Stream3_Channel2
+                        5 => (dma1.clone(), 6, 6), // TIM5_UP: DMA1_Stream6_Channel6
+                        6 => (dma1.clone(), 0, 7), // TIM6_UP: DMA1_Stream0_Channel7
+                        7 => (dma1.clone(), 5, 4), // TIM7_UP: DMA1_Stream5_Channel4
+                        8 => (dma2.clone(), 3, 7), // TIM8_UP: DMA2_Stream3_Channel7
+                        _ => return,
+                    };
+                    let dir = ctrl.lock().unwrap().stream_dir(stream);
+                    ctrl.lock()
+                        .unwrap()
+                        .service_stream(stream, channel, dir, crate::peripheral::dma::DmaTarget::Tim(*port));
                 }
             },
         )));
