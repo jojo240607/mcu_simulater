@@ -17,6 +17,7 @@ use crate::events::{Event, EventBus};
 use crate::peripheral::adc::{Adc, ADC_IRQ};
 use crate::peripheral::dac::Dac;
 use crate::peripheral::console::Console;
+use crate::peripheral::crc::Crc;
 use crate::peripheral::terminal::Terminal;
 use crate::peripheral::dma::{Dma, DmaDir, DMA1_BASE, DMA1_STREAM_IRQ, DMA2_BASE, DMA2_STREAM_IRQ};
 use crate::peripheral::exti::{Exti, EXTI_BASE};
@@ -472,6 +473,13 @@ impl Machine {
                 }
             },
         )));
+
+        // M8-CRC 计算单元（@0x40023000，AHB1）。
+        // 32 位 CRC-32/MPEG-2 风格：DR 写数据（8/16/32 位）按 MSB 先推进计算、读 DR 返回
+        // 当前值；CR.RESET 写 1 复位计算单元（回 0xFFFFFFFF）；IDR 为不影响计算的独立
+        // 数据寄存器。无时钟门控（F407 RCC 无 CRCEN 位，始终使能）、无中断/DMA/tick。
+        let crc = Arc::new(Mutex::new(Crc::new()));
+        self.bus.lock().unwrap().attach(0x4002_3000, 0x100, "CRC", crc.clone())?;
 
         // TIM1-14（tick 推进 + 溢出 → NVIC 更新中断；TIM1-8 的 DIER.UDE → 更新事件
         // DMA 请求，TIM9-14 无 DMA 请求能力）。类别/位宽/通道数/中断号按 F407 硬件：
