@@ -15,6 +15,7 @@ use crate::bus::Bus;
 use crate::core::{CoreError, Cpu, Result};
 use crate::events::{Event, EventBus};
 use crate::peripheral::adc::{Adc, ADC_IRQ};
+use crate::peripheral::can::{Can, CAN1_BASE, CAN2_BASE};
 use crate::peripheral::dac::Dac;
 use crate::peripheral::console::Console;
 use crate::peripheral::crc::Crc;
@@ -84,6 +85,10 @@ pub struct Machine {
     pub fsmc: Arc<Mutex<Fsmc>>,
     /// SDIO 安全数字 IO（@0x40012C00；命令/响应 + FIFO + DMA2 + IRQ49 + 虚拟 SD 卡）
     pub sdio: Arc<Mutex<Sdio>>,
+    /// CAN1 控制器局域网（@0x40006400，APB1；邮箱/接收 FIFO/过滤 + CanFrame 总线互联）
+    pub can1: Arc<Mutex<Can>>,
+    /// CAN2 控制器局域网（@0x40006800，APB1；同上，与 CAN1 互联）
+    pub can2: Arc<Mutex<Can>>,
     /// IWDG 独立看门狗（系统复位时复位外设，避免复位后立即再次超时）
     iwdg: Arc<Mutex<Iwdg>>,
     /// WWDG 窗口看门狗（同上）
@@ -130,6 +135,8 @@ impl Machine {
             dcmi: Arc::new(Mutex::new(Dcmi::new(nvic.clone(), DCMI_IRQ))),
             fsmc: Arc::new(Mutex::new(Fsmc::new())),
             sdio: Arc::new(Mutex::new(Sdio::new(events.clone(), nvic.clone()))),
+            can1: Arc::new(Mutex::new(Can::new(1, Some(events.clone()), nvic.clone()))),
+            can2: Arc::new(Mutex::new(Can::new(2, Some(events.clone()), nvic.clone()))),
             iwdg: Arc::new(Mutex::new(Iwdg::new(wdog_req.clone()))),
             wwdg: Arc::new(Mutex::new(Wwdg::new(
                 nvic.clone(),
@@ -750,6 +757,32 @@ impl Machine {
                             *dir,
                             crate::peripheral::dma::DmaTarget::Sdio(*p),
                         ),
+                    }
+                }
+            },
+        )));
+
+        // M15-CAN1/2 控制器局域网（@0x40006400/@0x40006800，APB1 区）。
+        // bxCAN 简化：3 发送邮箱 + 2 接收 FIFO（3 槽）+ 28 滤波器（列表模式）+ 错误管理。
+        // 总线级互联：发送方写 TIxR（TXRQ）→ 发布 CanFrame 事件 → 路由到对端 feed_rx
+        //（过滤通过入 FIFO0、FMP 递增、FMPIE0 使能时挂起 RX IRQ）。CAN1 挂起
+        // IRQ19/20/22（TX/RX0/SCE），CAN2 挂起 IRQ63/64/66。位于外设区 hook 覆盖内，
+        // 直接 attach 即可（无需单独页映射）。
+        let can1 = self.can1.clone();
+        self.bus.lock().unwrap().attach(CAN1_BASE, 0x400, "CAN1", can1)?;
+        let can2 = self.can2.clone();
+        self.bus.lock().unwrap().attach(CAN2_BASE, 0x400, "CAN2", can2)?;
+        // CanFrame 事件 → 路由到对端 CAN（CAN1↔CAN2 互联；feed_rx 只挂 IRQ 不发布，
+        // 无事件重入死锁风险）
+        let c1 = self.can1.clone();
+        let c2 = self.can2.clone();
+        events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+            move |ev: &Event| {
+                if let Event::CanFrame { frame } = ev {
+                    match frame.port {
+                        1 => c2.lock().unwrap().feed_rx((**frame).clone()),
+                        2 => c1.lock().unwrap().feed_rx((**frame).clone()),
+                        _ => {}
                     }
                 }
             },

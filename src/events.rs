@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::peripheral::can::CanFrame;
 use crate::peripheral::dma::DmaDir;
 
 /// 事件类型（M0 占位，M3 起按外设扩展）
@@ -46,6 +47,8 @@ pub enum Event {
     /// SDIO DMA 请求（SDIO → DMA2；读=外设→内存、写=内存→外设。
     /// items>0 表示读 FIFO 现成字数；items=0 表示写方向，由 DMA 侧取流 NDTR）
     SdioDma { port: u8, dir: DmaDir, items: u32 },
+    /// CAN 帧总线级互联（CAN TX 发布 → 对端 CAN/测试订阅；驱动接收 FIFO + 中断）
+    CanFrame { frame: Box<CanFrame> },
     /// 占位：其它事件后续按需扩展
     Other(String),
 }
