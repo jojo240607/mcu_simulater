@@ -259,14 +259,38 @@ mcu_simulater/
 
 ## 7. 里程碑
 
-| 阶段 | 内容 | 验收标准 |
+### 7.1 已达成
+
+| 阶段 | 内容 | 状态 |
 |---|---|---|
-| M0 内核骨架 | 工程 + unicorn-engine + M4F/VFP4 验证 + ELF 加载 | 跑通含浮点运算的裸机代码 |
-| M1 总线+时序+最小 GDB | Memory Bus + hook 转发；路线 B 周期计数 + 调度器；GDB 最小集 | GDB 可读写寄存器/内存并控制运行 |
-| M2 中断+MPU（重难点） | Rust NVIC + 异常栈帧 + BX LR 拦截 + SysTick + MPU 基础（寄存器/访问控制/MemManage fault）；GDB 单步/断点 | Timer 溢出进中断服务函数；越权访问触发 MemManage |
-| M3 外设 T1 集 + 事件总线 | GPIO + USART1-3 + 虚拟 Console + TIM2 + RCC 存根；connect 语法 | blinky / printf / 中断 demo 跑通 |
-| M4 T2 增强 | RCC 时钟树、EXTI、DMA、看门狗、优先级完整、MPU 完善（sub-region/别名/精确语义） | 可运行 FreeRTOS（依赖 MPU 隔离） |
-| M5 虚拟外设生态 | LED 面板/终端/逻辑分析仪、多架构（RISC-V）、性能调优 | 任意外设互联 |
+| M0 内核骨架 | 工程 + unicorn-engine + M4F/VFP4 验证 + ELF 加载 | ✅ |
+| M1 总线+时序 | Memory Bus + hook 转发 + 块级加权虚拟时钟 | ✅ |
+| M2 中断+MPU | Rust NVIC + 异常栈帧 + BX LR 拦截 + SysTick + MPU（默认全强制/MemManage） | ✅ |
+| M3 外设 T1 集 | GPIO + USART1-6 + 虚拟 Console/Terminal + TIM2 + RCC 存根 + connect 语法 | ✅ |
+| M4 T2 增强 | RCC 时钟树、SYSCFG/EXTI、DMA1/DMA2、IWDG/WWDG、优先级完整 | ✅ |
+| M5 外设 T2 集 | I2C1-3 + SPI1-3 + ADC1-3（轮询/中断/DMA 各模式端到端） | ✅ |
+| M6 外设 T2 集（定时器） | TIM1-14 通用化 + 高级互补输出/死区/刹车 + DMA 突发装载 + TIM9-14 参数化 | ✅ |
+
+### 7.2 外设补全路线（待实施，从易到难）
+
+> F407 片内外设已实现：GPIO/USART/I2C/SPI/ADC/TIM/DMA/EXTI/SYSCFG/RCC/WDG。
+> 下表按**从易到难**排列剩余外设，作为后续增量实施的推进顺序。每项独立成里程碑，
+> 遵循既有约定：外设文件 `src/peripheral/<name>.rs` + `machine/mod.rs` 挂载 +
+> 事件接入（如需）+ 验收固件 + 集成测试。
+
+| 序号 | 外设 | 地址 | 复杂度 | 内容 | 验收标准 |
+|---|---|---|---|---|---|
+| 1 | **DAC** | 0x40007400 | 低 | 12 位 2 通道：DHR→DOR 锁存、触发源（软件/定时器）、DMA 请求、输出经 `DacLevel` 事件发布 | 写 DHR 后 DOR 反映转换值；事件捕获电平；DMA 搬运 |
+| 2 | **CRC** | 0x40023000 | 低 | 32 位 CRC 计算单元：DR/IDR/CR；多项式 0x04C11DB7，按字推进 | 写数据序列后读回 CRC 校验值与参考实现一致 |
+| 3 | **RNG** | 0x50060800 | 低 | 真随机数发生器：CR 使能 + SR.DRDY + DR；随机性经测试种子可控 | 使能后 DR 有效且逐次变化；错误标志（SEIS/CEIS） |
+| 4 | **PWR** | 0x40007000 | 低-中 | 电源控制：CR（LPRUN/待机）、CSR（WUF/SBF）、待机唤醒（WKUP 引脚/备份） | 写低功耗位后状态寄存器联动；唤醒事件触发复位路径 |
+| 5 | **RTC + BKP** | 0x40002800 / 0x40002400 | 中 | 日历计数（预分频/TR）、闹钟/唤醒中断、写保护解锁、BKP 备份寄存器保持 | RTC 计数随虚拟时钟推进；闹钟触发 IRQ；BKP 写读保持 |
+| 6 | **DCMI** | 0x50050000 | 中 | 摄像头接口：同步/像素采样、帧/行事件、DMA 搬运（简化：`DcmiFrame` 事件注入帧数据） | 注入一帧后 FIFO/DR 可见且 DMA 搬运入内存 |
+| 7 | **FSMC** | 0xA0000000 | 中 | 外部存储器控制器：NOR/SRAM/PSRAM 片选窗口、读/写时序（简化为窗口映射） | 片选窗口地址可读写；Bank 映射命中 |
+| 8 | **SDIO** | 0x40012C00 | 高 | SD 卡接口：命令/响应路径、数据 FIFO、DMA、中断；虚拟 SD 卡（简化块读写） | 发送 CMD 后响应寄存器正确；块读写经 DMA 搬运 |
+| 9 | **CAN1/2** | 0x40006400 / 0x40006800 | 高 | 报文收发：邮箱/发送 FIFO/接收 FIFO、过滤、位时序、错误管理；总线级 `CanFrame` 事件互联 | 发送帧事件被对端订阅捕获；接收 FIFO 置 Pending 触发中断 |
+| 10 | **USB OTG FS/HS** | 0x50000000 / 0x40040000 | 很高 | 枚举/端点/描述符、控制/批量传输、VBUS；虚拟主机（简化：`UsbSetup` 事件注入） | 固件枚举成功；批量端点收发数据 |
+| 11 | **以太网 MAC** | 0x40028000 | 很高 | 帧收发、MAC 配置、DMA 描述符环、中断；虚拟网络（`EthFrame` 事件） | 发送帧被虚拟对端接收；接收帧进描述符环触发 DMA |
 
 ## 8. 风险与注意点
 

@@ -30,6 +30,10 @@ pub enum Event {
     SpiDma { port: u8, dir: DmaDir },
     /// ADC 模拟采样（测试/虚拟传感器 → ADC，驱动一次转换：DR 锁存 + EOC + DMA 请求）
     AdcValue { port: u8, channel: u8, value: u16 },
+    /// DAC 输出电平变化（DHR→DOR 转换完成 → 虚拟示波器/测试订阅，12 位）
+    DacLevel { port: u8, channel: u8, level: u16 },
+    /// DAC DMA 请求（触发转换且 CR.DMAEN 置位 → 内存→外设搬运：DMA 写 DHR 再转换）
+    DacDma { port: u8, channel: u8, dir: DmaDir },
     /// TIM 更新事件（TIM 计数溢出/软件更新 → Machine 路由 DMA 请求。
     /// 仅 DIER.UDE 使能时发布，等价硬件"更新事件 → DMA 请求"）
     TimUpdate { port: u8 },

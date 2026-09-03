@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::Cpu;
 use crate::peripheral::adc::Adc;
+use crate::peripheral::dac::Dac;
 use crate::peripheral::i2c::I2c;
 use crate::peripheral::nvic::Nvic;
 use crate::peripheral::spi::Spi;
@@ -80,6 +81,8 @@ pub enum DmaTarget {
     Spi(u8),
     /// ADC 外设（port 1..3，DMA 经 [`Adc::dma_read_dr`] 读 DR，12 位采样值）
     Adc(u8),
+    /// DAC 外设（port 1，DMA 经 [`Dac::dma_write_dr`] 写 DHR，内存→外设）
+    Dac(u8),
     /// TIM 外设（port 1..8，DMA 经 [`Timer::dma_write_dr`]/[`Timer::dma_read_dr`] 按
     /// DCR.DBA/DBL 突发访问 DMAR 目标寄存器）
     Tim(u8),
@@ -149,6 +152,8 @@ pub struct Dma {
     spi_handles: [Option<Arc<Mutex<Spi>>>; 3],
     /// 注册的 ADC 句柄（index 0..2 = ADC1..3，外设→内存搬运直接读 DR）
     adc_handles: [Option<Arc<Mutex<Adc>>>; 3],
+    /// 注册的 DAC 句柄（index 0 = DAC1，内存→外设搬运直接写 DHR）
+    dac_handles: [Option<Arc<Mutex<Dac>>>; 1],
     /// 注册的 TIM 句柄（index 0..7 = TIM1..8，DMA 经 [`Timer::dma_write_dr`] 写 DR）
     tim_handles: [Option<Arc<Mutex<Timer>>>; 8],
 }
@@ -167,6 +172,7 @@ impl Dma {
             i2c_handles: Default::default(),
             spi_handles: Default::default(),
             adc_handles: Default::default(),
+            dac_handles: Default::default(),
             tim_handles: Default::default(),
         }
     }
@@ -205,6 +211,15 @@ impl Dma {
     pub fn register_adc(&mut self, port: u8, adc: Arc<Mutex<Adc>>) {
         if (1..=3).contains(&port) {
             self.adc_handles[(port - 1) as usize] = Some(adc);
+        }
+    }
+
+    /// 注册 DAC 句柄（供内存→外设搬运写 DHR）。
+    ///
+    /// Machine 挂载 DAC1 时对 DMA1 调用；`port` 取值 1（STM32F407 仅 DAC1）。
+    pub fn register_dac(&mut self, port: u8, dac: Arc<Mutex<Dac>>) {
+        if port == 1 {
+            self.dac_handles[0] = Some(dac);
         }
     }
 
@@ -361,6 +376,11 @@ impl Dma {
                     .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),
                 DmaTarget::Adc(port) => self
                     .adc_handles
+                    .get((port as usize).wrapping_sub(1))
+                    .and_then(|h| h.clone())
+                    .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),
+                DmaTarget::Dac(port) => self
+                    .dac_handles
                     .get((port as usize).wrapping_sub(1))
                     .and_then(|h| h.clone())
                     .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),

@@ -15,6 +15,7 @@ use crate::bus::Bus;
 use crate::core::{CoreError, Cpu, Result};
 use crate::events::{Event, EventBus};
 use crate::peripheral::adc::{Adc, ADC_IRQ};
+use crate::peripheral::dac::Dac;
 use crate::peripheral::console::Console;
 use crate::peripheral::terminal::Terminal;
 use crate::peripheral::dma::{Dma, DmaDir, DMA1_BASE, DMA1_STREAM_IRQ, DMA2_BASE, DMA2_STREAM_IRQ};
@@ -409,6 +410,68 @@ impl Machine {
                 },
             )));
         }
+
+        // DAC1（STM32F407 唯一 DAC，2 通道 12 位，@0x40007400）。
+        // 触发源：软件（SWTRIGR，TSEL=7）+ 定时器（TSEL=0..5，订阅 TimUpdate 路由）；
+        // 触发转换 → DacLevel 事件发布（虚拟示波器/测试订阅），CR.DMAENx 置位时发布
+        // DacDma 请求内存→外设搬运（DMA 写 DHR12Rx 再转换）。DMA 映射（RM0090）：
+        // DAC1_CH1 → DMA1_Stream5_Channel7、DAC1_CH2 → DMA1_Stream6_Channel7。
+        let dac = Arc::new(Mutex::new(Dac::new(1, events.clone())));
+        self.bus
+            .lock()
+            .unwrap()
+            .attach(0x4000_7400, 0x400, "DAC", dac.clone())?;
+        // 注册 DAC 句柄到 DMA1（内存→外设搬运经句柄直接写 DHR）
+        self.dma.lock().unwrap().register_dac(1, dac.clone());
+        // 推入时钟外设列表：DAC 无计数语义，tick 仅冲刷定时器触发暂存的电平事件
+        self.timers.lock().unwrap().push(dac.clone());
+
+        // DAC 触发 → DMA 请求（内存→外设：DMA 写 DHR 再转换）
+        let dma1_for_dac = self.dma.clone();
+        events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+            move |ev: &Event| {
+                if let Event::DacDma { port: p, channel, .. } = ev {
+                    if *p != 1 {
+                        return;
+                    }
+                    let (stream, channel) = match *channel {
+                        1 => (5, 7), // DAC1_CH1: DMA1_Stream5_Channel7
+                        2 => (6, 7), // DAC1_CH2: DMA1_Stream6_Channel7
+                        _ => return,
+                    };
+                    dma1_for_dac.lock().unwrap().service_stream(
+                        stream,
+                        channel,
+                        DmaDir::MemToPeriph,
+                        crate::peripheral::dma::DmaTarget::Dac(*p),
+                    );
+                }
+            },
+        )));
+
+        // DAC 定时器触发：订阅 TimUpdate，TSEL 匹配通道锁存 DHR→DOR 并发起 DMA 请求
+        //（事件分发回调内不发布事件——二次 publish 死锁，电平由 DAC::tick 冲刷发布；
+        //  DMA 请求在 timer_trigger 之后对锁存通道直接路由，见 [`Dac::dma_requested`]）
+        let dac_for_tim = dac.clone();
+        let dma1_for_tim = self.dma.clone();
+        events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+            move |ev: &Event| {
+                if let Event::TimUpdate { port } = ev {
+                    let latched = dac_for_tim.lock().unwrap().timer_trigger(*port);
+                    for ch in 1..=2u8 {
+                        if latched & (1 << (ch - 1)) != 0 && dac_for_tim.lock().unwrap().dma_requested(ch) {
+                            let (stream, channel) = if ch == 1 { (5, 7) } else { (6, 7) };
+                            dma1_for_tim.lock().unwrap().service_stream(
+                                stream,
+                                channel,
+                                DmaDir::MemToPeriph,
+                                crate::peripheral::dma::DmaTarget::Dac(1),
+                            );
+                        }
+                    }
+                }
+            },
+        )));
 
         // TIM1-14（tick 推进 + 溢出 → NVIC 更新中断；TIM1-8 的 DIER.UDE → 更新事件
         // DMA 请求，TIM9-14 无 DMA 请求能力）。类别/位宽/通道数/中断号按 F407 硬件：

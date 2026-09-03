@@ -5,6 +5,7 @@
 
 pub mod adc;
 pub mod console;
+pub mod dac;
 pub mod dma;
 pub mod exti;
 pub mod gpio;
