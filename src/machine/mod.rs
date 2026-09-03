@@ -166,7 +166,7 @@ impl Machine {
         // 仍映射为普通内存避免读写异常，同时由 mem hook 转发到总线上的 SCB 外设。
         self.cpu.mem_map(0xE000_E000, 0x0000_1000, Prot::ALL)?;
         self.attach_system_control()?;
-        // M3 T1 外设集：GPIOA-E + USART1-3 + TIM2 + RCC 存根
+        // M3 T1 外设集：GPIOA-I + USART1-3 + TIM2 + RCC 存根
         self.attach_t1_peripherals()?;
         Ok(())
     }
@@ -244,7 +244,7 @@ impl Machine {
         Ok(())
     }
 
-    /// 挂载外设集：GPIOA-E + USART1-6 + TIM2 + RCC 存根 + SYSCFG/EXTI + 虚拟 Console/Terminal。
+    /// 挂载外设集：GPIOA-I + USART1-6 + TIM2 + RCC 存根 + SYSCFG/EXTI + 虚拟 Console/Terminal。
     ///
     /// 外设区 0x40000000..0x40024000 通过 mem hook 转发到总线（MPU 检查 + 读注入），
     /// 与 SCB 窗口相同的 MMIO 链路。TIM2 加入时钟外设列表由 block hook 推进；
@@ -273,8 +273,8 @@ impl Machine {
         let rcc = self.rcc.clone();
         self.bus.lock().unwrap().attach(0x4002_3800, 0x400, "RCC", rcc)?;
 
-        // GPIOA-E（port 0..4）
-        for port in 0..5u8 {
+        // GPIOA-I（port 0..8；F407 共 9 个端口，基址 0x40020000 起每 0x400 一个）
+        for port in 0..9u8 {
             let gpio = Arc::new(Mutex::new(Gpio::new(port, events.clone())));
             let base = 0x4002_0000 + (port as u32) * 0x400;
             self.bus.lock().unwrap().attach(base, 0x400, format!("GPIO{}", (b'A' + port) as char), gpio)?;
@@ -1109,7 +1109,7 @@ impl Machine {
             false
         })?;
 
-        log::info!("T1 外设已挂载：GPIOA-E + USART1-6 + I2C1-3 + SPI1-3 + ADC1-3 + TIM1-14 + RCC + SYSCFG/EXTI + DMA1/DMA2 + Console/Terminal @ 0x{periph_base:08X} +0x{periph_size:X}");
+        log::info!("T1 外设已挂载：GPIOA-I + USART1-6 + I2C1-3 + SPI1-3 + ADC1-3 + TIM1-14 + RCC + SYSCFG/EXTI + DMA1/DMA2 + Console/Terminal @ 0x{periph_base:08X} +0x{periph_size:X}");
         Ok(())
     }
 
