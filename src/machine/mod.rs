@@ -27,6 +27,7 @@ use crate::peripheral::mpu::{Access, MemManageFault, Mpu};
 use crate::peripheral::nvic::{Nvic, StopReason};
 use crate::peripheral::rcc::Rcc;
 use crate::peripheral::rng::{Rng, RNG_IRQ};
+use crate::peripheral::pwr::Pwr;
 use crate::peripheral::scb::SystemControl;
 use crate::peripheral::spi::{Spi, SPI1_IRQ, SPI2_IRQ, SPI3_IRQ};
 use crate::peripheral::syscfg::{ExtiPortSelect, Syscfg};
@@ -66,12 +67,14 @@ pub struct Machine {
     rcc: Arc<Mutex<Rcc>>,
     /// RNG 真随机数发生器（@0x50060800，AHB2；seed 可控供测试复现）
     pub rng: Arc<Mutex<Rng>>,
+    /// PWR 电源控制（@0x40007000；低功耗位 + WUF/SBF 标志 + 待机唤醒复位路径）
+    pub pwr: Arc<Mutex<Pwr>>,
     /// IWDG 独立看门狗（系统复位时复位外设，避免复位后立即再次超时）
     iwdg: Arc<Mutex<Iwdg>>,
     /// WWDG 窗口看门狗（同上）
     wwdg: Arc<Mutex<Wwdg>>,
-    /// 看门狗复位请求（IWDG/WWDG 置位，block hook 停机，run() 执行系统复位）
-    wdog_req: Arc<WdogResetReq>,
+    /// 看门狗复位请求（IWDG/WWDG/PWR 待机唤醒置位，block hook 停机，run() 执行系统复位）
+    pub wdog_req: Arc<WdogResetReq>,
     /// 初始 SP（向量表首字）
     pub initial_sp: u32,
     /// 复位向量（向量表第二字，含 Thumb 位处理见 [`Machine::reset`]）
@@ -105,6 +108,7 @@ impl Machine {
                 nvic.clone(),
                 RNG_IRQ,
             ))),
+            pwr: Arc::new(Mutex::new(Pwr::new(wdog_req.clone()))),
             iwdg: Arc::new(Mutex::new(Iwdg::new(wdog_req.clone()))),
             wwdg: Arc::new(Mutex::new(Wwdg::new(
                 nvic.clone(),
@@ -718,6 +722,14 @@ impl Machine {
         let wwdg = self.wwdg.clone();
         self.bus.lock().unwrap().attach(0x4000_2C00, 0x400, "WWDG", wwdg.clone())?;
         self.timers.lock().unwrap().push(wwdg);
+
+        // M10-PWR 电源控制（@0x40007000，APB1）。
+        // CR 低功耗位写读 + CWUF/CSBF 写 1 清 WUF/SBF；CSR.WUF/SBF/PVDO 只读标志
+        // 经 [`Pwr::inject_*`] 注入（模拟 WKUP/PVD 事件）。待机唤醒复位：固件/测试
+        // 先 enter_standby（模拟 WFI/WFE）再 inject_wakeup → 经共享复位请求
+        // （同一 wdog_req 链路）发出 ResetReason::LowPower，run() 执行系统复位。
+        let pwr = self.pwr.clone();
+        self.bus.lock().unwrap().attach(0x4000_7000, 0x400, "PWR", pwr)?;
 
         // M4-EXTI：SYSCFG（EXTICR 端口选择） + EXTI（外部中断，GPIO 事件 → NVIC）
         let port_select = Arc::new(Mutex::new(ExtiPortSelect::default()));

@@ -32,6 +32,8 @@ pub enum ResetReason {
     Iwdg,
     /// 窗口看门狗超时/窗口违规（CSR.WWDGRSTF = bit27）
     Wwdg,
+    /// 低功耗唤醒复位（PWR 待机唤醒；CSR.LPWRRSTF = bit31）
+    LowPower,
 }
 
 /// 共享看门狗复位请求：IWDG/WWDG 置位，Machine 消费（见 [`Machine::run`]）。

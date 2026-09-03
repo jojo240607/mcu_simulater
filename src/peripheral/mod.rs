@@ -13,6 +13,7 @@ pub mod gpio;
 pub mod i2c;
 pub mod mpu;
 pub mod nvic;
+pub mod pwr;
 pub mod rcc;
 pub mod rng;
 pub mod scb;

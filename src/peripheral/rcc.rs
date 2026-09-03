@@ -55,14 +55,16 @@ const CR_PLLON: u32 = 1 << 24;
 const CR_PLLRDY: u32 = 1 << 25;
 
 /// CSR 复位标志位（F407 硬件位）
+/// - bit31 LPWRRSTF：低功耗唤醒复位标志
 /// - bit28 IWDGRSTF：独立看门狗复位标志
 /// - bit27 WWDGRSTF：窗口看门狗复位标志
 /// - bit24 RMVF：清除复位标志（写 1 清除全部复位标志）
+const CSR_LPWRRSTF: u32 = 1 << 31;
 const CSR_IWDGRSTF: u32 = 1 << 28;
 const CSR_WWDGRSTF: u32 = 1 << 27;
 const CSR_RMVF: u32 = 1 << 24;
 /// 全部复位标志（RMVF 写 1 时清除这些位）
-const CSR_RESET_FLAGS: u32 = CSR_IWDGRSTF | CSR_WWDGRSTF;
+const CSR_RESET_FLAGS: u32 = CSR_LPWRRSTF | CSR_IWDGRSTF | CSR_WWDGRSTF;
 
 /// 时钟树推导结果（Hz）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,12 +97,13 @@ impl Rcc {
         r
     }
 
-    /// 记录一次看门狗复位原因（置对应 CSR 复位标志位，供固件/测试查询）。
+    /// 记录一次复位原因（置对应 CSR 复位标志位，供固件/测试查询）。
     pub fn record_reset(&mut self, reason: ResetReason) {
         let csr = self.regs[(OFF_CSR / 4) as usize];
         let flag = match reason {
             ResetReason::Iwdg => CSR_IWDGRSTF,
             ResetReason::Wwdg => CSR_WWDGRSTF,
+            ResetReason::LowPower => CSR_LPWRRSTF,
         };
         self.regs[(OFF_CSR / 4) as usize] = csr | flag;
     }
