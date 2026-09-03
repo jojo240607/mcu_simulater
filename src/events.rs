@@ -49,6 +49,8 @@ pub enum Event {
     SdioDma { port: u8, dir: DmaDir, items: u32 },
     /// CAN 帧总线级互联（CAN TX 发布 → 对端 CAN/测试订阅；驱动接收 FIFO + 中断）
     CanFrame { frame: Box<CanFrame> },
+    /// USB 主机 SETUP 包（虚拟主机/测试注入 → USB OTG 设备模式；驱动 DOEPINT0.STUP + RXFLVL）
+    UsbSetup { data: [u8; 8] },
     /// 占位：其它事件后续按需扩展
     Other(String),
 }

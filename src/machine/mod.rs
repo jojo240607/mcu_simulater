@@ -22,6 +22,7 @@ use crate::peripheral::crc::Crc;
 use crate::peripheral::dcmi::{Dcmi, DCMI_IRQ};
 use crate::peripheral::terminal::Terminal;
 use crate::peripheral::dma::{Dma, DmaDir, DMA1_BASE, DMA1_STREAM_IRQ, DMA2_BASE, DMA2_STREAM_IRQ};
+use crate::peripheral::usb_otg::{UsbOtg, USB_OTG_FS_BASE};
 use crate::peripheral::exti::{Exti, EXTI_BASE};
 use crate::peripheral::fsmc::{
     Fsmc, FSMC_BANK1_BASE, FSMC_BANK2_BASE, FSMC_BANK3_BASE, FSMC_BANK4_BASE, FSMC_BANK_SIZE,
@@ -89,6 +90,9 @@ pub struct Machine {
     pub can1: Arc<Mutex<Can>>,
     /// CAN2 控制器局域网（@0x40006800，APB1；同上，与 CAN1 互联）
     pub can2: Arc<Mutex<Can>>,
+    /// USB OTG FS 全速设备控制器（@0x50000000，AHB1；设备模式核心寄存器/端点/
+    /// FIFO/枚举 + 虚拟主机 UsbSetup 事件注入 + OTG_FS_IRQ=67）
+    pub usb_otg: Arc<Mutex<UsbOtg>>,
     /// IWDG 独立看门狗（系统复位时复位外设，避免复位后立即再次超时）
     iwdg: Arc<Mutex<Iwdg>>,
     /// WWDG 窗口看门狗（同上）
@@ -137,6 +141,10 @@ impl Machine {
             sdio: Arc::new(Mutex::new(Sdio::new(events.clone(), nvic.clone()))),
             can1: Arc::new(Mutex::new(Can::new(1, Some(events.clone()), nvic.clone()))),
             can2: Arc::new(Mutex::new(Can::new(2, Some(events.clone()), nvic.clone()))),
+            usb_otg: Arc::new(Mutex::new(UsbOtg::new(
+                Some(events.clone()),
+                nvic.clone(),
+            ))),
             iwdg: Arc::new(Mutex::new(Iwdg::new(wdog_req.clone()))),
             wwdg: Arc::new(Mutex::new(Wwdg::new(
                 nvic.clone(),
@@ -784,6 +792,62 @@ impl Machine {
                         2 => c1.lock().unwrap().feed_rx((**frame).clone()),
                         _ => {}
                     }
+                }
+            },
+        )));
+
+        // M16-USB OTG FS 全速设备控制器（@0x50000000，AHB1 区）。
+        // 设备模式简化：全局寄存器 + 4 IN/4 OUT 端点 + 数据 FIFO + 枚举。
+        // 虚拟主机侧经 inject_usb_reset/inject_setup/inject_out 注入（总线复位/
+        // SETUP 包/OUT 数据 → 接收 FIFO + GRXSTSP + DOEPINT.STUP/XFRC + RXFLVL），
+        // 固件写 DFIFOx+DIEPCTL.EPENA 完成 IN（DIEPINT.XFRC）。挂起 OTG_FS_IRQ=67
+        //（GINTMSK + DAINTMSK×DIEPMSK/DOEPMSK 门控）。USB 区位于外设区
+        // 0x40000000..0x40040000 之外（AHB1 0x50000000），需单独映射 + 转发 hook。
+        let usb = self.usb_otg.clone();
+        self.bus
+            .lock()
+            .unwrap()
+            .attach(USB_OTG_FS_BASE, 0x5000, "USB_OTG_FS", usb)?;
+        // USB OTG FS 位于 AHB1 0x50000000（外设区 0x40000000..0x40040000 之外），
+        // 需单独映射 + 转发 hook（同一 MPU 链路），否则 CPU 访问 READ_UNMAPPED。
+        {
+            let usb_base: u64 = USB_OTG_FS_BASE as u64;
+            self.cpu.mem_map(usb_base, 0x5000, Prot::ALL)?;
+            let bus = self.bus.clone();
+            let mpu = self.mpu.clone();
+            self.cpu
+                .add_mmio_hook(usb_base, usb_base + 0x5000, move |uc, ty, addr, size, value| {
+                    let fault = {
+                        let m = mpu.lock().unwrap();
+                        match mem_type_to_access(ty) {
+                            Some(access) => m.check(addr as u32, access, cpu_privileged(uc)).err(),
+                            None => None,
+                        }
+                    };
+                    if let Some(f) = fault {
+                        fault_and_stop(uc, &mpu, f);
+                        return true;
+                    }
+                    match ty {
+                        MemType::READ => {
+                            if let Ok(v) = bus.lock().unwrap().read(addr as u32, size as u32) {
+                                let _ = uc.mem_write(addr, &v.to_le_bytes()[..size]);
+                            }
+                        }
+                        MemType::WRITE => {
+                            let _ = bus.lock().unwrap().write(addr as u32, size as u32, value as u32);
+                        }
+                        _ => {}
+                    }
+                    false
+                })?;
+        }
+        // UsbSetup 事件（虚拟主机/测试）→ 注入设备模式 SETUP 包（驱动 DOEPINT0.STUP）
+        let u0 = self.usb_otg.clone();
+        events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+            move |ev: &Event| {
+                if let Event::UsbSetup { data } = ev {
+                    u0.lock().unwrap().inject_setup(*data);
                 }
             },
         )));

@@ -27,6 +27,7 @@ pub mod syscfg;
 pub mod terminal;
 pub mod timer;
 pub mod usart;
+pub mod usb_otg;
 pub mod wdog;
 
 /// 总线访问错误
