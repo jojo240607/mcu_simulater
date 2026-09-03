@@ -100,6 +100,12 @@ impl Pwr {
             self.csr &= !CSR_PVDO;
         }
     }
+
+    /// 备份域是否可写（CR.DBP=1）。
+    /// RTC 备份寄存器（BKP0R-19R）写访问需备份域写保护解除，经此查询。
+    pub fn backup_domain_writable(&self) -> bool {
+        self.cr & CR_DBP != 0
+    }
 }
 
 impl Peripheral for Pwr {

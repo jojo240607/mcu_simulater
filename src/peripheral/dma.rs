@@ -36,8 +36,10 @@ use std::sync::{Arc, Mutex};
 use crate::core::Cpu;
 use crate::peripheral::adc::Adc;
 use crate::peripheral::dac::Dac;
+use crate::peripheral::dcmi::Dcmi;
 use crate::peripheral::i2c::I2c;
 use crate::peripheral::nvic::Nvic;
+use crate::peripheral::sdio::Sdio;
 use crate::peripheral::spi::Spi;
 use crate::peripheral::timer::Timer;
 use crate::peripheral::usart::Usart;
@@ -86,6 +88,11 @@ pub enum DmaTarget {
     /// TIM 外设（port 1..8，DMA 经 [`Timer::dma_write_dr`]/[`Timer::dma_read_dr`] 按
     /// DCR.DBA/DBL 突发访问 DMAR 目标寄存器）
     Tim(u8),
+    /// DCMI 外设（port 1，DMA 经 [`Dcmi::dma_read_dr`] 读 DR，外设→内存 32 位字）
+    Dcmi(u8),
+    /// SDIO 外设（port 1，DMA 经 [`Sdio::dma_read_dr`]/[`Sdio::dma_write_dr`] 读写 FIFO，
+    /// 32 位字；外设→内存=卡读、内存→外设=卡写）
+    Sdio(u8),
 }
 
 /// 外设方向 DMA 搬运接口：DR 读写（供 DMA `process` 搬运外设↔内存）。
@@ -156,6 +163,10 @@ pub struct Dma {
     dac_handles: [Option<Arc<Mutex<Dac>>>; 1],
     /// 注册的 TIM 句柄（index 0..7 = TIM1..8，DMA 经 [`Timer::dma_write_dr`] 写 DR）
     tim_handles: [Option<Arc<Mutex<Timer>>>; 8],
+    /// 注册的 DCMI 句柄（index 0 = DCMI1，外设→内存搬运直接读 DR）
+    dcmi_handle: Option<Arc<Mutex<Dcmi>>>,
+    /// 注册的 SDIO 句柄（index 0 = SDIO1，外设↔内存搬运直接读写 FIFO）
+    sdio_handle: Option<Arc<Mutex<Sdio>>>,
 }
 
 impl Dma {
@@ -174,6 +185,8 @@ impl Dma {
             adc_handles: Default::default(),
             dac_handles: Default::default(),
             tim_handles: Default::default(),
+            dcmi_handle: None,
+            sdio_handle: None,
         }
     }
 
@@ -233,6 +246,25 @@ impl Dma {
         }
     }
 
+    /// 注册 DCMI 句柄（供外设→内存搬运读 DR）。
+    ///
+    /// Machine 挂载 DCMI1 时对 DMA2 调用；`port` 取值 1（F407 仅一个 DCMI，
+    /// DMA 映射 DMA2_Stream1_Channel1）。
+    pub fn register_dcmi(&mut self, port: u8, dcmi: Arc<Mutex<Dcmi>>) {
+        if port == 1 {
+            self.dcmi_handle = Some(dcmi);
+        }
+    }
+
+    /// 注册 SDIO 句柄（供外设↔内存搬运读写 FIFO）。
+    ///
+    /// Machine 挂载 SDIO 时对 DMA2 调用（SDIO DMA 在 DMA2，见 F407 请求映射）。
+    pub fn register_sdio(&mut self, port: u8, sdio: Arc<Mutex<Sdio>>) {
+        if port == 1 {
+            self.sdio_handle = Some(sdio);
+        }
+    }
+
     /// 查询流当前配置的传输方向（供 `TimUpdate` 等事件按 CR.DIR 路由对应 [`DmaDir`]）。
     pub fn stream_dir(&self, stream: usize) -> DmaDir {
         let cr = self.stream_reg(stream, 0);
@@ -249,8 +281,27 @@ impl Dma {
     /// - 外设→内存（RX）：每收 1 字节触发 1 次搬运（外设每字节发 1 次请求）；
     /// - 内存→外设（TX）：TXE 就绪一次搬运整个 NDTR（仿真快速发送一次完成）。
     pub fn service_stream(&mut self, stream: usize, channel: u32, dir: DmaDir, target: DmaTarget) {
-        let cr = self.stream_reg(stream, 0);
         let ndtr = self.stream_reg(stream, 1);
+        let items = match dir {
+            DmaDir::PeriphToMem => 1,    // 每收 1 项触发 1 次搬运
+            DmaDir::MemToPeriph => ndtr, // TXE 就绪 → 一次搬完
+        };
+        self.service_stream_n(stream, channel, dir, target, items);
+    }
+
+    /// 处理外设发布的 DMA 请求，显式指定一次搬运项数 `items`。
+    ///
+    /// 同 [`Dma::service_stream`]（校验 EN/CHSEL/DIR），但搬运项数由外设决定：
+    /// 适合一次注入即生成多字数据的批量外设（如 DCMI 注入一帧 → 一次搬完整帧）。
+    pub fn service_stream_n(
+        &mut self,
+        stream: usize,
+        channel: u32,
+        dir: DmaDir,
+        target: DmaTarget,
+        items: u32,
+    ) {
+        let cr = self.stream_reg(stream, 0);
         if cr & CR_EN == 0 {
             return; // 流未使能：忽略请求
         }
@@ -260,10 +311,6 @@ impl Dma {
         if (cr >> 6) & 0x3 != dir.bits() {
             return; // CR.DIR 与请求方向不一致
         }
-        let items = match dir {
-            DmaDir::PeriphToMem => 1,     // 每收 1 字节搬 1 项
-            DmaDir::MemToPeriph => ndtr,  // TXE 就绪 → 一次搬完
-        };
         if items == 0 {
             return;
         }
@@ -389,6 +436,20 @@ impl Dma {
                     .get((port as usize).wrapping_sub(1))
                     .and_then(|h| h.clone())
                     .map(|h| h as Arc<Mutex<dyn DmaByteIo>>),
+                DmaTarget::Dcmi(port) => {
+                    if port == 1 {
+                        self.dcmi_handle.clone().map(|h| h as Arc<Mutex<dyn DmaByteIo>>)
+                    } else {
+                        None
+                    }
+                }
+                DmaTarget::Sdio(port) => {
+                    if port == 1 {
+                        self.sdio_handle.clone().map(|h| h as Arc<Mutex<dyn DmaByteIo>>)
+                    } else {
+                        None
+                    }
+                }
             };
             let Some(dev) = handle else {
                 self.pending_transfer &= !(1 << s); // 未注册句柄（配置异常）：跳过

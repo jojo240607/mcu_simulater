@@ -18,9 +18,14 @@ use crate::peripheral::adc::{Adc, ADC_IRQ};
 use crate::peripheral::dac::Dac;
 use crate::peripheral::console::Console;
 use crate::peripheral::crc::Crc;
+use crate::peripheral::dcmi::{Dcmi, DCMI_IRQ};
 use crate::peripheral::terminal::Terminal;
 use crate::peripheral::dma::{Dma, DmaDir, DMA1_BASE, DMA1_STREAM_IRQ, DMA2_BASE, DMA2_STREAM_IRQ};
 use crate::peripheral::exti::{Exti, EXTI_BASE};
+use crate::peripheral::fsmc::{
+    Fsmc, FSMC_BANK1_BASE, FSMC_BANK2_BASE, FSMC_BANK3_BASE, FSMC_BANK4_BASE, FSMC_BANK_SIZE,
+    FSMC_BASE,
+};
 use crate::peripheral::gpio::Gpio;
 use crate::peripheral::i2c::{I2c, I2C1_EV_IRQ, I2C2_EV_IRQ, I2C3_EV_IRQ};
 use crate::peripheral::mpu::{Access, MemManageFault, Mpu};
@@ -28,7 +33,9 @@ use crate::peripheral::nvic::{Nvic, StopReason};
 use crate::peripheral::rcc::Rcc;
 use crate::peripheral::rng::{Rng, RNG_IRQ};
 use crate::peripheral::pwr::Pwr;
+use crate::peripheral::rtc::Rtc;
 use crate::peripheral::scb::SystemControl;
+use crate::peripheral::sdio::{Sdio, SDIO_BASE};
 use crate::peripheral::spi::{Spi, SPI1_IRQ, SPI2_IRQ, SPI3_IRQ};
 use crate::peripheral::syscfg::{ExtiPortSelect, Syscfg};
 use crate::peripheral::timer::{Timer, TimerConfig, TimerIrq, TimerKind};
@@ -69,6 +76,14 @@ pub struct Machine {
     pub rng: Arc<Mutex<Rng>>,
     /// PWR 电源控制（@0x40007000；低功耗位 + WUF/SBF 标志 + 待机唤醒复位路径）
     pub pwr: Arc<Mutex<Pwr>>,
+    /// RTC 实时时钟 + 备份寄存器（@0x40002800，APB1；日历 + 闹钟/唤醒中断 + 掉电保持）
+    pub rtc: Arc<Mutex<Rtc>>,
+    /// DCMI 数字摄像头接口（@0x50050000，AHB2；帧注入 + DMA2 搬运 + IRQ78）
+    pub dcmi: Arc<Mutex<Dcmi>>,
+    /// FSMC 外部存储器控制器（@0xA0000000；Bank1-4 片选窗口 64KB 简化映射）
+    pub fsmc: Arc<Mutex<Fsmc>>,
+    /// SDIO 安全数字 IO（@0x40012C00；命令/响应 + FIFO + DMA2 + IRQ49 + 虚拟 SD 卡）
+    pub sdio: Arc<Mutex<Sdio>>,
     /// IWDG 独立看门狗（系统复位时复位外设，避免复位后立即再次超时）
     iwdg: Arc<Mutex<Iwdg>>,
     /// WWDG 窗口看门狗（同上）
@@ -90,6 +105,8 @@ impl Machine {
         let dma2 = Arc::new(Mutex::new(Dma::new(nvic.clone(), "DMA2", DMA2_STREAM_IRQ)));
         let wdog_req = Arc::new(WdogResetReq::new());
         let events = Arc::new(Mutex::new(EventBus::new()));
+        let pwr = Arc::new(Mutex::new(Pwr::new(wdog_req.clone())));
+        let rtc = Arc::new(Mutex::new(Rtc::new(nvic.clone(), pwr.clone())));
         Ok(Self {
             cpu,
             bus: Arc::new(Mutex::new(Bus::new())),
@@ -97,7 +114,7 @@ impl Machine {
             nvic: nvic.clone(),
             events: events.clone(),
             console: Arc::new(Mutex::new(Console::new())),
-            terminal: Arc::new(Mutex::new(Terminal::new(events))),
+            terminal: Arc::new(Mutex::new(Terminal::new(events.clone()))),
             clock: Arc::new(Mutex::new(VirtualClock::new())),
             timers: Arc::new(Mutex::new(Vec::new())),
             dma,
@@ -108,7 +125,11 @@ impl Machine {
                 nvic.clone(),
                 RNG_IRQ,
             ))),
-            pwr: Arc::new(Mutex::new(Pwr::new(wdog_req.clone()))),
+            pwr,
+            rtc,
+            dcmi: Arc::new(Mutex::new(Dcmi::new(nvic.clone(), DCMI_IRQ))),
+            fsmc: Arc::new(Mutex::new(Fsmc::new())),
+            sdio: Arc::new(Mutex::new(Sdio::new(events.clone(), nvic.clone()))),
             iwdg: Arc::new(Mutex::new(Iwdg::new(wdog_req.clone()))),
             wwdg: Arc::new(Mutex::new(Wwdg::new(
                 nvic.clone(),
@@ -532,6 +553,208 @@ impl Machine {
             })?;
         }
 
+        // M12-DCMI 数字摄像头接口（@0x50050000，AHB2）。
+        // CR.ENABLE+CAPTURE 使能捕获；测试/虚拟摄像头发布 DcmiFrame 注入一帧像素 →
+        // feed_frame 拆 32 位字入 FIFO（SR.FNE/FRAME + RIS + IRQ78 帧完成中断）；
+        // DMA 模式：DMA2_Stream1_Channel1 外设→内存搬运（RM0090 请求映射）。
+        // 与 RNG 相同：AHB2 不在外设区 hook 覆盖内，需单独页映射 + 转发 hook（同 MPU 链路）。
+        let dcmi = self.dcmi.clone();
+        self.bus
+            .lock()
+            .unwrap()
+            .attach(0x5005_0000, 0x40, "DCMI", dcmi.clone())?;
+        // 注册 DCMI 句柄到 DMA2（外设→内存搬运经句柄直接读 DR）
+        self.dma2.lock().unwrap().register_dcmi(1, dcmi.clone());
+        {
+            let dcmi_base: u64 = 0x5005_0000;
+            // Unicorn mem_map 需页对齐：映射 DCMI 所在 4KB 页，hook 精确到寄存器窗口
+            self.cpu.mem_map(0x5005_0000, 0x1000, Prot::ALL)?;
+            let bus = self.bus.clone();
+            let mpu = self.mpu.clone();
+            self.cpu.add_mmio_hook(dcmi_base, dcmi_base + 0x40, move |uc, ty, addr, size, value| {
+                let fault = {
+                    let m = mpu.lock().unwrap();
+                    match mem_type_to_access(ty) {
+                        Some(access) => m.check(addr as u32, access, cpu_privileged(uc)).err(),
+                        None => None,
+                    }
+                };
+                if let Some(f) = fault {
+                    fault_and_stop(uc, &mpu, f);
+                    return true;
+                }
+                match ty {
+                    MemType::READ => {
+                        if let Ok(v) = bus.lock().unwrap().read(addr as u32, size as u32) {
+                            let _ = uc.mem_write(addr, &v.to_le_bytes()[..size]);
+                        }
+                    }
+                    MemType::WRITE => {
+                        let _ = bus.lock().unwrap().write(addr as u32, size as u32, value as u32);
+                    }
+                    _ => {}
+                }
+                false
+            })?;
+        }
+        // DCMI 帧事件 → 注入 + DMA 请求路由。发布者（测试/虚拟摄像头）在事件分发
+        // 回调内不能再 publish（二次 publish 死锁）；DMA 请求在 feed_frame 之后
+        // 直接路由（DMA2_Stream1_Channel1，外设→内存，一次搬完整帧字）
+        let dcmi_ev = dcmi.clone();
+        let dma2_dcmi = self.dma2.clone();
+        events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+            move |ev: &Event| {
+                if let Event::DcmiFrame { port: p, data } = ev {
+                    if *p != 1 {
+                        return;
+                    }
+                    let words = dcmi_ev.lock().unwrap().feed_frame(data);
+                    if words > 0 {
+                        dma2_dcmi.lock().unwrap().service_stream_n(
+                            1,
+                            1,
+                            DmaDir::PeriphToMem,
+                            crate::peripheral::dma::DmaTarget::Dcmi(*p),
+                            words,
+                        );
+                    }
+                }
+            },
+        )));
+
+        // M13-FSMC 外部存储器控制器（@0xA0000000，AHB3/AHB1 域）。
+        // 寄存器文件（BCR1-4/BTR1-4/BWTR1-4）挂在总线上；Bank1-4 片选窗口
+        // （@0x60000000/0x64000000/0x68000000/0x6C000000，各 64KB 简化映射）经
+        // 页映射 + hook 转发到 Fsmc::window_read/write，BCRn.MBKEN 使能才命中。
+        // 寄存器块与窗口均位于外设区 hook（0x40000000）与数据区 hook 之外，
+        // 与 RNG/DCMI 相同：单独页映射 + 转发 hook。
+        let fsmc = self.fsmc.clone();
+        self.bus
+            .lock()
+            .unwrap()
+            .attach(FSMC_BASE, 0x200, "FSMC", fsmc.clone())?;
+        {
+            // 寄存器块：映射 1 页，hook 精确到寄存器窗口
+            self.cpu.mem_map(FSMC_BASE as u64, 0x1000, Prot::ALL)?;
+            let bus = self.bus.clone();
+            let mpu = self.mpu.clone();
+            self.cpu.add_mmio_hook(
+                FSMC_BASE as u64,
+                FSMC_BASE as u64 + 0x200,
+                move |uc, ty, addr, size, value| {
+                    let fault = {
+                        let m = mpu.lock().unwrap();
+                        match mem_type_to_access(ty) {
+                            Some(access) => m.check(addr as u32, access, cpu_privileged(uc)).err(),
+                            None => None,
+                        }
+                    };
+                    if let Some(f) = fault {
+                        fault_and_stop(uc, &mpu, f);
+                        return true;
+                    }
+                    match ty {
+                        MemType::READ => {
+                            if let Ok(v) = bus.lock().unwrap().read(addr as u32, size as u32) {
+                                let _ = uc.mem_write(addr, &v.to_le_bytes()[..size]);
+                            }
+                        }
+                        MemType::WRITE => {
+                            let _ = bus.lock().unwrap().write(addr as u32, size as u32, value as u32);
+                        }
+                        _ => {}
+                    }
+                    false
+                },
+            )?;
+            // 4 个片选窗口：映射 + hook 转发（MBKEN 门控由 Fsmc 内部处理）
+            for (base, size) in [
+                (FSMC_BANK1_BASE, FSMC_BANK_SIZE),
+                (FSMC_BANK2_BASE, FSMC_BANK_SIZE),
+                (FSMC_BANK3_BASE, FSMC_BANK_SIZE),
+                (FSMC_BANK4_BASE, FSMC_BANK_SIZE),
+            ] {
+                self.cpu.mem_map(base as u64, size as u64, Prot::ALL)?;
+                let fsmc_win = fsmc.clone();
+                let mpu = self.mpu.clone();
+                let (b, e) = (base as u64, base as u64 + size as u64);
+                self.cpu.add_mmio_hook(b, e, move |uc, ty, addr, size, value| {
+                    let fault = {
+                        let m = mpu.lock().unwrap();
+                        match mem_type_to_access(ty) {
+                            Some(access) => m.check(addr as u32, access, cpu_privileged(uc)).err(),
+                            None => None,
+                        }
+                    };
+                    if let Some(f) = fault {
+                        fault_and_stop(uc, &mpu, f);
+                        return true;
+                    }
+                    match ty {
+                        MemType::READ => {
+                            let v =
+                                fsmc_win.lock().unwrap().window_read(addr as u32, size as u32);
+                            let _ = uc.mem_write(addr, &v.to_le_bytes()[..size]);
+                        }
+                        MemType::WRITE => {
+                            fsmc_win
+                                .lock()
+                                .unwrap()
+                                .window_write(addr as u32, size as u32, value as u32);
+                        }
+                        _ => {}
+                    }
+                    false
+                })?;
+            }
+        }
+
+        // M14-SDIO 安全数字 IO（@0x40012C00，APB2 区；命令/响应 + FIFO + DMA2 + IRQ49）。
+        // 命令路径：写 CMD（CPSMEN）→ 虚拟 SD 卡按 index 返回 RESP1-4/STATUS 标志；
+        // 数据路径：DCTRL.DTEN 使能后读方向填充 FIFO、写方向由 DMA 推入 FIFO，
+        // DMAEN 时发布 SdioDma → DMA2 按方向路由（RX=DMA2_Stream3_Channel4、
+        // TX=DMA2_Stream6_Channel4，RM0090 请求映射）搬运外设↔内存。
+        let sdio = self.sdio.clone();
+        self.bus
+            .lock()
+            .unwrap()
+            .attach(SDIO_BASE, 0x400, "SDIO", sdio.clone())?;
+        // 注册 SDIO 句柄到 DMA2（外设↔内存搬运经句柄直接读写 FIFO）
+        self.dma2.lock().unwrap().register_sdio(1, sdio.clone());
+        // SDIO DMA 事件 → 按方向路由到 DMA2 对应流
+        let dma2_sdio = self.dma2.clone();
+        events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+            move |ev: &Event| {
+                if let Event::SdioDma { port: p, dir, items } = ev {
+                    if *p != 1 {
+                        return;
+                    }
+                    let stream = match dir {
+                        DmaDir::PeriphToMem => 3, // DMA2_Stream3（RX）
+                        DmaDir::MemToPeriph => 6, // DMA2_Stream6（TX）
+                    };
+                    let mut d = dma2_sdio.lock().unwrap();
+                    match dir {
+                        // 读：FIFO 现成字数一次搬完
+                        DmaDir::PeriphToMem => d.service_stream_n(
+                            stream,
+                            4,
+                            *dir,
+                            crate::peripheral::dma::DmaTarget::Sdio(*p),
+                            *items,
+                        ),
+                        // 写：items=0，由 service_stream 取 NDTR 一次搬完
+                        DmaDir::MemToPeriph => d.service_stream(
+                            stream,
+                            4,
+                            *dir,
+                            crate::peripheral::dma::DmaTarget::Sdio(*p),
+                        ),
+                    }
+                }
+            },
+        )));
+
         // TIM1-14（tick 推进 + 溢出 → NVIC 更新中断；TIM1-8 的 DIER.UDE → 更新事件
         // DMA 请求，TIM9-14 无 DMA 请求能力）。类别/位宽/通道数/中断号按 F407 硬件：
         // TIM1/8 高级 16 位 4 通道，TIM2/5 通用 32 位 4 通道，TIM3/4 通用 16 位
@@ -730,6 +953,15 @@ impl Machine {
         // （同一 wdog_req 链路）发出 ResetReason::LowPower，run() 执行系统复位。
         let pwr = self.pwr.clone();
         self.bus.lock().unwrap().attach(0x4000_7000, 0x400, "PWR", pwr)?;
+
+        // M11-RTC + 备份寄存器（@0x40002800，APB1）。
+        // 日历：双预分频（PRER）把 RTCCLK 分频为 1 Hz ck_spre，tick 按周期推进秒计数；
+        // 闹钟 A/B + 唤醒定时器：匹配置 ISR 标志并经 NVIC 挂起 RTC_Alarm(41)/RTC_WKUP(3)；
+        // 备份寄存器 BKP0R-19R（+0x50..+0x9C）写访问需 PWR_CR.DBP=1（备份域写保护）。
+        // 写入 tick 列表：随虚拟时钟推进（与 TIM/IWDG/WWDG 共享同一周期源）。
+        let rtc = self.rtc.clone();
+        self.bus.lock().unwrap().attach(0x4000_2800, 0x400, "RTC", rtc.clone())?;
+        self.timers.lock().unwrap().push(rtc);
 
         // M4-EXTI：SYSCFG（EXTICR 端口选择） + EXTI（外部中断，GPIO 事件 → NVIC）
         let port_select = Arc::new(Mutex::new(ExtiPortSelect::default()));

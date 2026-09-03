@@ -41,6 +41,11 @@ pub enum Event {
     TimPwm { port: u8, channel: u8, level: bool },
     /// GPIO 电平变化
     GpioLevel { port: u8, pin: u8, level: bool },
+    /// DCMI 帧数据（测试/虚拟摄像头 → DCMI，注入一帧图像数据；驱动 SR.FNE + RIS.FRAME）
+    DcmiFrame { port: u8, data: Vec<u8> },
+    /// SDIO DMA 请求（SDIO → DMA2；读=外设→内存、写=内存→外设。
+    /// items>0 表示读 FIFO 现成字数；items=0 表示写方向，由 DMA 侧取流 NDTR）
+    SdioDma { port: u8, dir: DmaDir, items: u32 },
     /// 占位：其它事件后续按需扩展
     Other(String),
 }

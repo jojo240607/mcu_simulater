@@ -273,7 +273,7 @@ mcu_simulater/
 
 ### 7.2 外设补全路线（待实施，从易到难）
 
-> F407 片内外设已实现：GPIO/USART/I2C/SPI/ADC/TIM/DMA/EXTI/SYSCFG/RCC/WDG/DAC/CRC/RNG/PWR。
+> F407 片内外设已实现：GPIO/USART/I2C/SPI/ADC/TIM/DMA/EXTI/SYSCFG/RCC/WDG/DAC/CRC/RNG/PWR/RTC+BKP/DCMI/FSMC/SDIO。
 > 下表按**从易到难**排列剩余外设，作为后续增量实施的推进顺序。每项独立成里程碑，
 > 遵循既有约定：外设文件 `src/peripheral/<name>.rs` + `machine/mod.rs` 挂载 +
 > 事件接入（如需）+ 验收固件 + 集成测试。
@@ -284,10 +284,10 @@ mcu_simulater/
 | 2 | ~~CRC~~ ✅ | 0x40023000 | 低 | 32 位 CRC 计算单元：DR/IDR/CR；多项式 0x04C11DB7，按字推进 | 写数据序列后读回 CRC 校验值与参考实现一致 |
 | 3 | ~~RNG~~ ✅ | 0x50060800 | 低 | 真随机数发生器：CR 使能 + SR.DRDY + DR；连续生成、错误注入（CECS/SECS + IRQ80）；随机性经测试种子可控（xorshift32） | 使能后 DR 有效且逐次变化；错误标志（CECS/SECS）经注入触发 IRQ80 |
 | 4 | ~~PWR~~ ✅ | 0x40007000 | 低-中 | 电源控制：CR 低功耗位（LPDS/PDDS）+ CWUF/CSBF 写 1 清 WUF/SBF；CSR 只读标志（WUF/SBF/PVDO）经注入；待机唤醒（enter_standby + inject_wakeup）经共享复位链路发 LowPower 复位 | 写低功耗位后读回一致；WUF/SBF 标志注入/清除联动；待机唤醒触发系统复位（RCC_CSR.LPWRRSTF 置位） |
-| 5 | **RTC + BKP** | 0x40002800 / 0x40002400 | 中 | 日历计数（预分频/TR）、闹钟/唤醒中断、写保护解锁、BKP 备份寄存器保持 | RTC 计数随虚拟时钟推进；闹钟触发 IRQ；BKP 写读保持 |
-| 6 | **DCMI** | 0x50050000 | 中 | 摄像头接口：同步/像素采样、帧/行事件、DMA 搬运（简化：`DcmiFrame` 事件注入帧数据） | 注入一帧后 FIFO/DR 可见且 DMA 搬运入内存 |
-| 7 | **FSMC** | 0xA0000000 | 中 | 外部存储器控制器：NOR/SRAM/PSRAM 片选窗口、读/写时序（简化为窗口映射） | 片选窗口地址可读写；Bank 映射命中 |
-| 8 | **SDIO** | 0x40012C00 | 高 | SD 卡接口：命令/响应路径、数据 FIFO、DMA、中断；虚拟 SD 卡（简化块读写） | 发送 CMD 后响应寄存器正确；块读写经 DMA 搬运 |
+| 5 | ~~RTC + BKP~~ ✅ | 0x40002800 / 0x40002400 | 中 | 日历计数（预分频/TR）、闹钟/唤醒中断、写保护解锁、BKP 备份寄存器保持 | RTC 计数随虚拟时钟推进；闹钟触发 IRQ；BKP 写读保持 |
+| 6 | ~~DCMI~~ ✅ | 0x50050000 | 中 | 摄像头接口：CR 使能/捕获（连续/快照）、FIFO/DR 读、帧/行事件、DMA 搬运（简化：`DcmiFrame` 事件注入帧数据；DMA2_Stream1_Channel1 外设→内存整帧搬运） | 注入一帧后 FIFO/DR 可见且 DMA 搬运入内存；帧完成经 IRQ78 |
+| 7 | ~~FSMC~~ ✅ | 0xA0000000 | 中 | 外部存储器控制器：BCR1-4/BTR1-4/BWTR1-4 寄存器；Bank1-4 片选窗口（0x60000000/0x64000000/0x68000000/0x6C000000，各 64KB）经 MBKEN 门控的读写后备缓冲（简化为窗口映射） | 片选窗口使能后地址可读写（未使能丢弃写、读恒 0）；BCR 可写位掩码回读 |
+| 8 | ~~SDIO~~ ✅ | 0x40012C00 | 高 | SD 卡接口：命令/响应路径、数据 FIFO、DMA、中断；虚拟 SD 卡（简化块读写） | 发送 CMD 后响应寄存器正确；块读写经 DMA 搬运 |
 | 9 | **CAN1/2** | 0x40006400 / 0x40006800 | 高 | 报文收发：邮箱/发送 FIFO/接收 FIFO、过滤、位时序、错误管理；总线级 `CanFrame` 事件互联 | 发送帧事件被对端订阅捕获；接收 FIFO 置 Pending 触发中断 |
 | 10 | **USB OTG FS/HS** | 0x50000000 / 0x40040000 | 很高 | 枚举/端点/描述符、控制/批量传输、VBUS；虚拟主机（简化：`UsbSetup` 事件注入） | 固件枚举成功；批量端点收发数据 |
 | 11 | **以太网 MAC** | 0x40028000 | 很高 | 帧收发、MAC 配置、DMA 描述符环、中断；虚拟网络（`EthFrame` 事件） | 发送帧被虚拟对端接收；接收帧进描述符环触发 DMA |
