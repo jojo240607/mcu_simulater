@@ -11,6 +11,10 @@
 //!
 //! M3 语义简化：IDR 读回当前 ODR（输出自环）；输入电平的注入（外部事件）
 //! 留待 M4；BSRR 写 1 置位/复位对应 ODR 位，仅对输出引脚发布事件。
+//!
+//! M17 补齐寄存器级 pinmux：AFRL/AFRH 可读写（AF0..AF15 复用功能选择）；MODER
+//! 复用模式(10)/模拟模式(11) 可配置存储，且该模式下引脚不发布 GPIO 输出事件
+//! （外设信号→引脚的真实路由仍由事件总线承担，未在引脚层实现）。
 
 use std::sync::{Arc, Mutex};
 
@@ -25,6 +29,8 @@ const OFF_MODER: u32 = 0x00;
 const OFF_IDR: u32 = 0x10;
 const OFF_ODR: u32 = 0x14;
 const OFF_BSRR: u32 = 0x18;
+const OFF_AFRL: u32 = 0x20;
+const OFF_AFRH: u32 = 0x24;
 
 /// GPIO 外设
 pub struct Gpio {
@@ -96,7 +102,8 @@ impl Peripheral for Gpio {
             OFF_MODER..=0x0C => Ok(self.regs[(offset / 4) as usize]), // MODER..PUPDR
             OFF_IDR => Ok(self.odr),                                  // IDR 读回当前输出电平
             OFF_ODR => Ok(self.odr),
-            0x18..=0x24 => Ok(0), // BSRR/LCKR/AFR 读回 0（只写/保留语义）
+            OFF_AFRL | OFF_AFRH => Ok(self.regs[(offset / 4) as usize]), // AFRL/AFRH 复用功能选择
+            0x18..=0x1C => Ok(0), // BSRR/LCKR 读回 0（只写/保留语义）
             _ => Err(BusError::OutOfRange),
         }
     }
@@ -107,6 +114,10 @@ impl Peripheral for Gpio {
         }
         match offset {
             OFF_MODER..=0x0C => { // MODER..PUPDR
+                self.regs[(offset / 4) as usize] = value;
+                Ok(())
+            }
+            OFF_AFRL | OFF_AFRH => { // AFRL/AFRH（复用功能选择，每引脚 4 位 AF0..AF15）
                 self.regs[(offset / 4) as usize] = value;
                 Ok(())
             }
@@ -168,5 +179,44 @@ mod tests {
         assert_eq!(evs.len(), 2, "置位+复位应各发布一次事件");
         assert_eq!(evs[0], Event::GpioLevel { port: 0, pin: 5, level: true });
         assert_eq!(evs[1], Event::GpioLevel { port: 0, pin: 5, level: false });
+    }
+
+    #[test]
+    fn afr_rw() {
+        let (mut g, _bus) = gpio();
+        // AFRL（pin0..7）/AFRH（pin8..15）各 4 位，写读应回读
+        g.write(OFF_AFRL, 4, 0x0000_0013).unwrap(); // pin0=3(AF3), pin1=1(AF1)
+        assert_eq!(g.read(OFF_AFRL, 4).unwrap(), 0x0000_0013);
+        g.write(OFF_AFRH, 4, 0x0000_9000).unwrap(); // pin12=9(AF9)
+        assert_eq!(g.read(OFF_AFRH, 4).unwrap(), 0x0000_9000);
+    }
+
+    #[test]
+    fn non_output_mode_suppresses_event() {
+        let (mut g, bus) = gpio();
+        let events = Arc::new(Mutex::new(0usize));
+        let n = events.clone();
+        bus.lock()
+            .unwrap()
+            .subscribe(Arc::new(Mutex::new(move |ev: &Event| {
+                if let Event::GpioLevel { .. } = ev {
+                    *n.lock().unwrap() += 1;
+                }
+            })));
+
+        // 复用模式(10) 下 BSRR 置位 → 不发布 GPIO 输出事件（由外设驱动）
+        g.write(OFF_MODER, 4, 2 << (5 * 2)).unwrap();
+        g.write(OFF_BSRR, 4, 1 << 5).unwrap();
+        // 模拟模式(11) 下复位/置位均不发布
+        g.write(OFF_MODER, 4, 3 << (5 * 2)).unwrap();
+        g.write(OFF_BSRR, 4, 1 << (5 + 16)).unwrap();
+        g.write(OFF_BSRR, 4, 1 << 5).unwrap();
+        assert_eq!(*events.lock().unwrap(), 0, "复用/模拟模式不应发布输出事件");
+
+        // 切回输出模式(01)：先复位再置位 → 各发布一次
+        g.write(OFF_MODER, 4, 1 << (5 * 2)).unwrap();
+        g.write(OFF_BSRR, 4, 1 << (5 + 16)).unwrap();
+        g.write(OFF_BSRR, 4, 1 << 5).unwrap();
+        assert_eq!(*events.lock().unwrap(), 2, "输出模式应发布复位+置位事件");
     }
 }

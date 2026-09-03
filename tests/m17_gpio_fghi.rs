@@ -118,3 +118,60 @@ fn m17_gpio_fghi_rcc_clocks() {
         "AHB1ENR GPIOF..I 时钟位应镜像"
     );
 }
+
+const OFF_AFRL: u32 = 0x20;
+const OFF_AFRH: u32 = 0x24;
+
+#[test]
+fn m17_gpio_fghi_pinmux() {
+    let m = load_machine();
+    let bus = m.bus.clone();
+
+    // 全部 9 个端口：AFRL/AFRH 经总线可写读（寄存器级 pinmux）
+    for port in 0..9u32 {
+        let base = GPIO_BASE + port * 0x400;
+        let label = (b'A' + port as u8) as char;
+        bus.lock().unwrap().write(base + OFF_AFRL, 4, 0x0000_0013).unwrap();
+        assert_eq!(
+            bus.lock().unwrap().read(base + OFF_AFRL, 4).unwrap(),
+            0x0000_0013,
+            "GPIO{label} AFRL 应可写读"
+        );
+        bus.lock().unwrap().write(base + OFF_AFRH, 4, 0x0000_9000).unwrap();
+        assert_eq!(
+            bus.lock().unwrap().read(base + OFF_AFRH, 4).unwrap(),
+            0x0000_9000,
+            "GPIO{label} AFRH 应可写读"
+        );
+    }
+
+    // 复用/模拟模式：MODER 可配置存储，且引脚不发布 GpioLevel 输出事件；
+    // 输出模式下 BSRR 置位仍发布（以 port5/GPIOF 为例）
+    let base = GPIO_BASE + 5 * 0x400;
+    let published = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let n = published.clone();
+    m.events.lock().unwrap().subscribe(std::sync::Arc::new(std::sync::Mutex::new(
+        move |ev: &Event| {
+            if let Event::GpioLevel { port: 5, .. } = ev {
+                *n.lock().unwrap() += 1;
+            }
+        },
+    )));
+
+    // 复用模式(10)
+    bus.lock().unwrap().write(base + OFF_MODER, 4, 2 << (5 * 2)).unwrap();
+    assert_eq!(bus.lock().unwrap().read(base + OFF_MODER, 4).unwrap(), 2 << (5 * 2), "复用模式应可配置存储");
+    bus.lock().unwrap().write(base + OFF_BSRR, 4, 1 << 5).unwrap();
+    // 模拟模式(11)
+    bus.lock().unwrap().write(base + OFF_MODER, 4, 3 << (5 * 2)).unwrap();
+    assert_eq!(bus.lock().unwrap().read(base + OFF_MODER, 4).unwrap(), 3 << (5 * 2), "模拟模式应可配置存储");
+    bus.lock().unwrap().write(base + OFF_BSRR, 4, 1 << (5 + 16)).unwrap();
+    bus.lock().unwrap().write(base + OFF_BSRR, 4, 1 << 5).unwrap();
+    assert_eq!(*published.lock().unwrap(), 0, "复用/模拟模式不应发布输出事件");
+
+    // 输出模式(01)：先复位再置位 → 各发布一次
+    bus.lock().unwrap().write(base + OFF_MODER, 4, 1 << (5 * 2)).unwrap();
+    bus.lock().unwrap().write(base + OFF_BSRR, 4, 1 << (5 + 16)).unwrap();
+    bus.lock().unwrap().write(base + OFF_BSRR, 4, 1 << 5).unwrap();
+    assert_eq!(*published.lock().unwrap(), 2, "输出模式应发布复位+置位事件");
+}
