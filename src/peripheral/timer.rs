@@ -1,10 +1,16 @@
-//! 通用定时器（STM32F407，TIM1-8，M6 集）。
+//! 通用定时器（STM32F407，TIM1-14，M6 集）。
 //!
-//! 一个 [`Timer`] 结构体按 [`TimerKind`] 参数化覆盖三类定时器：
+//! 一个 [`Timer`] 结构体按 [`TimerKind`] 参数化覆盖三类定时器，通道数由
+//! [`TimerConfig::channels`] 指定：
 //! - 基本定时器（TIM6/7）：仅时基 + 更新事件，无捕获/比较通道；
 //! - 通用定时器（TIM2-5）：时基 + 4 路捕获/比较通道（TIM2/5 为 32 位）；
+//!   TIM9/12 为 2 通道、TIM10/11/13/14 为 1 通道（均 16 位，无 DMA 请求能力）；
 //! - 高级控制定时器（TIM1/8）：通用全部功能 + 互补输出/死区（BDTR.DTG/MOE）
 //!   + 刹车（BKE/BG/BIF）+ 重复计数（RCR）。
+//!
+//! 中断分配（F407 共享 IRQ 行）：TIM9↔TIM1_BRK(24)、TIM10↔TIM1_UP(25)、
+//! TIM11↔TIM1_TRG_COM(26)、TIM12↔TIM8_BRK(43)、TIM13↔TIM8_UP(44)、
+//! TIM14↔TIM8_TRG_COM(45)——更新/捕获共用该行（NVIC 按中断号挂起）。
 //!
 //! 计数语义（M3 T1 集）：按 [`Peripheral::tick`] 推进的虚拟周期驱动 CNT 递增/递减
 //! （块级加权周期，见 [`crate::sim::timing`]），溢出/下溢时按重复计数（高级定时器）
@@ -79,6 +85,9 @@ pub struct TimerConfig {
     pub kind: TimerKind,
     /// CNT/ARR/PSC/CCR 位宽：TIM2/5 = 32，其余 = 16
     pub bits: u32,
+    /// 捕获/比较通道数：TIM1-5/8 = 4，TIM9/12 = 2，TIM10/11/13/14 = 1，
+    /// 基本定时器（TIM6/7）= 0（仅时基 + 更新事件）
+    pub channels: u8,
     pub irq: TimerIrq,
 }
 
@@ -182,6 +191,9 @@ pub struct Timer {
     /// 各通道 OCxN 互补驱动输出电平（受 MOE 门控 + 死区延迟；
     /// 变化时以通道号 ch+4 发布 [`Event::TimPwm`]）
     ocn_ref: [bool; 4],
+    /// 捕获/比较通道数（来自配置；约束 check_compare 等仅迭代有效通道，
+    /// TIM9/12=2、TIM10/11/13/14=1、TIM6/7=0）
+    channels: u8,
     /// 主输出 OCx 的待生效跳变（变有效沿经死区延迟）
     dead_main: [DeadTimer; 4],
     /// 互补输出 OCxN 的待生效跳变（变有效沿经死区延迟）
@@ -209,6 +221,7 @@ impl Timer {
             ocx_ref: [false; 4],
             oc_ref: [false; 4],
             ocn_ref: [false; 4],
+            channels: cfg.channels,
             dead_main: [DeadTimer::default(); 4],
             dead_comp: [DeadTimer::default(); 4],
             moe_state: false,
@@ -228,12 +241,10 @@ impl Timer {
         }
     }
 
-    /// 通道数（基本定时器无通道）
+    /// 捕获/比较通道数（来自配置：TIM1-5/8 = 4、TIM9/12 = 2、TIM10/11/13/14 = 1、
+    /// 基本定时器 TIM6/7 = 0 仅时基 + 更新事件）
     fn channels(&self) -> usize {
-        match self.kind {
-            TimerKind::Basic => 0,
-            _ => 4,
-        }
+        self.channels as usize
     }
 
     /// 通道 ch 的 (CCxS, OCxM) 配置（取自 CCMR1/CCMR2 对应字节）
@@ -746,6 +757,7 @@ mod tests {
             name: "TIM2",
             kind: TimerKind::General,
             bits: 32,
+            channels: 4,
             irq: TimerIrq { brk: 28, up: 28, trig_com: 28, cc: 28 },
         };
         (Timer::new(2, cfg, bus.clone(), nvic.clone()), nvic, bus)
@@ -759,6 +771,7 @@ mod tests {
             name: "TIM1",
             kind: TimerKind::Advanced,
             bits: 16,
+            channels: 4,
             irq: TimerIrq { brk: 24, up: 25, trig_com: 26, cc: 27 },
         };
         (Timer::new(1, cfg, bus.clone(), nvic.clone()), nvic, bus)
@@ -910,6 +923,7 @@ mod tests {
             name: "TIM3",
             kind: TimerKind::General,
             bits: 16,
+            channels: 4,
             irq: TimerIrq { brk: 29, up: 29, trig_com: 29, cc: 29 },
         };
         let mut t3 = Timer::new(3, cfg, bus, nvic);
@@ -1135,6 +1149,78 @@ mod tests {
     }
 
     #[test]
+    fn channel_count_parameterized() {
+        // TIM9 类（通用 2 通道）：channels()==2，ch0/ch1 均按 PWM 输出
+        let nvic = Arc::new(Mutex::new(Nvic::new()));
+        let bus = Arc::new(Mutex::new(EventBus::new()));
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        bus.lock()
+            .unwrap()
+            .subscribe(Arc::new(Mutex::new(move |ev: &Event| {
+                if let Event::TimPwm { port: 9, channel, .. } = ev {
+                    g.lock().unwrap().push(*channel);
+                }
+            })));
+        let cfg = TimerConfig {
+            name: "TIM9",
+            kind: TimerKind::General,
+            bits: 16,
+            channels: 2,
+            irq: TimerIrq { brk: 24, up: 24, trig_com: 24, cc: 24 }, // 共享 TIM1_BRK 行
+        };
+        let mut t9 = Timer::new(9, cfg, bus, nvic.clone());
+        assert_eq!(t9.channels(), 2, "TIM9 应为 2 通道");
+        // CCMR1：ch0/ch1 均 PWM 模式1（OC1M=bit4:6、OC2M=bit12:14）；CCER：CC1E|CC2E
+        t9.write(OFF_CCMR1, 4, (0b110 << 4) | (0b110 << 12)).unwrap();
+        t9.write(OFF_CCER, 4, CCER_CC1E | (CCER_CC1E << 4)).unwrap();
+        t9.write(OFF_ARR, 4, 100).unwrap();
+        t9.write(OFF_CCR1, 4, 8).unwrap();
+        t9.write(OFF_CCR2, 4, 50).unwrap();
+        t9.write(OFF_CR1, 4, CR1_CEN).unwrap();
+        for _ in 0..40 {
+            t9.tick(1);
+        }
+        let chs = got.lock().unwrap();
+        assert!(chs.contains(&0) && chs.contains(&1), "2 通道定时器应发布 ch0/ch1 事件（实际 {chs:?}）");
+        drop(chs);
+
+        // TIM10 类（通用 1 通道）：channels()==1，ch1 即使配置 PWM 也不输出
+        let bus10 = Arc::new(Mutex::new(EventBus::new()));
+        let got10 = Arc::new(Mutex::new(Vec::new()));
+        let g10 = got10.clone();
+        bus10
+            .lock()
+            .unwrap()
+            .subscribe(Arc::new(Mutex::new(move |ev: &Event| {
+                if let Event::TimPwm { port: 10, channel, .. } = ev {
+                    g10.lock().unwrap().push(*channel);
+                }
+            })));
+        let cfg = TimerConfig {
+            name: "TIM10",
+            kind: TimerKind::General,
+            bits: 16,
+            channels: 1,
+            irq: TimerIrq { brk: 25, up: 25, trig_com: 25, cc: 25 }, // 共享 TIM1_UP 行
+        };
+        let mut t10 = Timer::new(10, cfg, bus10, nvic.clone());
+        assert_eq!(t10.channels(), 1, "TIM10 应为 1 通道");
+        t10.write(OFF_CCMR1, 4, (0b110 << 4) | (0b110 << 12)).unwrap(); // ch1 配置被忽略
+        t10.write(OFF_CCER, 4, CCER_CC1E | (CCER_CC1E << 4)).unwrap();
+        t10.write(OFF_ARR, 4, 100).unwrap();
+        t10.write(OFF_CCR1, 4, 8).unwrap();
+        t10.write(OFF_CCR2, 4, 50).unwrap();
+        t10.write(OFF_CR1, 4, CR1_CEN).unwrap();
+        for _ in 0..40 {
+            t10.tick(1);
+        }
+        let chs10 = got10.lock().unwrap();
+        assert!(chs10.contains(&0), "1 通道定时器应发布 ch0 事件（实际 {chs10:?}）");
+        assert!(!chs10.contains(&1), "1 通道定时器不得发布 ch1 事件（实际 {chs10:?}）");
+    }
+
+    #[test]
     fn basic_timer_update_only() {
         // TIM6 基本定时器：无通道，仅更新事件
         let nvic = Arc::new(Mutex::new(Nvic::new()));
@@ -1143,6 +1229,7 @@ mod tests {
             name: "TIM6",
             kind: TimerKind::Basic,
             bits: 16,
+            channels: 0,
             irq: TimerIrq { brk: 54, up: 54, trig_com: 54, cc: 54 },
         };
         let mut t = Timer::new(6, cfg, bus, nvic.clone());

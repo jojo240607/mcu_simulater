@@ -410,40 +410,59 @@ impl Machine {
             )));
         }
 
-        // TIM1-8（tick 推进 + 溢出 → NVIC 更新中断；DIER.UDE → 更新事件 DMA 请求）。
-        // 类别/位宽/中断号按 F407 硬件：TIM1/8 高级 16 位，TIM2/5 通用 32 位，
-        // TIM3/4 通用 16 位，TIM6/7 基本 16 位（无捕获/比较通道）。
+        // TIM1-14（tick 推进 + 溢出 → NVIC 更新中断；TIM1-8 的 DIER.UDE → 更新事件
+        // DMA 请求，TIM9-14 无 DMA 请求能力）。类别/位宽/通道数/中断号按 F407 硬件：
+        // TIM1/8 高级 16 位 4 通道，TIM2/5 通用 32 位 4 通道，TIM3/4 通用 16 位
+        // 4 通道，TIM6/7 基本 16 位（无通道），TIM9/12 通用 16 位 2 通道，
+        // TIM10/11/13/14 通用 16 位 1 通道。TIM9-14 中断行与高级定时器共享
+        // （TIM9↔TIM1_BRK24、TIM10↔TIM1_UP25、TIM11↔TIM1_TRG_COM26、
+        // TIM12↔TIM8_BRK43、TIM13↔TIM8_UP44、TIM14↔TIM8_TRG_COM45）。
         // 更新事件 DMA 映射采用 HAL 默认流（TIM1/8 → DMA2，TIM2-7 → DMA1）。
-        let tim_cfgs: &[(u8, u32, &str, TimerKind, u32, TimerIrq)] = &[
-            // (port, base, name, kind, bits, irq)
-            (1, 0x4001_0000, "TIM1", TimerKind::Advanced, 16,
+        let tim_cfgs: &[(u8, u32, &str, TimerKind, u32, u8, TimerIrq)] = &[
+            // (port, base, name, kind, bits, channels, irq)
+            (1, 0x4001_0000, "TIM1", TimerKind::Advanced, 16, 4,
              TimerIrq { brk: 24, up: 25, trig_com: 26, cc: 27 }),
-            (2, 0x4000_0000, "TIM2", TimerKind::General, 32,
+            (2, 0x4000_0000, "TIM2", TimerKind::General, 32, 4,
              TimerIrq { brk: 28, up: 28, trig_com: 28, cc: 28 }),
-            (3, 0x4000_0400, "TIM3", TimerKind::General, 16,
+            (3, 0x4000_0400, "TIM3", TimerKind::General, 16, 4,
              TimerIrq { brk: 29, up: 29, trig_com: 29, cc: 29 }),
-            (4, 0x4000_0800, "TIM4", TimerKind::General, 16,
+            (4, 0x4000_0800, "TIM4", TimerKind::General, 16, 4,
              TimerIrq { brk: 30, up: 30, trig_com: 30, cc: 30 }),
-            (5, 0x4000_0C00, "TIM5", TimerKind::General, 32,
+            (5, 0x4000_0C00, "TIM5", TimerKind::General, 32, 4,
              TimerIrq { brk: 50, up: 50, trig_com: 50, cc: 50 }),
-            (6, 0x4000_1000, "TIM6", TimerKind::Basic, 16,
+            (6, 0x4000_1000, "TIM6", TimerKind::Basic, 16, 0,
              TimerIrq { brk: 54, up: 54, trig_com: 54, cc: 54 }),
-            (7, 0x4000_1400, "TIM7", TimerKind::Basic, 16,
+            (7, 0x4000_1400, "TIM7", TimerKind::Basic, 16, 0,
              TimerIrq { brk: 55, up: 55, trig_com: 55, cc: 55 }),
-            (8, 0x4001_0400, "TIM8", TimerKind::Advanced, 16,
+            (8, 0x4001_0400, "TIM8", TimerKind::Advanced, 16, 4,
              TimerIrq { brk: 43, up: 44, trig_com: 45, cc: 46 }),
+            (9, 0x4001_4000, "TIM9", TimerKind::General, 16, 2,
+             TimerIrq { brk: 24, up: 24, trig_com: 24, cc: 24 }),
+            (10, 0x4001_4400, "TIM10", TimerKind::General, 16, 1,
+             TimerIrq { brk: 25, up: 25, trig_com: 25, cc: 25 }),
+            (11, 0x4001_4800, "TIM11", TimerKind::General, 16, 1,
+             TimerIrq { brk: 26, up: 26, trig_com: 26, cc: 26 }),
+            (12, 0x4000_1800, "TIM12", TimerKind::General, 16, 2,
+             TimerIrq { brk: 43, up: 43, trig_com: 43, cc: 43 }),
+            (13, 0x4000_1C00, "TIM13", TimerKind::General, 16, 1,
+             TimerIrq { brk: 44, up: 44, trig_com: 44, cc: 44 }),
+            (14, 0x4000_2000, "TIM14", TimerKind::General, 16, 1,
+             TimerIrq { brk: 45, up: 45, trig_com: 45, cc: 45 }),
         ];
-        for (port, base, name, kind, bits, irq) in tim_cfgs {
-            let cfg = TimerConfig { name, kind: *kind, bits: *bits, irq: *irq };
+        for (port, base, name, kind, bits, channels, irq) in tim_cfgs {
+            let cfg = TimerConfig { name, kind: *kind, bits: *bits, channels: *channels, irq: *irq };
             let tim = Arc::new(Mutex::new(Timer::new(*port, cfg, events.clone(), self.nvic.clone())));
             self.bus
                 .lock()
                 .unwrap()
                 .attach(*base, 0x400, format!("{name}"), tim.clone())?;
             // 注册 TIM 句柄到对应 DMA 控制器（TIM1/8 → DMA2，TIM2-7 → DMA1，
-            // 内存→外设搬运经句柄按 DCR 突发写 DMAR）
-            let reg_ctrl = if *port == 1 || *port == 8 { self.dma2.clone() } else { self.dma.clone() };
-            reg_ctrl.lock().unwrap().register_tim(*port, tim.clone());
+            // 内存→外设搬运经句柄按 DCR 突发写 DMAR）。TIM9-14 在 F407 上
+            // 无 DMA 请求映射（RM0090 DMA 请求表不含 TIM9-14），不注册。
+            if *port <= 8 {
+                let reg_ctrl = if *port == 1 || *port == 8 { self.dma2.clone() } else { self.dma.clone() };
+                reg_ctrl.lock().unwrap().register_tim(*port, tim.clone());
+            }
             self.timers.lock().unwrap().push(tim);
         }
 
@@ -631,7 +650,7 @@ impl Machine {
             false
         })?;
 
-        log::info!("T1 外设已挂载：GPIOA-E + USART1-6 + I2C1-3 + SPI1-3 + ADC1-3 + TIM2 + RCC + SYSCFG/EXTI + DMA1/DMA2 + Console/Terminal @ 0x{periph_base:08X} +0x{periph_size:X}");
+        log::info!("T1 外设已挂载：GPIOA-E + USART1-6 + I2C1-3 + SPI1-3 + ADC1-3 + TIM1-14 + RCC + SYSCFG/EXTI + DMA1/DMA2 + Console/Terminal @ 0x{periph_base:08X} +0x{periph_size:X}");
         Ok(())
     }
 
