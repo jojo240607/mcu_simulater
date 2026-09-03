@@ -410,10 +410,29 @@ impl Machine {
             )));
         }
 
-        // TIM2（tick 推进 + 溢出 → NVIC IRQ28）
-        let tim2 = Arc::new(Mutex::new(Tim2::new(self.nvic.clone())));
+        // TIM2（tick 推进 + 溢出 → NVIC IRQ28；DIER.UDE → 更新事件 DMA 请求）
+        let tim2 = Arc::new(Mutex::new(Tim2::new(2, events.clone(), self.nvic.clone())));
         self.bus.lock().unwrap().attach(0x4000_0000, 0x400, "TIM2", tim2.clone())?;
+        // 注册 TIM 句柄到 DMA1（内存→外设搬运经句柄按 DCR 突发写 DMAR）
+        self.dma.lock().unwrap().register_tim(2, tim2.clone());
         self.timers.lock().unwrap().push(tim2);
+
+        // TIM2 更新事件 → DMA 请求（F407 固定映射：TIM2_UP → DMA1_Stream5_Channel5，
+        // HAL 默认流；方向按流 CR.DIR 取，支持 PWM 装载（内存→外设）与捕获（外设→内存））
+        let dma1 = self.dma.clone();
+        events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+            move |ev: &Event| {
+                if let Event::TimUpdate { port } = ev {
+                    if *port == 2 {
+                        let (stream, channel) = (5, 5); // TIM2_UP: DMA1_Stream5_Channel5
+                        let dir = dma1.lock().unwrap().stream_dir(stream);
+                        dma1.lock()
+                            .unwrap()
+                            .service_stream(stream, channel, dir, crate::peripheral::dma::DmaTarget::Tim(*port));
+                    }
+                }
+            },
+        )));
 
         // M4-DMA1/DMA2（MEM2MEM 传输 + TC 中断；tick 判完成，run 间隙 process 搬运）
         let dma = self.dma.clone();

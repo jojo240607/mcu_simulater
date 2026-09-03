@@ -30,6 +30,9 @@ pub enum Event {
     SpiDma { port: u8, dir: DmaDir },
     /// ADC 模拟采样（测试/虚拟传感器 → ADC，驱动一次转换：DR 锁存 + EOC + DMA 请求）
     AdcValue { port: u8, channel: u8, value: u16 },
+    /// TIM 更新事件（TIM 计数溢出/软件更新 → Machine 路由 DMA 请求。
+    /// 仅 DIER.UDE 使能时发布，等价硬件"更新事件 → DMA 请求"）
+    TimUpdate { port: u8 },
     /// GPIO 电平变化
     GpioLevel { port: u8, pin: u8, level: bool },
     /// 占位：其它事件后续按需扩展
