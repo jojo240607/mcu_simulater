@@ -273,7 +273,7 @@ mcu_simulater/
 
 ### 7.2 外设补全路线（待实施，从易到难）
 
-> F407 片内外设已实现：GPIO/USART/I2C/SPI/ADC/TIM/DMA/EXTI/SYSCFG/RCC/WDG/DAC/CRC。
+> F407 片内外设已实现：GPIO/USART/I2C/SPI/ADC/TIM/DMA/EXTI/SYSCFG/RCC/WDG/DAC/CRC/RNG。
 > 下表按**从易到难**排列剩余外设，作为后续增量实施的推进顺序。每项独立成里程碑，
 > 遵循既有约定：外设文件 `src/peripheral/<name>.rs` + `machine/mod.rs` 挂载 +
 > 事件接入（如需）+ 验收固件 + 集成测试。
@@ -282,7 +282,7 @@ mcu_simulater/
 |---|---|---|---|---|---|
 | 1 | ~~DAC~~ ✅ | 0x40007400 | 低 | 12 位 2 通道：DHR→DOR 锁存、触发源（软件/定时器）、DMA 请求、输出经 `DacLevel` 事件发布 | 写 DHR 后 DOR 反映转换值；事件捕获电平；DMA 搬运 |
 | 2 | ~~CRC~~ ✅ | 0x40023000 | 低 | 32 位 CRC 计算单元：DR/IDR/CR；多项式 0x04C11DB7，按字推进 | 写数据序列后读回 CRC 校验值与参考实现一致 |
-| 3 | **RNG** | 0x50060800 | 低 | 真随机数发生器：CR 使能 + SR.DRDY + DR；随机性经测试种子可控 | 使能后 DR 有效且逐次变化；错误标志（SEIS/CEIS） |
+| 3 | ~~RNG~~ ✅ | 0x50060800 | 低 | 真随机数发生器：CR 使能 + SR.DRDY + DR；连续生成、错误注入（CECS/SECS + IRQ80）；随机性经测试种子可控（xorshift32） | 使能后 DR 有效且逐次变化；错误标志（CECS/SECS）经注入触发 IRQ80 |
 | 4 | **PWR** | 0x40007000 | 低-中 | 电源控制：CR（LPRUN/待机）、CSR（WUF/SBF）、待机唤醒（WKUP 引脚/备份） | 写低功耗位后状态寄存器联动；唤醒事件触发复位路径 |
 | 5 | **RTC + BKP** | 0x40002800 / 0x40002400 | 中 | 日历计数（预分频/TR）、闹钟/唤醒中断、写保护解锁、BKP 备份寄存器保持 | RTC 计数随虚拟时钟推进；闹钟触发 IRQ；BKP 写读保持 |
 | 6 | **DCMI** | 0x50050000 | 中 | 摄像头接口：同步/像素采样、帧/行事件、DMA 搬运（简化：`DcmiFrame` 事件注入帧数据） | 注入一帧后 FIFO/DR 可见且 DMA 搬运入内存 |

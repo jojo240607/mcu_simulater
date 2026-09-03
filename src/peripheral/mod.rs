@@ -14,6 +14,7 @@ pub mod i2c;
 pub mod mpu;
 pub mod nvic;
 pub mod rcc;
+pub mod rng;
 pub mod scb;
 pub mod spi;
 pub mod syscfg;

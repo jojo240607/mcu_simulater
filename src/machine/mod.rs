@@ -26,6 +26,7 @@ use crate::peripheral::i2c::{I2c, I2C1_EV_IRQ, I2C2_EV_IRQ, I2C3_EV_IRQ};
 use crate::peripheral::mpu::{Access, MemManageFault, Mpu};
 use crate::peripheral::nvic::{Nvic, StopReason};
 use crate::peripheral::rcc::Rcc;
+use crate::peripheral::rng::{Rng, RNG_IRQ};
 use crate::peripheral::scb::SystemControl;
 use crate::peripheral::spi::{Spi, SPI1_IRQ, SPI2_IRQ, SPI3_IRQ};
 use crate::peripheral::syscfg::{ExtiPortSelect, Syscfg};
@@ -63,6 +64,8 @@ pub struct Machine {
     dma2: Arc<Mutex<Dma>>,
     /// RCC（看门狗复位时置 CSR 复位标志）
     rcc: Arc<Mutex<Rcc>>,
+    /// RNG 真随机数发生器（@0x50060800，AHB2；seed 可控供测试复现）
+    pub rng: Arc<Mutex<Rng>>,
     /// IWDG 独立看门狗（系统复位时复位外设，避免复位后立即再次超时）
     iwdg: Arc<Mutex<Iwdg>>,
     /// WWDG 窗口看门狗（同上）
@@ -97,6 +100,11 @@ impl Machine {
             dma,
             dma2,
             rcc: Arc::new(Mutex::new(Rcc::new())),
+            rng: Arc::new(Mutex::new(Rng::new(
+                0x5EED_2026,
+                nvic.clone(),
+                RNG_IRQ,
+            ))),
             iwdg: Arc::new(Mutex::new(Iwdg::new(wdog_req.clone()))),
             wwdg: Arc::new(Mutex::new(Wwdg::new(
                 nvic.clone(),
@@ -480,6 +488,45 @@ impl Machine {
         // 数据寄存器。无时钟门控（F407 RCC 无 CRCEN 位，始终使能）、无中断/DMA/tick。
         let crc = Arc::new(Mutex::new(Crc::new()));
         self.bus.lock().unwrap().attach(0x4002_3000, 0x100, "CRC", crc.clone())?;
+
+        // M9-RNG 真随机数发生器（@0x50060800，AHB2）。
+        // CR.RNGEN 使能 → SR.DRDY 置位、读 DR 返回随机值并连续生成；CECS/SECS 错误
+        // 经 [`Rng::inject_*`] 注入（IRQ80 错误中断）。外设区 MMIO hook 只覆盖
+        // 0x40000000..0x40040000，RNG 位于 AHB2 需单独映射 + 转发 hook（同一 MPU 链路）。
+        let rng = self.rng.clone();
+        self.bus.lock().unwrap().attach(0x5006_0800, 0x100, "RNG", rng)?;
+        {
+            let rng_base: u64 = 0x5006_0800;
+            // Unicorn mem_map 需页对齐：映射 RNG 所在 4KB 页，hook 精确到寄存器窗口
+            self.cpu.mem_map(0x5006_0000, 0x1000, Prot::ALL)?;
+            let bus = self.bus.clone();
+            let mpu = self.mpu.clone();
+            self.cpu.add_mmio_hook(rng_base, rng_base + 0x100, move |uc, ty, addr, size, value| {
+                let fault = {
+                    let m = mpu.lock().unwrap();
+                    match mem_type_to_access(ty) {
+                        Some(access) => m.check(addr as u32, access, cpu_privileged(uc)).err(),
+                        None => None,
+                    }
+                };
+                if let Some(f) = fault {
+                    fault_and_stop(uc, &mpu, f);
+                    return true;
+                }
+                match ty {
+                    MemType::READ => {
+                        if let Ok(v) = bus.lock().unwrap().read(addr as u32, size as u32) {
+                            let _ = uc.mem_write(addr, &v.to_le_bytes()[..size]);
+                        }
+                    }
+                    MemType::WRITE => {
+                        let _ = bus.lock().unwrap().write(addr as u32, size as u32, value as u32);
+                    }
+                    _ => {}
+                }
+                false
+            })?;
+        }
 
         // TIM1-14（tick 推进 + 溢出 → NVIC 更新中断；TIM1-8 的 DIER.UDE → 更新事件
         // DMA 请求，TIM9-14 无 DMA 请求能力）。类别/位宽/通道数/中断号按 F407 硬件：
