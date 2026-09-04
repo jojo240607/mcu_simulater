@@ -45,10 +45,20 @@ use crate::peripheral::timer::{Timer, TimerConfig, TimerIrq, TimerKind};
 use crate::peripheral::usart::{Usart, USART1_IRQ, USART2_IRQ, USART3_IRQ, UART4_IRQ, UART5_IRQ, USART6_IRQ};
 use crate::peripheral::wdog::{Iwdg, ResetReason, WdogResetReq, Wwdg};
 use crate::peripheral::{Peripheral};
+use crate::sim::status::{Status, BIT_ANY_ACTIVE, BIT_MPU, BIT_NVIC_PENDING, BIT_WDOG};
 use crate::sim::timing::VirtualClock;
 
 /// 块级加权周期的平均周期/指令（见 [`crate::sim::timing::BlockWeighted`]）
 const AVG_CYCLES_PER_INS: u64 = 3;
+
+/// block hook 冷路径状态（MPU/NVIC/外设 tick 列表），捆进单个 Arc 以缩小闭包捕获体
+///（bench_probe：H13d 6 字段捕获 97.7 → H13e 3 字段 121+ MIPS，闭包捕获字段数即热路径成本）。
+struct BlockHookCold {
+    mpu: Arc<Mutex<Mpu>>,
+    nvic: Arc<Mutex<Nvic>>,
+    timers: Vec<Arc<Mutex<dyn Peripheral>>>,
+    tick_actives: Vec<Arc<AtomicBool>>,
+}
 
 /// 一台仿真的 MCU
 pub struct Machine {
@@ -58,8 +68,6 @@ pub struct Machine {
     pub bus: Arc<Mutex<Bus>>,
     /// MPU（内存保护单元，挂载于 SCB 窗口，访问控制 hook 共享）
     pub mpu: Arc<Mutex<Mpu>>,
-    /// MPU 使能原子快速判定（CTRL.ENABLE 变化时同步，Machine 持有并传给 Mpu::with_enabled）
-    mpu_enabled: Arc<AtomicBool>,
     /// NVIC（嵌套向量中断控制器，挂载于 SCB 窗口，中断投递 hook 共享）
     pub nvic: Arc<Mutex<Nvic>>,
     /// 事件总线（虚拟外设互联，M3）
@@ -75,8 +83,10 @@ pub struct Machine {
     /// 与 `timers` 并行的活动标记列表（外设使能状态原子同步，block hook 据此跳过
     /// 未激活外设的加锁 tick）
     tick_actives: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
-    /// 任一外设是否激活（tick_actives 的 OR 缓存，供 block hook 快路径整体跳过）
-    any_active: Arc<AtomicBool>,
+    /// 全局执行状态位域（MPU 使能 / 任一外设激活 / 中断挂起 / 看门狗复位请求）。
+    /// block hook 热路径单次 `raw()` load + 位测试，替代原先 4~5 次独立原子判读
+    ///（bench_probe：H2 独立原子 37.8 → H12 单状态字 115.1 MIPS）。
+    status: Arc<Status>,
     /// DMA1/DMA2（tick 判传输完成；run 间隙 process 执行内存搬运）
     dma: Arc<Mutex<Dma>>,
     dma2: Arc<Mutex<Dma>>,
@@ -114,22 +124,23 @@ pub struct Machine {
     wwdg_active: Arc<AtomicBool>,
     /// RTC 活动标记（闹钟/唤醒使能或日历初始化，Machine 持有并推入 tick_actives）
     rtc_active: Arc<AtomicBool>,
-    /// NVIC 挂起中断原子快速判定（block hook 据此在无挂起时跳过加锁检查）
-    nvic_pending: Arc<AtomicBool>,
-    /// 看门狗复位请求（IWDG/WWDG/PWR 待机唤醒置位，block hook 停机，run() 执行系统复位）
+    /// 看门狗复位请求（IWDG/WWDG/PWR 待机唤醒置位，block hook 经 BIT_WDOG 停机，run() 执行系统复位）
     pub wdog_req: Arc<WdogResetReq>,
     /// 初始 SP（向量表首字）
     pub initial_sp: u32,
     /// 复位向量（向量表第二字，含 Thumb 位处理见 [`Machine::reset`]）
     pub entry: u32,
+    /// run() 外层循环迭代次数（探测 emu_start 是否频繁提前返回，纯调试用）
+    run_iterations: std::cell::Cell<u64>,
 }
 
 impl Machine {
     /// 创建 Cortex-M4F 机器
     pub fn new_m4f() -> Result<Self> {
         let cpu = Cpu::new_m4f()?;
-        let nvic_pending = Arc::new(AtomicBool::new(false));
-        let nvic = Arc::new(Mutex::new(Nvic::with_pending_any(nvic_pending.clone())));
+        // 全局状态位域：Nvic/Mpu/WdogResetReq 共享，block hook 热路径一次 load
+        let status = Arc::new(Status::new());
+        let nvic = Arc::new(Mutex::new(Nvic::with_pending_any(status.clone())));
         let dma_active = Arc::new(AtomicBool::new(false));
         let dma = Arc::new(Mutex::new(Dma::with_active(
             nvic.clone(),
@@ -144,7 +155,7 @@ impl Machine {
             DMA2_STREAM_IRQ,
             dma2_active.clone(),
         )));
-        let wdog_req = Arc::new(WdogResetReq::new());
+        let wdog_req = Arc::new(WdogResetReq::with_status(status.clone()));
         let events = Arc::new(Mutex::new(EventBus::new()));
         let pwr = Arc::new(Mutex::new(Pwr::new(wdog_req.clone())));
         let rtc_active = Arc::new(AtomicBool::new(false));
@@ -155,12 +166,10 @@ impl Machine {
         )));
         let iwdg_active = Arc::new(AtomicBool::new(false));
         let wwdg_active = Arc::new(AtomicBool::new(false));
-        let mpu_enabled = Arc::new(AtomicBool::new(false));
         Ok(Self {
             cpu,
             bus: Arc::new(Mutex::new(Bus::new())),
-            mpu: Arc::new(Mutex::new(Mpu::with_enabled(mpu_enabled.clone()))),
-            mpu_enabled,
+            mpu: Arc::new(Mutex::new(Mpu::with_enabled(status.clone()))),
             nvic: nvic.clone(),
             events: events.clone(),
             console: Arc::new(Mutex::new(Console::new())),
@@ -168,7 +177,7 @@ impl Machine {
             clock: Arc::new(VirtualClock::new()),
             timers: Arc::new(Mutex::new(Vec::new())),
             tick_actives: Arc::new(Mutex::new(Vec::new())),
-            any_active: Arc::new(AtomicBool::new(false)),
+            status,
             dma,
             dma2,
             dma_active,
@@ -202,10 +211,10 @@ impl Machine {
             ))),
             wwdg_active,
             rtc_active,
-            nvic_pending,
             wdog_req,
             initial_sp: 0,
             entry: 0,
+            run_iterations: std::cell::Cell::new(0),
         })
     }
 
@@ -290,8 +299,9 @@ impl Machine {
         // 2) RAM/Flash/CCM 数据访问入口（MPU 全强制）
         self.attach_data_access_hook()?;
 
-        // 3) 取指 XN 检查入口（code hook）
-        self.attach_fetch_xn_hook()?;
+        // 3) 取指 XN 检查——并入 block hook（attach_interrupt_delivery，块级判定），
+        //    不再注册每指令 code hook：每指令 FFI 会强制单指令翻译块，
+        //    是纯计算负载的最大性能黑洞（见 bench_probe）。
 
         // 4) 中断投递入口（block 检查 + EXC_RETURN 拦截）——在全部外设挂载后注册
         //（见 map_stm32f407_layout），此处不再调用。
@@ -1154,6 +1164,24 @@ impl Machine {
         // 外设区 MMIO 转发 hook（MPU 检查 + 读注入 / 写转发）
         let bus = self.bus.clone();
         let mpu = self.mpu.clone();
+        // 参与 tick 的外设地址区间（TIM1-14 + DAC + DMA1/2 + IWDG + WWDG + RTC）。
+        // 写这些区间即置位 BIT_ANY_ACTIVE，block hook 据此走 tick 循环；免去 block hook
+        // 每块全扫 ~20 个 active 标记（bench_probe：actives 7→20，MIPS 57.9→34.7）。
+        // 注：BIT_ANY_ACTIVE 只置不清（外设激活后需持续 tick；未激活外设在 tick 循环内
+        // 按各自标记跳过，开销仅为逐标记判读）。
+        let status = self.status.clone();
+        let tick_regions: Arc<Vec<(u64, u64)>> = Arc::new(vec![
+            // TIM1-14（每块 0x400）
+            (0x4001_0000, 0x400), (0x4000_0000, 0x400), (0x4000_0400, 0x400),
+            (0x4000_0800, 0x400), (0x4000_0C00, 0x400), (0x4000_1000, 0x400),
+            (0x4000_1400, 0x400), (0x4001_0400, 0x400), (0x4001_4000, 0x400),
+            (0x4001_4400, 0x400), (0x4001_4800, 0x400), (0x4000_1800, 0x400),
+            (0x4000_1C00, 0x400), (0x4000_2000, 0x400),
+            // DAC / DMA1 / DMA2
+            (0x4000_7400, 0x400), (DMA1_BASE as u64, 0x400), (DMA2_BASE as u64, 0x400),
+            // IWDG / WWDG / RTC
+            (0x4000_3000, 0x400), (0x4000_2C00, 0x400), (0x4000_2800, 0x400),
+        ]);
         self.cpu.add_mmio_hook(periph_base, periph_base + periph_size, move |uc, ty, addr, size, value| {
             let fault = {
                 let m = mpu.lock().unwrap();
@@ -1173,6 +1201,11 @@ impl Machine {
                     }
                 }
                 MemType::WRITE => {
+                    if !status.has(BIT_ANY_ACTIVE)
+                        && tick_regions.iter().any(|(b, s)| addr >= *b && addr < *b + *s)
+                    {
+                        status.set(BIT_ANY_ACTIVE);
+                    }
                     let _ = bus.lock().unwrap().write(addr as u32, size as u32, value as u32);
                 }
                 _ => {}
@@ -1235,45 +1268,61 @@ impl Machine {
     /// 看门狗复位：block hook 同时检查共享 [`WdogResetReq`]，有请求即停机
     /// （不设置中断停机原因，由 [`Machine::run`] 识别复位请求并执行系统复位）。
     fn attach_interrupt_delivery(&mut self) -> Result<()> {
-        // 1) block hook：挂起中断抢占检查 + 块级时钟推进（begin=1,end=0 全范围）
-        let nvic = self.nvic.clone();
-        let nvic_pending = self.nvic_pending.clone();
+        // 1) block hook：XN 检查 + 挂起中断抢占检查 + 块级时钟推进（begin=1,end=0 全范围）
+        let status = self.status.clone();
         let clock = self.clock.clone();
-        let timers = self.timers.clone();
-        // 冻结活动标记列表：所有外设已挂载，转成 Arc<Vec>，block hook 快路径免加锁
-        let tick_actives: Arc<Vec<Arc<AtomicBool>>> =
-            Arc::new(self.tick_actives.lock().unwrap().clone());
-        let any_active = self.any_active.clone();
-        let wdog_req = self.wdog_req.clone();
+        // 冷路径状态捆成单个 Arc<BlockHookCold>：缩小闭包捕获体（3 字段 → 24B），
+        // 热路径仅 status/clock 两个指针进闭包（bench_probe：H13d 6 字段 97.7 → H13e 3 字段 121+ MIPS）
+        let cold = Arc::new(BlockHookCold {
+            mpu: self.mpu.clone(),
+            nvic: self.nvic.clone(),
+            // 冻结时钟外设列表：所有外设已挂载，转成 Vec，block hook 免每块加锁
+            //（bench_probe：H4 每块 timers.lock() 28.8 → H5 冻结无锁 47.3 MIPS）
+            timers: self.timers.lock().unwrap().clone(),
+            // 冻结活动标记列表：所有外设已挂载，转成 Vec，block hook 快路径免加锁
+            tick_actives: self.tick_actives.lock().unwrap().clone(),
+        });
         self.cpu.add_block_hook(1, 0, move |uc, _addr, size| {
-            // 块级加权周期推进虚拟时钟，并 tick 活动外设（TIM/DMA/DAC/RTC/IWDG/WWDG）
+            // 热路径单次原子 load，按位测试 MPU/外设激活/看门狗/中断挂起四个低频标志
+            //（bench_probe：H2 独立原子 37.8 → H12 单状态字 115.1 MIPS）
+            let s = status.raw();
+            // 取指 XN 检查（块级）：MPU 未使能时无锁跳过。
+            // 块执行前触发，块内指令同属一个区域，等效原每指令检查。
+            if s & BIT_MPU != 0 {
+                let addr = (_addr & !1) as u32;
+                let fault = {
+                    let m = cold.mpu.lock().unwrap();
+                    m.check(addr, Access::Fetch, cpu_privileged(uc)).err()
+                };
+                if let Some(f) = fault {
+                    fault_and_stop(uc, &cold.mpu, f);
+                    return;
+                }
+            }
+            // 块级加权周期推进虚拟时钟，并 tick 活动外设（TIM/DMA/DAC/RTC/IWDG/WWDG）。
             let cycles = size as u64 * AVG_CYCLES_PER_INS;
             clock.advance(cycles);
-            // 快路径：任一外设未激活（纯计算负载，外设从不使能）时跳过整个
-            // tick 循环，省去 timers 列表加锁与逐个外设加锁（性能主瓶颈）。
-            if !any_active.load(Ordering::Relaxed)
-                && tick_actives.iter().any(|a| a.load(Ordering::Relaxed))
-            {
-                any_active.store(true, Ordering::Relaxed);
-            }
-            if any_active.load(Ordering::Relaxed) {
-                let timers = timers.lock().unwrap();
-                for (t, a) in timers.iter().zip(tick_actives.iter()) {
+            // 快路径：BIT_ANY_ACTIVE 由外设区 MMIO 写置位（外设激活只可能发生在 MMIO 写，
+            // 见 attach_peripherals 的 TICK_REGIONS 判定），block hook 免去每块全扫
+            // ~20 个 active 标记（bench_probe：H10 actives 7→20，MIPS 57.9→34.7）。
+            if s & BIT_ANY_ACTIVE != 0 {
+                for (t, a) in cold.timers.iter().zip(cold.tick_actives.iter()) {
                     if a.load(Ordering::Relaxed) {
                         t.lock().unwrap().tick(cycles);
                     }
                 }
             }
-            // 看门狗复位请求：停机（run() 消费请求并执行系统复位）
-            if wdog_req.is_pending() {
+            // 看门狗复位请求（BIT_WDOG 由 WdogResetReq::request 置位）：停机
+            //（run() 经 take() 消费请求、清除 BIT_WDOG 并执行系统复位）
+            if s & BIT_WDOG != 0 {
                 let _ = uc.emu_stop();
                 return;
             }
             // 挂起中断抢占检查（快路径：无挂起中断时跳过加锁的 select_pending）
-            if nvic_pending.load(Ordering::Relaxed) {
+            if s & BIT_NVIC_PENDING != 0 {
                 let primask = uc.reg_read(RegisterARM::PRIMASK).unwrap_or(0) != 0;
                 let basepri = (uc.reg_read(RegisterARM::BASEPRI).unwrap_or(0) & 0xF) as u8;
-                let mut n = nvic.lock().unwrap();
+                let mut n = cold.nvic.lock().unwrap();
                 if let Some(irq) = n.select_pending(primask, basepri) {
                     n.set_stop_reason(StopReason::Switch(irq));
                     let _ = uc.emu_stop();
@@ -1313,14 +1362,14 @@ impl Machine {
         const DATA_END: u64 = 0x2002_0000; // 覆盖 FLASH/CCM/SRAM，止于 SRAM 末端
 
         let mpu = self.mpu.clone();
-        let mpu_enabled = self.mpu_enabled.clone();
+        let status = self.status.clone();
         self.cpu.add_mem_hook(
             HookType::MEM_READ | HookType::MEM_WRITE,
             DATA_BEGIN,
             DATA_END,
             move |uc, ty, addr, _size, _value| {
                 // 快路径：MPU 未使能时无锁放行（纯计算负载下省去每内存访问的加锁）
-                if !mpu_enabled.load(Ordering::Relaxed) {
+                if status.raw() & BIT_MPU == 0 {
                     return false;
                 }
                 let fault = {
@@ -1343,30 +1392,12 @@ impl Machine {
         Ok(())
     }
 
-    /// 取指 XN 检查 code hook：全范围监听每条指令执行地址。
+    /// 取指 XN 检查——已并入 block hook（块级判定），不再注册每指令 code hook。
     ///
-    /// 仅 MPU 使能后做检查；`begin=1, end=0` 为 Unicorn 全范围约定。
-    /// Thumb 位（bit0）在匹配前剥离。
-    fn attach_fetch_xn_hook(&mut self) -> Result<()> {
-        let mpu = self.mpu.clone();
-        let mpu_enabled = self.mpu_enabled.clone();
-        self.cpu.add_code_hook(1, 0, move |uc, address, _size| {
-            // 快路径：MPU 未使能时无锁放行（省去每指令的加锁，纯计算负载关键）
-            if !mpu_enabled.load(Ordering::Relaxed) {
-                return;
-            }
-            let addr = (address & !1) as u32;
-            let fault = {
-                let m = mpu.lock().unwrap();
-                m.check(addr, Access::Fetch, cpu_privileged(uc)).err()
-            };
-            if let Some(f) = fault {
-                fault_and_stop(uc, &mpu, f);
-            }
-        })?;
-        log::info!("取指 XN 检查 code hook 已挂载");
-        Ok(())
-    }
+    /// 为什么块级可行：XN 是内存区域属性，一条直行翻译块内的所有指令同属一个
+    /// 区域；若该区域 XN，则块入口处的取指即违规，block hook 在块执行前触发，
+    /// 与原先每指令 code hook 在语义上等价，但避免每指令一次 FFI（强制单指令
+    /// 翻译块，纯计算负载最大性能黑洞，见 bench_probe）。
 
     /// 运行 `count` 条指令（从当前 PC 继续）。
     ///
@@ -1376,9 +1407,41 @@ impl Machine {
     /// - 异常返回（EXC_RETURN，intr hook 停机）→ 现场已恢复，继续；
     /// - 看门狗复位请求（block hook 停机）→ 记录 RCC_CSR 复位标志 + 系统复位，继续。
     /// `count` 以线程模式指令计：每次 emu_start 命中 `remaining` 即结束。
+    /// 是否有外设处于活动状态（探测/调试用）。
+    pub fn peripheral_any_active(&self) -> bool {
+        self.status.has(BIT_ANY_ACTIVE)
+    }
+
+    /// 活动外设标记数量（探测/调试用）。
+    pub fn peripheral_active_count(&self) -> usize {
+        self.tick_actives
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.load(Ordering::Relaxed))
+            .count()
+    }
+
+    /// 是否有挂起中断（探测/调试用）。
+    pub fn nvic_pending(&self) -> bool {
+        self.status.has(BIT_NVIC_PENDING)
+    }
+
+    /// MPU 是否已使能（探测/调试用）。
+    pub fn mpu_enabled(&self) -> bool {
+        self.status.has(BIT_MPU)
+    }
+
+    /// run() 外层循环迭代次数（探测 emu_start 是否频繁提前返回）。
+    pub fn run_iterations(&self) -> u64 {
+        self.run_iterations.get()
+    }
+
     pub fn run(&mut self, count: usize) -> Result<()> {
         let remaining = count;
         while remaining > 0 {
+            self.run_iterations
+                .set(self.run_iterations.get() + 1);
             let pc = self.cpu.reg_read_u32(RegisterARM::PC)?;
             self.cpu.emu_start(pc as u64, 0, 0, remaining)?;
 

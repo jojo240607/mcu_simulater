@@ -53,12 +53,13 @@ fn bench_mips_compute() {
 #[test]
 fn bench_calibrate_count() {
     let mut m = load("firmware/fp_acceptance/fp_acceptance.elf");
-    m.run(1_000_000).unwrap(); // 预热
 
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    // code hook：每条指令回调一次；同时累计字节数验证 block hook 的 size 语义
+    // code hook：每条指令回调一次；同时累计字节数验证 block hook 的 size 语义。
+    // 必须在预热前注册：Unicorn 把 code hook 调用在翻译期烘焙进 TB，
+    // 预热后再注册不会影响已缓存的 TB（故预热后触发次数为 0）。
     let actual = Arc::new(AtomicU64::new(0));
     let bytes = Arc::new(AtomicU64::new(0));
     let a = actual.clone();
@@ -68,6 +69,10 @@ fn bench_calibrate_count() {
         b.fetch_add(size as u64, Ordering::Relaxed);
     })
     .unwrap();
+
+    m.run(1_000_000).unwrap(); // 预热（此时已带 code hook）
+    actual.store(0, Ordering::Relaxed);
+    bytes.store(0, Ordering::Relaxed);
 
     let budget = 2_000_000usize;
     let c0 = m.clock.count();

@@ -21,10 +21,10 @@
 //! STM32F407 优先级位数为 4（低 4 位有效，数值小 = 优先级高）。
 //! 本实现仅覆盖 4 字节访问；SCB 对本窗口做委托。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::peripheral::BusError;
+use crate::sim::status::{Status, BIT_NVIC_PENDING};
 
 /// STM32F407 外部中断数（IRQ 0..=81）
 pub const NVIC_IRQ_COUNT: usize = 82;
@@ -128,9 +128,10 @@ pub struct Nvic {
     exception_stack: Vec<u32>,
     /// 仿真循环停机原因
     stop_reason: StopReason,
-    /// 是否有任一挂起中断（原子快速判定）：Machine block hook 据此在无挂起时
-    /// 跳过加锁的 select_pending 检查（纯计算负载下中断稀少，省去每块锁开销）
-    pending_any: Arc<AtomicBool>,
+    /// 全局状态字（BIT_NVIC_PENDING = 是否有任一挂起中断）：Machine block hook
+    /// 据此在无挂起时跳过加锁的 select_pending 检查（纯计算负载下中断稀少，
+    /// 省去每块锁开销；与 mpu/any_active/wdog 合并为单原子，热路径一次 load）
+    pending_any: Arc<Status>,
 }
 
 impl Default for Nvic {
@@ -140,13 +141,13 @@ impl Default for Nvic {
 }
 
 impl Nvic {
-    /// 便捷构造（单元测试/独立使用）：pending_any 为内部占位，不与外部共享
+    /// 便捷构造（单元测试/独立使用）：状态字为内部占位，不与外部共享
     pub fn new() -> Self {
-        Self::with_pending_any(Arc::new(AtomicBool::new(false)))
+        Self::with_pending_any(Arc::new(Status::new()))
     }
 
-    /// 正式构造：`pending_any` 由 Machine 持有（与 nvic 字段并行），挂起位变化时同步
-    pub fn with_pending_any(pending_any: Arc<AtomicBool>) -> Self {
+    /// 正式构造：`status` 由 Machine 持有，挂起位变化时同步 BIT_NVIC_PENDING
+    pub fn with_pending_any(pending_any: Arc<Status>) -> Self {
         Self {
             enable: [0; 3],
             pending: [0; 3],
@@ -179,7 +180,7 @@ impl Nvic {
     pub fn set_pending(&mut self, irq: u32) {
         let (w, b) = irq_bits(irq);
         self.pending[w] |= b;
-        self.pending_any.store(true, Ordering::Relaxed);
+        self.pending_any.set(BIT_NVIC_PENDING);
     }
 
     pub fn clear_pending(&mut self, irq: u32) {
@@ -190,13 +191,17 @@ impl Nvic {
 
     /// 是否有任一挂起中断（无锁快速判定，供 block hook 跳过加锁检查）
     pub fn pending_any(&self) -> bool {
-        self.pending_any.load(Ordering::Relaxed)
+        self.pending_any.has(BIT_NVIC_PENDING)
     }
 
-    /// 根据挂起位图重算 pending_any（clear_pending / ICPR 清除后调用）
+    /// 根据挂起位图重算 BIT_NVIC_PENDING（clear_pending / ICPR 清除后调用）
     fn sync_pending_any(&self) {
         let any = self.pending.iter().any(|&w| w != 0);
-        self.pending_any.store(any, Ordering::Relaxed);
+        if any {
+            self.pending_any.set(BIT_NVIC_PENDING);
+        } else {
+            self.pending_any.clear(BIT_NVIC_PENDING);
+        }
     }
 
     pub fn set_active(&mut self, irq: u32) {
@@ -383,7 +388,7 @@ impl Nvic {
                 }
                 Some((RegBank::Ispr, w)) => {
                     self.pending[w] |= value;
-                    self.pending_any.store(true, Ordering::Relaxed);
+                    self.pending_any.set(BIT_NVIC_PENDING);
                     Ok(())
                 }
                 Some((RegBank::Icpr, w)) => {

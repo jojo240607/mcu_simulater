@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::peripheral::nvic::Nvic;
 use crate::peripheral::{BusError, Peripheral};
+use crate::sim::status::{Status, BIT_WDOG};
 
 /// WWDG 在 STM32F407 上的中断号（IRQ0）
 pub const WWDG_IRQ: u32 = 0;
@@ -41,21 +42,35 @@ pub enum ResetReason {
 ///
 /// 无锁原子实现：block hook 每基本块调用 `is_pending()`，Mutex 开销在性能敏感
 /// 路径上不可忽略，改用 `AtomicU8`（0=None, 1=Iwdg, 2=Wwdg, 3=LowPower）。
+/// 同时联动全局状态字 BIT_WDOG：`request()` 置位（block hook 据此停机）、
+/// `take()` 清位（消费后放行），使 block hook 热路径免去二次原子判读。
 pub struct WdogResetReq {
     req: AtomicU8,
+    /// 全局状态字联动（可选：单测独立构造时为 None，不更新 BIT_WDOG）
+    status: Option<Arc<Status>>,
 }
 
 impl Default for WdogResetReq {
     fn default() -> Self {
-        Self {
-            req: AtomicU8::new(0),
-        }
+        Self::new()
     }
 }
 
 impl WdogResetReq {
+    /// 独立构造（单元测试用）：不联动全局状态字
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            req: AtomicU8::new(0),
+            status: None,
+        }
+    }
+
+    /// 正式构造：与全局状态字联动（request/take 同步 BIT_WDOG）
+    pub fn with_status(status: Arc<Status>) -> Self {
+        Self {
+            req: AtomicU8::new(0),
+            status: Some(status),
+        }
     }
 
     /// 发出复位请求（多个看门狗同时超时以后写覆盖先写）
@@ -66,21 +81,30 @@ impl WdogResetReq {
             ResetReason::LowPower => 3,
         };
         self.req.store(code, Ordering::Relaxed);
+        if let Some(s) = &self.status {
+            s.set(BIT_WDOG);
+        }
     }
 
-    /// 是否有待处理复位请求（block hook 据此停机，无锁快速判定）
+    /// 是否有待处理复位请求（探测/测试用；block hook 改用全局状态字 BIT_WDOG）
     pub fn is_pending(&self) -> bool {
         self.req.load(Ordering::Relaxed) != 0
     }
 
-    /// 取走复位请求（消费后为 None）
+    /// 取走复位请求（消费后为 None，并清除全局状态字 BIT_WDOG）
     pub fn take(&self) -> Option<ResetReason> {
-        match self.req.swap(0, Ordering::Relaxed) {
+        let r = match self.req.swap(0, Ordering::Relaxed) {
             1 => Some(ResetReason::Iwdg),
             2 => Some(ResetReason::Wwdg),
             3 => Some(ResetReason::LowPower),
             _ => None,
+        };
+        if r.is_some() {
+            if let Some(s) = &self.status {
+                s.clear(BIT_WDOG);
+            }
         }
+        r
     }
 }
 
