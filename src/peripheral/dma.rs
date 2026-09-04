@@ -31,6 +31,7 @@
 //! 状态位每流 6 位（FEIF=0, DMEIF=2, TEIF=3, HTIF=4, TCIF=5），低 4 流在 LISR/LIFCR、
 //! 高 4 流在 HISR/HIFCR，流内偏移 = (流 % 4) × 6。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::core::Cpu;
@@ -167,10 +168,24 @@ pub struct Dma {
     dcmi_handle: Option<Arc<Mutex<Dcmi>>>,
     /// 注册的 SDIO 句柄（index 0 = SDIO1，外设↔内存搬运直接读写 FIFO）
     sdio_handle: Option<Arc<Mutex<Sdio>>>,
+    /// 活动标记（任一流 CR.EN 置位）：Machine block hook 据此跳过全流禁用的
+    /// DMA 加锁 tick（无使能流时 tick 无事可做）
+    active: Arc<AtomicBool>,
 }
 
 impl Dma {
+    /// 便捷构造（单元测试用）：活动标记为一次性占位，不与 Machine 联动
     pub fn new(nvic: Arc<Mutex<Nvic>>, name: &'static str, stream_irq: [u32; 8]) -> Self {
+        Self::with_active(nvic, name, stream_irq, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// 正式构造：`active` 由 Machine 持有（与 timers 列表并行），流 CR.EN 变化时同步
+    pub fn with_active(
+        nvic: Arc<Mutex<Nvic>>,
+        name: &'static str,
+        stream_irq: [u32; 8],
+        active: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             name,
             stream_irq,
@@ -187,7 +202,14 @@ impl Dma {
             tim_handles: Default::default(),
             dcmi_handle: None,
             sdio_handle: None,
+            active,
         }
+    }
+
+    /// 是否有任一流处于使能态（根据 CR.EN 重算活动标记，CR 清除后调用）
+    fn sync_active(&self) {
+        let any = (0..8usize).any(|s| self.stream_reg(s, 0) & CR_EN != 0);
+        self.active.store(any, Ordering::Relaxed);
     }
 
     /// 注册 USART 句柄（供外设方向搬运读写 DR）。
@@ -539,6 +561,15 @@ impl Peripheral for Dma {
             }
             i if i < REG_COUNT => {
                 self.regs[i] = value;
+                // 同步活动标记：写流 CR（每 6 寄存器一个，S0CR 起始）且含 EN 时置位；
+                // 清除 EN 时重算（其余流可能仍使能）
+                if i >= (OFF_CR as usize / 4) && (i - OFF_CR as usize / 4) % 6 == 0 {
+                    if value & CR_EN != 0 {
+                        self.active.store(true, Ordering::Relaxed);
+                    } else {
+                        self.sync_active();
+                    }
+                }
                 Ok(())
             }
             _ => Err(BusError::OutOfRange),

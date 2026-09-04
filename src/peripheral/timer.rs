@@ -49,6 +49,7 @@
 //! - BDTR 0x44（高级：DTG=bit7:0, BKE=bit12, BKP=bit13, AOE=bit14, MOE=bit15）
 //! - DCR 0x48（DBL=bit4:0, DBA=bit12:8）/ DMAR 0x4C
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::events::{Event, EventBus};
@@ -204,10 +205,24 @@ pub struct Timer {
     bus: Arc<Mutex<EventBus>>,
     /// 共享 NVIC（更新事件 → 更新中断；CC 匹配/捕获 → CC 中断；刹车 → 刹车中断）
     nvic: Arc<Mutex<Nvic>>,
+    /// 活动标记（CR1.CEN）：Machine block hook 据此跳过未使能定时器的加锁 tick
+    active: Arc<AtomicBool>,
 }
 
 impl Timer {
+    /// 便捷构造（单元测试用）：活动标记为一次性占位，不与 Machine 联动
     pub fn new(port: u8, cfg: TimerConfig, bus: Arc<Mutex<EventBus>>, nvic: Arc<Mutex<Nvic>>) -> Self {
+        Self::with_active(port, cfg, bus, nvic, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// 正式构造：`active` 由 Machine 持有（与 timers 列表并行），CR1.CEN 变化时同步
+    pub fn with_active(
+        port: u8,
+        cfg: TimerConfig,
+        bus: Arc<Mutex<EventBus>>,
+        nvic: Arc<Mutex<Nvic>>,
+        active: Arc<AtomicBool>,
+    ) -> Self {
         let mut t = Self {
             port,
             name: cfg.name,
@@ -227,6 +242,7 @@ impl Timer {
             moe_state: false,
             bus,
             nvic,
+            active,
         };
         t.reset();
         t
@@ -615,6 +631,17 @@ impl Peripheral for Timer {
             return Err(BusError::NotImplemented);
         }
         match offset {
+            OFF_CR1 => {
+                // 同步活动标记：CEN 位 0→1 / 1→0 时更新（Machine block hook 据此跳过
+                // 未使能定时器的加锁 tick，避免对未激活定时器做无效推进）
+                let old_cen = self.regs[OFF_CR1 as usize / 4] & CR1_CEN;
+                self.regs[OFF_CR1 as usize / 4] = value;
+                let new_cen = value & CR1_CEN;
+                if old_cen != new_cen {
+                    self.active.store(new_cen != 0, Ordering::Relaxed);
+                }
+                Ok(())
+            }
             OFF_EGR => {
                 // UG：软件更新事件（重复计数直接清零并生成更新事件）
                 if value & EGR_UG != 0 {
@@ -740,6 +767,8 @@ impl Peripheral for Timer {
         self.dead_main = [DeadTimer::default(); 4];
         self.dead_comp = [DeadTimer::default(); 4];
         self.moe_state = false;
+        // 复位清零 CR1.CEN → 活动标记同步为未激活
+        self.active.store(false, Ordering::Relaxed);
     }
 }
 

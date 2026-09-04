@@ -6,6 +6,7 @@
 //!     与中断投递（NVIC 挂起抢占 + 异常入栈/出栈）。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use object::{Object, ObjectSection, SectionKind};
@@ -69,9 +70,17 @@ pub struct Machine {
     pub clock: Arc<Mutex<VirtualClock>>,
     /// 时钟外设列表（block hook 按块 tick 推进）
     timers: Arc<Mutex<Vec<Arc<Mutex<dyn Peripheral>>>>>,
+    /// 与 `timers` 并行的活动标记列表（外设使能状态原子同步，block hook 据此跳过
+    /// 未激活外设的加锁 tick）
+    tick_actives: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
+    /// 任一外设是否激活（tick_actives 的 OR 缓存，供 block hook 快路径整体跳过）
+    any_active: Arc<AtomicBool>,
     /// DMA1/DMA2（tick 判传输完成；run 间隙 process 执行内存搬运）
     dma: Arc<Mutex<Dma>>,
     dma2: Arc<Mutex<Dma>>,
+    /// DMA1/DMA2 活动标记（任一流 CR.EN 置位，Machine 持有并推入 tick_actives）
+    dma_active: Arc<AtomicBool>,
+    dma2_active: Arc<AtomicBool>,
     /// RCC（看门狗复位时置 CSR 复位标志）
     rcc: Arc<Mutex<Rcc>>,
     /// RNG 真随机数发生器（@0x50060800，AHB2；seed 可控供测试复现）
@@ -95,8 +104,16 @@ pub struct Machine {
     pub usb_otg: Arc<Mutex<UsbOtg>>,
     /// IWDG 独立看门狗（系统复位时复位外设，避免复位后立即再次超时）
     iwdg: Arc<Mutex<Iwdg>>,
+    /// IWDG 活动标记（KR_START 启动，Machine 持有并推入 tick_actives）
+    iwdg_active: Arc<AtomicBool>,
     /// WWDG 窗口看门狗（同上）
     wwdg: Arc<Mutex<Wwdg>>,
+    /// WWDG 活动标记（CR.WDGA 置位，Machine 持有并推入 tick_actives）
+    wwdg_active: Arc<AtomicBool>,
+    /// RTC 活动标记（闹钟/唤醒使能或日历初始化，Machine 持有并推入 tick_actives）
+    rtc_active: Arc<AtomicBool>,
+    /// NVIC 挂起中断原子快速判定（block hook 据此在无挂起时跳过加锁检查）
+    nvic_pending: Arc<AtomicBool>,
     /// 看门狗复位请求（IWDG/WWDG/PWR 待机唤醒置位，block hook 停机，run() 执行系统复位）
     pub wdog_req: Arc<WdogResetReq>,
     /// 初始 SP（向量表首字）
@@ -109,13 +126,33 @@ impl Machine {
     /// 创建 Cortex-M4F 机器
     pub fn new_m4f() -> Result<Self> {
         let cpu = Cpu::new_m4f()?;
-        let nvic = Arc::new(Mutex::new(Nvic::new()));
-        let dma = Arc::new(Mutex::new(Dma::new(nvic.clone(), "DMA1", DMA1_STREAM_IRQ)));
-        let dma2 = Arc::new(Mutex::new(Dma::new(nvic.clone(), "DMA2", DMA2_STREAM_IRQ)));
+        let nvic_pending = Arc::new(AtomicBool::new(false));
+        let nvic = Arc::new(Mutex::new(Nvic::with_pending_any(nvic_pending.clone())));
+        let dma_active = Arc::new(AtomicBool::new(false));
+        let dma = Arc::new(Mutex::new(Dma::with_active(
+            nvic.clone(),
+            "DMA1",
+            DMA1_STREAM_IRQ,
+            dma_active.clone(),
+        )));
+        let dma2_active = Arc::new(AtomicBool::new(false));
+        let dma2 = Arc::new(Mutex::new(Dma::with_active(
+            nvic.clone(),
+            "DMA2",
+            DMA2_STREAM_IRQ,
+            dma2_active.clone(),
+        )));
         let wdog_req = Arc::new(WdogResetReq::new());
         let events = Arc::new(Mutex::new(EventBus::new()));
         let pwr = Arc::new(Mutex::new(Pwr::new(wdog_req.clone())));
-        let rtc = Arc::new(Mutex::new(Rtc::new(nvic.clone(), pwr.clone())));
+        let rtc_active = Arc::new(AtomicBool::new(false));
+        let rtc = Arc::new(Mutex::new(Rtc::with_active(
+            nvic.clone(),
+            pwr.clone(),
+            rtc_active.clone(),
+        )));
+        let iwdg_active = Arc::new(AtomicBool::new(false));
+        let wwdg_active = Arc::new(AtomicBool::new(false));
         Ok(Self {
             cpu,
             bus: Arc::new(Mutex::new(Bus::new())),
@@ -126,8 +163,12 @@ impl Machine {
             terminal: Arc::new(Mutex::new(Terminal::new(events.clone()))),
             clock: Arc::new(Mutex::new(VirtualClock::new())),
             timers: Arc::new(Mutex::new(Vec::new())),
+            tick_actives: Arc::new(Mutex::new(Vec::new())),
+            any_active: Arc::new(AtomicBool::new(false)),
             dma,
             dma2,
+            dma_active,
+            dma2_active,
             rcc: Arc::new(Mutex::new(Rcc::new())),
             rng: Arc::new(Mutex::new(Rng::new(
                 0x5EED_2026,
@@ -145,11 +186,19 @@ impl Machine {
                 Some(events.clone()),
                 nvic.clone(),
             ))),
-            iwdg: Arc::new(Mutex::new(Iwdg::new(wdog_req.clone()))),
-            wwdg: Arc::new(Mutex::new(Wwdg::new(
+            iwdg: Arc::new(Mutex::new(Iwdg::with_active(
+                wdog_req.clone(),
+                iwdg_active.clone(),
+            ))),
+            iwdg_active,
+            wwdg: Arc::new(Mutex::new(Wwdg::with_active(
                 nvic.clone(),
                 wdog_req.clone(),
+                wwdg_active.clone(),
             ))),
+            wwdg_active,
+            rtc_active,
+            nvic_pending,
             wdog_req,
             initial_sp: 0,
             entry: 0,
@@ -465,7 +514,8 @@ impl Machine {
         // 触发转换 → DacLevel 事件发布（虚拟示波器/测试订阅），CR.DMAENx 置位时发布
         // DacDma 请求内存→外设搬运（DMA 写 DHR12Rx 再转换）。DMA 映射（RM0090）：
         // DAC1_CH1 → DMA1_Stream5_Channel7、DAC1_CH2 → DMA1_Stream6_Channel7。
-        let dac = Arc::new(Mutex::new(Dac::new(1, events.clone())));
+        let dac_active = Arc::new(AtomicBool::new(false));
+        let dac = Arc::new(Mutex::new(Dac::with_active(1, events.clone(), dac_active.clone())));
         self.bus
             .lock()
             .unwrap()
@@ -474,6 +524,7 @@ impl Machine {
         self.dma.lock().unwrap().register_dac(1, dac.clone());
         // 推入时钟外设列表：DAC 无计数语义，tick 仅冲刷定时器触发暂存的电平事件
         self.timers.lock().unwrap().push(dac.clone());
+        self.tick_actives.lock().unwrap().push(dac_active);
 
         // DAC 触发 → DMA 请求（内存→外设：DMA 写 DHR 再转换）
         let dma1_for_dac = self.dma.clone();
@@ -893,7 +944,14 @@ impl Machine {
         ];
         for (port, base, name, kind, bits, channels, irq) in tim_cfgs {
             let cfg = TimerConfig { name, kind: *kind, bits: *bits, channels: *channels, irq: *irq };
-            let tim = Arc::new(Mutex::new(Timer::new(*port, cfg, events.clone(), self.nvic.clone())));
+            let tim_active = Arc::new(AtomicBool::new(false));
+            let tim = Arc::new(Mutex::new(Timer::with_active(
+                *port,
+                cfg,
+                events.clone(),
+                self.nvic.clone(),
+                tim_active.clone(),
+            )));
             self.bus
                 .lock()
                 .unwrap()
@@ -906,6 +964,7 @@ impl Machine {
                 reg_ctrl.lock().unwrap().register_tim(*port, tim.clone());
             }
             self.timers.lock().unwrap().push(tim);
+            self.tick_actives.lock().unwrap().push(tim_active);
         }
 
         // TIM 更新事件 → DMA 请求（F407 固定映射 + HAL 默认流，见
@@ -942,10 +1001,12 @@ impl Machine {
         let dma = self.dma.clone();
         self.bus.lock().unwrap().attach(DMA1_BASE, 0x400, "DMA1", dma.clone())?;
         self.timers.lock().unwrap().push(dma);
+        self.tick_actives.lock().unwrap().push(self.dma_active.clone());
 
         let dma2 = self.dma2.clone();
         self.bus.lock().unwrap().attach(DMA2_BASE, 0x400, "DMA2", dma2.clone())?;
         self.timers.lock().unwrap().push(dma2);
+        self.tick_actives.lock().unwrap().push(self.dma2_active.clone());
 
         // USART DMA 请求路由（F407 固定映射：port + 方向 → DMAx_StreamN_ChannelM，
         // 采用 HAL 默认流，见 STM32F4xx_hal_uart.c UART_DMA_GetConfig）。
@@ -1038,10 +1099,12 @@ impl Machine {
         let iwdg = self.iwdg.clone();
         self.bus.lock().unwrap().attach(0x4000_3000, 0x400, "IWDG", iwdg.clone())?;
         self.timers.lock().unwrap().push(iwdg);
+        self.tick_actives.lock().unwrap().push(self.iwdg_active.clone());
 
         let wwdg = self.wwdg.clone();
         self.bus.lock().unwrap().attach(0x4000_2C00, 0x400, "WWDG", wwdg.clone())?;
         self.timers.lock().unwrap().push(wwdg);
+        self.tick_actives.lock().unwrap().push(self.wwdg_active.clone());
 
         // M10-PWR 电源控制（@0x40007000，APB1）。
         // CR 低功耗位写读 + CWUF/CSBF 写 1 清 WUF/SBF；CSR.WUF/SBF/PVDO 只读标志
@@ -1059,6 +1122,7 @@ impl Machine {
         let rtc = self.rtc.clone();
         self.bus.lock().unwrap().attach(0x4000_2800, 0x400, "RTC", rtc.clone())?;
         self.timers.lock().unwrap().push(rtc);
+        self.tick_actives.lock().unwrap().push(self.rtc_active.clone());
 
         // M4-EXTI：SYSCFG（EXTICR 端口选择） + EXTI（外部中断，GPIO 事件 → NVIC）
         let port_select = Arc::new(Mutex::new(ExtiPortSelect::default()));
@@ -1166,18 +1230,31 @@ impl Machine {
     fn attach_interrupt_delivery(&mut self) -> Result<()> {
         // 1) block hook：挂起中断抢占检查 + 块级时钟推进（begin=1,end=0 全范围）
         let nvic = self.nvic.clone();
+        let nvic_pending = self.nvic_pending.clone();
         let clock = self.clock.clone();
         let timers = self.timers.clone();
+        let tick_actives = self.tick_actives.clone();
+        let any_active = self.any_active.clone();
         let wdog_req = self.wdog_req.clone();
         self.cpu.add_block_hook(1, 0, move |uc, _addr, size| {
-            // 块级加权周期推进虚拟时钟，并 tick 时钟外设（TIM2…，含 IWDG/WWDG）
+            // 块级加权周期推进虚拟时钟，并 tick 活动外设（TIM/DMA/DAC/RTC/IWDG/WWDG）
             let cycles = size as u64 * AVG_CYCLES_PER_INS;
-            {
-                let mut c = clock.lock().unwrap();
-                c.advance(cycles);
+            clock.lock().unwrap().advance(cycles);
+            // 快路径：任一外设未激活（纯计算负载，外设从不使能）时跳过整个
+            // tick 循环，省去 timers 列表加锁与逐个外设加锁（性能主瓶颈）。
+            if !any_active.load(Ordering::Relaxed) {
+                let acts = tick_actives.lock().unwrap();
+                if acts.iter().any(|a| a.load(Ordering::Relaxed)) {
+                    any_active.store(true, Ordering::Relaxed);
+                }
+            }
+            if any_active.load(Ordering::Relaxed) {
                 let timers = timers.lock().unwrap();
-                for t in timers.iter() {
-                    t.lock().unwrap().tick(cycles);
+                let acts = tick_actives.lock().unwrap();
+                for (t, a) in timers.iter().zip(acts.iter()) {
+                    if a.load(Ordering::Relaxed) {
+                        t.lock().unwrap().tick(cycles);
+                    }
                 }
             }
             // 看门狗复位请求：停机（run() 消费请求并执行系统复位）
@@ -1185,13 +1262,15 @@ impl Machine {
                 let _ = uc.emu_stop();
                 return;
             }
-            // 挂起中断抢占检查
-            let primask = uc.reg_read(RegisterARM::PRIMASK).unwrap_or(0) != 0;
-            let basepri = (uc.reg_read(RegisterARM::BASEPRI).unwrap_or(0) & 0xF) as u8;
-            let mut n = nvic.lock().unwrap();
-            if let Some(irq) = n.select_pending(primask, basepri) {
-                n.set_stop_reason(StopReason::Switch(irq));
-                let _ = uc.emu_stop();
+            // 挂起中断抢占检查（快路径：无挂起中断时跳过加锁的 select_pending）
+            if nvic_pending.load(Ordering::Relaxed) {
+                let primask = uc.reg_read(RegisterARM::PRIMASK).unwrap_or(0) != 0;
+                let basepri = (uc.reg_read(RegisterARM::BASEPRI).unwrap_or(0) & 0xF) as u8;
+                let mut n = nvic.lock().unwrap();
+                if let Some(irq) = n.select_pending(primask, basepri) {
+                    n.set_stop_reason(StopReason::Switch(irq));
+                    let _ = uc.emu_stop();
+                }
             }
         })?;
 

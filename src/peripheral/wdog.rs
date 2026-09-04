@@ -17,6 +17,7 @@
 //! 窗口语义：计数器 > W 时写 CR（刷新）→ 窗口违规复位；计数器跨过 0x40 置 EWIF
 //! 并（EWI 使能时）挂起 IRQ0；计数器 < 0x40（T6 清零）→ 超时复位。
 
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::peripheral::nvic::Nvic;
@@ -37,9 +38,19 @@ pub enum ResetReason {
 }
 
 /// 共享看门狗复位请求：IWDG/WWDG 置位，Machine 消费（见 [`Machine::run`]）。
-#[derive(Default)]
+///
+/// 无锁原子实现：block hook 每基本块调用 `is_pending()`，Mutex 开销在性能敏感
+/// 路径上不可忽略，改用 `AtomicU8`（0=None, 1=Iwdg, 2=Wwdg, 3=LowPower）。
 pub struct WdogResetReq {
-    req: Mutex<Option<ResetReason>>,
+    req: AtomicU8,
+}
+
+impl Default for WdogResetReq {
+    fn default() -> Self {
+        Self {
+            req: AtomicU8::new(0),
+        }
+    }
 }
 
 impl WdogResetReq {
@@ -49,17 +60,27 @@ impl WdogResetReq {
 
     /// 发出复位请求（多个看门狗同时超时以后写覆盖先写）
     pub fn request(&self, reason: ResetReason) {
-        *self.req.lock().unwrap() = Some(reason);
+        let code = match reason {
+            ResetReason::Iwdg => 1,
+            ResetReason::Wwdg => 2,
+            ResetReason::LowPower => 3,
+        };
+        self.req.store(code, Ordering::Relaxed);
     }
 
-    /// 是否有待处理复位请求（block hook 据此停机）
+    /// 是否有待处理复位请求（block hook 据此停机，无锁快速判定）
     pub fn is_pending(&self) -> bool {
-        self.req.lock().unwrap().is_some()
+        self.req.load(Ordering::Relaxed) != 0
     }
 
     /// 取走复位请求（消费后为 None）
     pub fn take(&self) -> Option<ResetReason> {
-        self.req.lock().unwrap().take()
+        match self.req.swap(0, Ordering::Relaxed) {
+            1 => Some(ResetReason::Iwdg),
+            2 => Some(ResetReason::Wwdg),
+            3 => Some(ResetReason::LowPower),
+            _ => None,
+        }
     }
 }
 
@@ -96,10 +117,19 @@ pub struct Iwdg {
     remainder: u64,
     /// 共享复位请求
     req: Arc<WdogResetReq>,
+    /// 活动标记（enabled，KR=0xCCCC 启动）：Machine block hook 据此跳过未激活
+    /// 看门狗的加锁 tick
+    active: Arc<AtomicBool>,
 }
 
 impl Iwdg {
+    /// 便捷构造（单元测试用）：活动标记为一次性占位，不与 Machine 联动
     pub fn new(req: Arc<WdogResetReq>) -> Self {
+        Self::with_active(req, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// 正式构造：`active` 由 Machine 持有（与 iwdg 字段并行），KR=0xCCCC 启动时同步
+    pub fn with_active(req: Arc<WdogResetReq>, active: Arc<AtomicBool>) -> Self {
         Self {
             regs: [0; 4],
             down: 0,
@@ -107,6 +137,7 @@ impl Iwdg {
             unlocked: false,
             remainder: 0,
             req,
+            active,
         }
     }
 
@@ -149,6 +180,7 @@ impl Peripheral for Iwdg {
                     }
                     KR_START => {
                         self.enabled = true;
+                        self.active.store(true, Ordering::Relaxed);
                         self.reload();
                     }
                     _ => self.unlocked = false, // 非法键值重新上锁
@@ -213,6 +245,8 @@ impl Peripheral for Iwdg {
         self.enabled = false;
         self.unlocked = false;
         self.remainder = 0;
+        // 复位清除 enabled → 活动标记同步为未激活
+        self.active.store(false, Ordering::Relaxed);
     }
 }
 
@@ -242,16 +276,29 @@ pub struct Wwdg {
     nvic: Arc<Mutex<Nvic>>,
     /// 共享复位请求
     req: Arc<WdogResetReq>,
+    /// 活动标记（CR.WDGA 激活）：Machine block hook 据此跳过未激活看门狗的加锁 tick
+    active: Arc<AtomicBool>,
 }
 
 impl Wwdg {
+    /// 便捷构造（单元测试用）：活动标记为一次性占位，不与 Machine 联动
     pub fn new(nvic: Arc<Mutex<Nvic>>, req: Arc<WdogResetReq>) -> Self {
+        Self::with_active(nvic, req, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// 正式构造：`active` 由 Machine 持有（与 wwdg 字段并行），CR.WDGA 置位时同步
+    pub fn with_active(
+        nvic: Arc<Mutex<Nvic>>,
+        req: Arc<WdogResetReq>,
+        active: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             regs: [0; 3],
             counter: 0x7F,
             remainder: 0,
             nvic,
             req,
+            active,
         }
     }
 
@@ -298,6 +345,9 @@ impl Peripheral for Wwdg {
                 }
                 // 激活或刷新：WDGA 只可置位，T 写入 → 计数器重载
                 self.regs[(WW_OFF_CR / 4) as usize] |= wdga;
+                // 同步活动标记：WDGA 一经置位保持（写 WDGA=0 不清除）
+                self.active
+                    .store(self.regs[(WW_OFF_CR / 4) as usize] & CR_WDGA != 0, Ordering::Relaxed);
                 self.counter = t;
                 Ok(())
             }
@@ -352,6 +402,8 @@ impl Peripheral for Wwdg {
         self.regs = [0; 3];
         self.counter = 0x7F;
         self.remainder = 0;
+        // 复位清除 WDGA → 活动标记同步为未激活
+        self.active.store(false, Ordering::Relaxed);
     }
 }
 

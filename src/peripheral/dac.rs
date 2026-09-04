@@ -22,6 +22,7 @@
 //! DHR12R2 0x14 / DHR12L2 0x18 / DHR8R2 0x1C / DHR12RD 0x20 / DHR12LD 0x24 /
 //! DHR8RD 0x28 / DOR1 0x2C / DOR2 0x30 / SR 0x34
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::events::{Event, EventBus};
@@ -92,10 +93,19 @@ pub struct Dac {
     pending_levels: Vec<(u8, u16)>,
     /// 事件总线（转换完成 → DacLevel / DMA 请求 → DacDma）
     bus: Arc<Mutex<EventBus>>,
+    /// 活动标记（任一通道使能 CR.EN1/EN2）：Machine block hook 据此跳过未使能
+    /// DAC 的加锁 tick（未使能时 pending_levels 必为空，无待冲刷发布）
+    active: Arc<AtomicBool>,
 }
 
 impl Dac {
+    /// 便捷构造（单元测试用）：活动标记为一次性占位，不与 Machine 联动
     pub fn new(port: u8, bus: Arc<Mutex<EventBus>>) -> Self {
+        Self::with_active(port, bus, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// 正式构造：`active` 由 Machine 持有（与 timers 列表并行），CR.ENx 置位时同步
+    pub fn with_active(port: u8, bus: Arc<Mutex<EventBus>>, active: Arc<AtomicBool>) -> Self {
         Self {
             port,
             regs: [0; REG_COUNT],
@@ -104,6 +114,7 @@ impl Dac {
             dma_channel: 1,
             pending_levels: Vec::new(),
             bus,
+            active,
         }
     }
 
@@ -311,6 +322,9 @@ impl Peripheral for Dac {
             }
             OFF_CR => {
                 self.regs[0] = value;
+                // 同步活动标记：任一通道使能（EN1/EN2）即需周期 tick 冲刷电平
+                self.active
+                    .store(value & (CR_EN1 | CR_EN2) != 0, Ordering::Relaxed);
                 Ok(())
             }
             // DOR/SR 只读，写忽略
@@ -332,6 +346,8 @@ impl Peripheral for Dac {
         self.dor = [0; 2];
         self.dma_channel = 1;
         self.pending_levels.clear();
+        // 复位清除 EN → 活动标记同步为未激活
+        self.active.store(false, Ordering::Relaxed);
     }
 
     /// 周期推进：冲刷定时器触发暂存的电平事件（定时器路径在 TimUpdate 订阅回调内

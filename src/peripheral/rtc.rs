@@ -26,6 +26,7 @@
 //! （RCC_BDCR.RTCSEL）与 LSE/LSI 就绪未建模；12 小时制（CR.FMT=1）未实现，
 //! PM 位恒 0。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::peripheral::nvic::Nvic;
@@ -155,10 +156,22 @@ pub struct Rtc {
     unlocked: bool,
     /// 备份寄存器（掉电保持，外设复位不丢失）
     bkp: [u32; BKP_COUNT],
+    /// 活动标记（闹钟/唤醒使能或日历已初始化）：Machine block hook 据此跳过
+    /// 无任何计时需求的 RTC 加锁 tick（纯计算负载下 RTC 无事可做）
+    active: Arc<AtomicBool>,
 }
 
 impl Rtc {
     pub fn new(nvic: Arc<Mutex<Nvic>>, pwr: Arc<Mutex<Pwr>>) -> Self {
+        Self::with_active(nvic, pwr, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// 正式构造：`active` 由 Machine 持有（与 timers 列表并行），使能/初始化变化时同步
+    pub fn with_active(
+        nvic: Arc<Mutex<Nvic>>,
+        pwr: Arc<Mutex<Pwr>>,
+        active: Arc<AtomicBool>,
+    ) -> Self {
         let mut r = Self {
             nvic,
             pwr,
@@ -180,11 +193,18 @@ impl Rtc {
             wpr_step: 0,
             unlocked: false,
             bkp: [0; BKP_COUNT],
+            active,
         };
         // 复位值：DR=0x00002101 → 2021-01-01 00:00:00，SSR=PREDIV_S=0xFF
         r.time_s = r.time_from_ymd_hms(2021, 1, 1, 0, 0, 0);
         r.ssr = r.prer & PRER_PREDIV_S; // 同步预分频值（初始 0xFF）
         r
+    }
+
+    /// 重算活动标记：任一闹钟/唤醒使能，或日历已被固件初始化（作为时间源使用）。
+    fn sync_active(&self) {
+        let any = self.cr & (CR_ALRAE | CR_ALRBE | CR_WUTE) != 0 || self.initialized;
+        self.active.store(any, Ordering::Relaxed);
     }
 
     /// 日历推进（虚拟时钟周期数即 RTCCLK 周期数）。
@@ -387,6 +407,7 @@ impl Rtc {
         self.initialized = true;
         self.accum = 0;
         self.ssr = self.prer & PRER_PREDIV_S;
+        self.sync_active();
     }
 
     /// CR 写（软件加减秒/分/时 + 使能位边缘检测）。
@@ -437,6 +458,7 @@ impl Rtc {
             self.wut_cnt = self.wutr & 0xFFFF;
             self.wut_accum = 0;
         }
+        self.sync_active();
     }
 
     /// ISR 写：标志位写 0 清除；INIT 位写 1/0 进出初始化（需解锁写保护）。
@@ -645,6 +667,7 @@ impl Peripheral for Rtc {
         self.wpr_step = 0;
         self.unlocked = false;
         // bkp 保持不变
+        self.sync_active();
     }
 
     fn tick(&mut self, cycles: u64) {
