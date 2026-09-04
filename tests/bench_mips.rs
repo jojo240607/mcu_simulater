@@ -70,9 +70,9 @@ fn bench_calibrate_count() {
     .unwrap();
 
     let budget = 2_000_000usize;
-    let c0 = m.clock.lock().unwrap().cycles;
+    let c0 = m.clock.count();
     m.run(budget).unwrap();
-    let c1 = m.clock.lock().unwrap().cycles;
+    let c1 = m.clock.count();
     let n = actual.load(Ordering::Relaxed);
     let nb = bytes.load(Ordering::Relaxed);
     println!(

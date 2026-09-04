@@ -38,10 +38,12 @@ impl CycleModel for BlockWeighted {
 }
 
 /// 共享虚拟时钟（M3：block hook 按块推进，供 TIM/SysTick 等外设 `tick`）。
+///
+/// `cycles` 为原子计数：block hook 每块无锁 `advance`（纯计算负载下省去每块加锁）。
 #[derive(Debug, Default)]
 pub struct VirtualClock {
     /// 已推进的虚拟周期数
-    pub cycles: u64,
+    pub cycles: std::sync::atomic::AtomicU64,
 }
 
 impl VirtualClock {
@@ -49,7 +51,12 @@ impl VirtualClock {
         Self::default()
     }
 
-    pub fn advance(&mut self, cycles: u64) {
-        self.cycles += cycles;
+    pub fn advance(&self, cycles: u64) {
+        self.cycles.fetch_add(cycles, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 当前周期数（测试/调试）
+    pub fn count(&self) -> u64 {
+        self.cycles.load(std::sync::atomic::Ordering::Relaxed)
     }
 }

@@ -58,6 +58,8 @@ pub struct Machine {
     pub bus: Arc<Mutex<Bus>>,
     /// MPU（内存保护单元，挂载于 SCB 窗口，访问控制 hook 共享）
     pub mpu: Arc<Mutex<Mpu>>,
+    /// MPU 使能原子快速判定（CTRL.ENABLE 变化时同步，Machine 持有并传给 Mpu::with_enabled）
+    mpu_enabled: Arc<AtomicBool>,
     /// NVIC（嵌套向量中断控制器，挂载于 SCB 窗口，中断投递 hook 共享）
     pub nvic: Arc<Mutex<Nvic>>,
     /// 事件总线（虚拟外设互联，M3）
@@ -66,8 +68,8 @@ pub struct Machine {
     pub console: Arc<Mutex<Console>>,
     /// 虚拟终端（M5：双向接线对象，显示缓冲 + 键盘 → UartRx）
     pub terminal: Arc<Mutex<Terminal>>,
-    /// 共享虚拟时钟（block hook 推进，供 TIM 等外设 tick）
-    pub clock: Arc<Mutex<VirtualClock>>,
+    /// 共享虚拟时钟（block hook 推进，供 TIM 等外设 tick；原子计数无锁）
+    pub clock: Arc<VirtualClock>,
     /// 时钟外设列表（block hook 按块 tick 推进）
     timers: Arc<Mutex<Vec<Arc<Mutex<dyn Peripheral>>>>>,
     /// 与 `timers` 并行的活动标记列表（外设使能状态原子同步，block hook 据此跳过
@@ -153,15 +155,17 @@ impl Machine {
         )));
         let iwdg_active = Arc::new(AtomicBool::new(false));
         let wwdg_active = Arc::new(AtomicBool::new(false));
+        let mpu_enabled = Arc::new(AtomicBool::new(false));
         Ok(Self {
             cpu,
             bus: Arc::new(Mutex::new(Bus::new())),
-            mpu: Arc::new(Mutex::new(Mpu::new())),
+            mpu: Arc::new(Mutex::new(Mpu::with_enabled(mpu_enabled.clone()))),
+            mpu_enabled,
             nvic: nvic.clone(),
             events: events.clone(),
             console: Arc::new(Mutex::new(Console::new())),
             terminal: Arc::new(Mutex::new(Terminal::new(events.clone()))),
-            clock: Arc::new(Mutex::new(VirtualClock::new())),
+            clock: Arc::new(VirtualClock::new()),
             timers: Arc::new(Mutex::new(Vec::new())),
             tick_actives: Arc::new(Mutex::new(Vec::new())),
             any_active: Arc::new(AtomicBool::new(false)),
@@ -217,6 +221,9 @@ impl Machine {
         self.attach_system_control()?;
         // M3 T1 外设集：GPIOA-I + USART1-3 + TIM2 + RCC 存根
         self.attach_t1_peripherals()?;
+        // 中断投递 hook 最后注册：此时 timers/tick_actives 已挂载完毕，
+        // 可冻结活动标记列表（Arc<Vec>）→ block hook 快路径无需每块加锁。
+        self.attach_interrupt_delivery()?;
         Ok(())
     }
 
@@ -286,8 +293,8 @@ impl Machine {
         // 3) 取指 XN 检查入口（code hook）
         self.attach_fetch_xn_hook()?;
 
-        // 4) 中断投递入口（block 检查 + EXC_RETURN 拦截）
-        self.attach_interrupt_delivery()?;
+        // 4) 中断投递入口（block 检查 + EXC_RETURN 拦截）——在全部外设挂载后注册
+        //（见 map_stm32f407_layout），此处不再调用。
 
         log::info!("SCB+MPU+NVIC 已挂载：0x{SCB_BASE:08X} +0x{SCB_SIZE:X}");
         Ok(())
@@ -1233,25 +1240,25 @@ impl Machine {
         let nvic_pending = self.nvic_pending.clone();
         let clock = self.clock.clone();
         let timers = self.timers.clone();
-        let tick_actives = self.tick_actives.clone();
+        // 冻结活动标记列表：所有外设已挂载，转成 Arc<Vec>，block hook 快路径免加锁
+        let tick_actives: Arc<Vec<Arc<AtomicBool>>> =
+            Arc::new(self.tick_actives.lock().unwrap().clone());
         let any_active = self.any_active.clone();
         let wdog_req = self.wdog_req.clone();
         self.cpu.add_block_hook(1, 0, move |uc, _addr, size| {
             // 块级加权周期推进虚拟时钟，并 tick 活动外设（TIM/DMA/DAC/RTC/IWDG/WWDG）
             let cycles = size as u64 * AVG_CYCLES_PER_INS;
-            clock.lock().unwrap().advance(cycles);
+            clock.advance(cycles);
             // 快路径：任一外设未激活（纯计算负载，外设从不使能）时跳过整个
             // tick 循环，省去 timers 列表加锁与逐个外设加锁（性能主瓶颈）。
-            if !any_active.load(Ordering::Relaxed) {
-                let acts = tick_actives.lock().unwrap();
-                if acts.iter().any(|a| a.load(Ordering::Relaxed)) {
-                    any_active.store(true, Ordering::Relaxed);
-                }
+            if !any_active.load(Ordering::Relaxed)
+                && tick_actives.iter().any(|a| a.load(Ordering::Relaxed))
+            {
+                any_active.store(true, Ordering::Relaxed);
             }
             if any_active.load(Ordering::Relaxed) {
                 let timers = timers.lock().unwrap();
-                let acts = tick_actives.lock().unwrap();
-                for (t, a) in timers.iter().zip(acts.iter()) {
+                for (t, a) in timers.iter().zip(tick_actives.iter()) {
                     if a.load(Ordering::Relaxed) {
                         t.lock().unwrap().tick(cycles);
                     }
@@ -1306,16 +1313,18 @@ impl Machine {
         const DATA_END: u64 = 0x2002_0000; // 覆盖 FLASH/CCM/SRAM，止于 SRAM 末端
 
         let mpu = self.mpu.clone();
+        let mpu_enabled = self.mpu_enabled.clone();
         self.cpu.add_mem_hook(
             HookType::MEM_READ | HookType::MEM_WRITE,
             DATA_BEGIN,
             DATA_END,
             move |uc, ty, addr, _size, _value| {
+                // 快路径：MPU 未使能时无锁放行（纯计算负载下省去每内存访问的加锁）
+                if !mpu_enabled.load(Ordering::Relaxed) {
+                    return false;
+                }
                 let fault = {
                     let m = mpu.lock().unwrap();
-                    if !m.is_enabled() {
-                        return false; // 快速路径
-                    }
                     match mem_type_to_access(ty) {
                         Some(access) => {
                             m.check(addr as u32, access, cpu_privileged(uc)).err()
@@ -1340,13 +1349,15 @@ impl Machine {
     /// Thumb 位（bit0）在匹配前剥离。
     fn attach_fetch_xn_hook(&mut self) -> Result<()> {
         let mpu = self.mpu.clone();
+        let mpu_enabled = self.mpu_enabled.clone();
         self.cpu.add_code_hook(1, 0, move |uc, address, _size| {
+            // 快路径：MPU 未使能时无锁放行（省去每指令的加锁，纯计算负载关键）
+            if !mpu_enabled.load(Ordering::Relaxed) {
+                return;
+            }
             let addr = (address & !1) as u32;
             let fault = {
                 let m = mpu.lock().unwrap();
-                if !m.is_enabled() {
-                    return;
-                }
                 m.check(addr, Access::Fetch, cpu_privileged(uc)).err()
             };
             if let Some(f) = fault {

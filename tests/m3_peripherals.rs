@@ -102,7 +102,7 @@ fn m3_t1_peripherals_end_to_end() {
 
     // 6) 虚拟时钟已推进
     assert!(
-        m.clock.lock().unwrap().cycles > 0,
+        m.clock.count() > 0,
         "block hook 应推进虚拟时钟"
     );
 }

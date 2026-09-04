@@ -10,6 +10,9 @@
 //! - MPU_TYPE 0xD90 / CTRL 0xD94 / RNR 0xD98 / RBAR 0xD9C / RASR 0xDA0
 //! - 别名 0xDA4-0xDB8（region 1-3 的 RBAR/RASR 快速访问）
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use crate::peripheral::BusError;
 
 /// 8 个 region
@@ -81,6 +84,9 @@ pub struct Mpu {
     regions: [Region; MPU_REGION_COUNT],
     mmfsr: u32,
     mmfar: u32,
+    /// MPU 使能原子快速判定（CTRL.ENABLE 变化时同步）：Machine mem/code hook 据此
+    /// 在未使能时跳过加锁的 check（纯计算负载下 MPU 未使能，省去每指令/每内存访问加锁）
+    enabled: Arc<AtomicBool>,
 }
 
 impl Default for Mpu {
@@ -91,13 +97,24 @@ impl Default for Mpu {
 
 impl Mpu {
     pub fn new() -> Self {
+        Self::with_enabled(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// 正式构造：`enabled` 由 Machine 持有（与 mpu 字段并行），CTRL.ENABLE 变化时同步
+    pub fn with_enabled(enabled: Arc<AtomicBool>) -> Self {
         Self {
             ctrl: 0,
             rnr: 0,
             regions: [Region::default(); MPU_REGION_COUNT],
             mmfsr: 0,
             mmfar: 0,
+            enabled,
         }
+    }
+
+    /// MPU 使能原子标记（无锁快速判定，供 mem/code hook 跳过加锁检查）
+    pub fn enabled(&self) -> &Arc<AtomicBool> {
+        &self.enabled
     }
 
     /// MPU 是否使能（CTRL.ENABLE=1）
@@ -243,6 +260,7 @@ impl Mpu {
             MPU_CTRL_OFF => {
                 // ENABLE(0) / HFNMIENA(1) / PRIVDEFENA(2)；HFNMIENA 首版仅存储
                 self.ctrl = value & 0x7;
+                self.enabled.store(self.ctrl & 1 != 0, Ordering::Relaxed);
                 Ok(())
             }
             MPU_RNR_OFF => {
