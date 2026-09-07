@@ -47,10 +47,16 @@ pub const SHPR_END: u32 = 0xD24;
 pub enum StopReason {
     /// 无停机请求（emu_start 因达到指令数上限而返回）
     None,
-    /// block hook 请求切换到该中断号
+    /// block hook 请求切换到该向量号（系统异常 14/15 或外部中断 16+）
     Switch(u32),
     /// intr hook 检测到 EXC_RETURN，现场已恢复
     ExceptionReturn,
+    /// intr hook 已补全 SVC 异常入口（现场已压栈、PC 已指向 SVC handler）——
+    /// run() 继续执行即可（rtos_start → svc 0 启动首个任务依赖此延续）。
+    SvcEntry,
+    /// block hook 检到 MPU 已使能但数据访问 hook 未安装：run() 懒安装 hook + 刷 TB
+    /// 后继续（避免启动早期 hook helper 翻译触发 Unicorn 首指令副作用丢失缺陷）。
+    MpuEnable,
 }
 
 /// NVIC 寄存器组
@@ -116,6 +122,8 @@ pub struct Nvic {
     enable: [u32; 3],
     /// 挂起位
     pending: [u32; 3],
+    /// 系统异常挂起位（位 = 向量号，仅可配置的 PendSV=14/SysTick=15 有效）
+    sys_pending: u32,
     /// 活跃位（当前正在服务）
     active: [u32; 3],
     /// 外部中断优先级（低 4 位有效，数值小 = 优先级高）
@@ -151,6 +159,7 @@ impl Nvic {
         Self {
             enable: [0; 3],
             pending: [0; 3],
+            sys_pending: 0,
             active: [0; 3],
             priority: [0; NVIC_IRQ_COUNT],
             sys_pri: [0; 12],
@@ -189,6 +198,22 @@ impl Nvic {
         self.sync_pending_any();
     }
 
+    /// 系统异常挂起（vector 14=PendSV / 15=SysTick）。挂起位为电平：
+    /// 溢出/软件置位多次仅保持置位，进入异常时由 enter_exception 清除。
+    pub fn set_sys_pending(&mut self, vector: u32) {
+        self.sys_pending |= 1 << vector;
+        self.pending_any.set(BIT_NVIC_PENDING);
+    }
+
+    pub fn clear_sys_pending(&mut self, vector: u32) {
+        self.sys_pending &= !(1 << vector);
+        self.sync_pending_any();
+    }
+
+    pub fn is_sys_pending(&self, vector: u32) -> bool {
+        self.sys_pending & (1 << vector) != 0
+    }
+
     /// 是否有任一挂起中断（无锁快速判定，供 block hook 跳过加锁检查）
     pub fn pending_any(&self) -> bool {
         self.pending_any.has(BIT_NVIC_PENDING)
@@ -196,7 +221,7 @@ impl Nvic {
 
     /// 根据挂起位图重算 BIT_NVIC_PENDING（clear_pending / ICPR 清除后调用）
     fn sync_pending_any(&self) {
-        let any = self.pending.iter().any(|&w| w != 0);
+        let any = self.pending.iter().any(|&w| w != 0) || self.sys_pending != 0;
         if any {
             self.pending_any.set(BIT_NVIC_PENDING);
         } else {
@@ -288,6 +313,59 @@ impl Nvic {
             }
         }
         best.map(|(irq, _)| irq)
+    }
+
+    /// 选择应抢占的挂起中断，返回**向量号**（可配置系统异常 14/15 或外部中断 16+）。
+    ///
+    /// 与 [`Nvic::select_pending`]（仅外部中断、返回 IRQ 号）的区别：PendSV/SysTick
+    /// 属系统异常，挂起位不在 NVIC ISPR 位图，优先级取自 SHPR3；两者需与外部中断
+    /// 统一参与抢占仲裁（RTOS 内核节拍/切换依赖此语义）。block hook 调用本方法。
+    pub fn select_pending_vector(&self, primask: bool, basepri: u8) -> Option<u32> {
+        if primask {
+            return None;
+        }
+        let cur = self.current_priority();
+        let mut best: Option<(u32, u8)> = None;
+        // 可配置系统异常（PendSV=14 / SysTick=15）：优先级 = SHPR 低 4 位，无分组
+        for v in [14u32, 15] {
+            if !self.is_sys_pending(v) {
+                continue;
+            }
+            let raw = self.sys_pri[(v - 4) as usize] & 0xF;
+            if basepri != 0 && raw >= basepri {
+                continue;
+            }
+            // 系统异常可被 BASEPRI 屏蔽（jOS 约定内核节拍/切换置于最低优先级）；
+            // 同优先级不抢占当前异常（PendSV 等所有 ISR 退出后运行即依赖此规则）
+            if let Some(c) = cur {
+                if raw as i32 >= c {
+                    continue;
+                }
+            }
+            if best.map_or(true, |(_, b)| raw < b) {
+                best = Some((v, raw));
+            }
+        }
+        // 外部中断（向量号 = 16 + IRQ）
+        for irq in 0..NVIC_IRQ_COUNT as u32 {
+            if !self.is_pending(irq) || !self.is_enabled(irq) {
+                continue;
+            }
+            let raw = self.priority(irq);
+            if basepri != 0 && raw >= basepri {
+                continue;
+            }
+            let pre = self.preempt_priority(raw);
+            if let Some(c) = cur {
+                if pre as i32 >= c {
+                    continue;
+                }
+            }
+            if best.map_or(true, |(_, b)| raw < b) {
+                best = Some((16 + irq, raw));
+            }
+        }
+        best.map(|(v, _)| v)
     }
 
     // ---- 仿真侧：异常栈与停机原因 ----

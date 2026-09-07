@@ -154,6 +154,7 @@ impl UsbOtg {
         let mut regs = [0u32; REG_COUNT];
         regs[(OFF_GCCFG >> 2) as usize] = GCCFG_PWRDWN; // 复位默认掉电
         regs[(OFF_DSTS >> 2) as usize] = DSTS_RESET; // ENUMSPD=FS
+        regs[(OFF_GRSTCTL >> 2) as usize] = GRSTCTL_AHBIDL; // AHB 空闲（无活动突发）
         Self {
             events,
             nvic,

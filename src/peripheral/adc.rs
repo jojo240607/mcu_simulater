@@ -31,6 +31,7 @@ const CR1_EOCIE: u32 = 1 << 5; // EOC 中断使能
 /// CR2 控制位
 const CR2_ADON: u32 = 1 << 0;  // ADC 使能
 const CR2_DMA: u32 = 1 << 8;   // DMA 模式使能
+const CR2_SWSTART: u32 = 1 << 30; // 软件启动常规转换（写 1 启动，硬件自清零）
 
 /// 寄存器偏移
 const OFF_SR: u32 = 0x00;
@@ -170,6 +171,18 @@ impl Peripheral for Adc {
                 let idx = (offset / 4) as usize;
                 self.regs[idx] = value;
                 if offset == OFF_CR1 || offset == OFF_CR2 {
+                    // CR2.SWSTART 写 1：固件软件启动一次常规转换（如 jOS HAL 的
+                    // "丢首次不稳定转换" 与每次 dev_read 单次转换）。
+                    // 真机转换耗时数周期后置 EOC；仿真即时完成：
+                    //   - SWSTART 为硬件自清零位，写入后立即清 0；
+                    //   - ADON 使能时完成一次转换（置 SR.EOC，采样值取最近一次
+                    //     锁存值；无外部注入时为 0/上次值），EOCIE 时挂起 IRQ。
+                    if offset == OFF_CR2 && value & CR2_SWSTART != 0 {
+                        self.regs[2] &= !CR2_SWSTART;
+                        if self.regs[2] & CR2_ADON != 0 {
+                            self.regs[0] |= SR_EOC;
+                        }
+                    }
                     self.set_pending_if_irq();
                 }
                 Ok(())

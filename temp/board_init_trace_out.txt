@@ -1,0 +1,446 @@
+﻿cargo : [1m[92m   Compiling[0m unicorn-engine-sys v2.1.5
+At line:15 char:9359
++ ... | Out-Null; cargo test m_jos_board_init_trace -- --nocapture 2>&1 | T ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([1m[92m   Com...gine-sys v2.1.5:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[1m[92m   Compiling[0m unicorn-engine v2.1.5
+[1m[92m   Compiling[0m mcu_simulater v0.1.0 (D:\project\mcu\oop\mcu_simulater)
+[1m[93mwarning[0m[1m[97m: constant `BDTR_BKE` is never used[0m
+   [1m[96m--> [0msrc\peripheral\timer.rs:122:7
+    [1m[96m|[0m
+[1m[96m122[0m [1m[96m|[0m const BDTR_BKE: u32 = 1 << 12; // 刹车使能
+    [1m[96m|[0m       [1m[93m^^^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m: `mcu_simulater` (lib) generated 1 warning
+[1m[93mwarning[0m[1m[97m: unused import: `crate::peripheral::dma::DmaByteIo`[0m
+   [1m[96m--> [0msrc\peripheral\timer.rs:779:9
+    [1m[96m|[0m
+[1m[96m779[0m [1m[96m|[0m     use crate::peripheral::dma::DmaByteIo;
+    [1m[96m|[0m         [1m[93m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: unused variable: `nvic`[0m
+   [1m[96m--> [0msrc\peripheral\timer.rs:876:21
+    [1m[96m|[0m
+[1m[96m876[0m [1m[96m|[0m         let (mut t, nvic, bus) = tim2();
+    [1m[96m|[0m                     [1m[93m^^^^[0m [1m[93mhelp: if this is intentional, prefix it with an under
+score: `_nvic`[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: unused variable: `uc`[0m
+   [1m[96m--> [0mtests\m_jos_diag.rs:573:40
+    [1m[96m|[0m
+[1m[96m573[0m [1m[96m|[0m             .add_code_hook(1, 0, move |uc, addr, _size| {
+    [1m[96m|[0m                                        [1m[93m^^[0m [1m[93mhelp: if this is intentional, prefix
+ it with an underscore: `_uc`[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: unused import: `std::io::Write`[0m
+  [1m[96m--> [0mtests\m_jos_acceptance.rs:54:9
+   [1m[96m|[0m
+[1m[96m54[0m [1m[96m|[0m     use std::io::Write;
+   [1m[96m|[0m         [1m[93m^^^^^^^^^^^^^^[0m
+   [1m[96m|[0m
+   [1m[96m= [0m[1m[97mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: constant `ADDR_DMA_REMAINING` is never used[0m
+   [1m[96m--> [0mtests\m_jos_acceptance.rs:293:11
+    [1m[96m|[0m
+[1m[96m293[0m [1m[96m|[0m     const ADDR_DMA_REMAINING: u64 = 0x0800_8F88;
+    [1m[96m|[0m           [1m[93m^^^^^^^^^^^^^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: constant `ADDR_DMA_HAL_REMAINING` is never used[0m
+   [1m[96m--> [0mtests\m_jos_acceptance.rs:294:11
+    [1m[96m|[0m
+[1m[96m294[0m [1m[96m|[0m     const ADDR_DMA_HAL_REMAINING: u64 = 0x0800_C874;
+    [1m[96m|[0m           [1m[93m^^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: calls to `std::mem::drop` with a value that implements `Copy` does nothing[0m
+  [1m[96m--> [0mtests\m_unicorn_bn_bug.rs:98:9
+   [1m[96m|[0m
+[1m[96m98[0m [1m[96m|[0m         drop(pre_hook.0);
+   [1m[96m|[0m         [1m[93m^^^^^[0m[1m[96m----------[0m[1m[93m^[0m
+   [1m[96m|[0m              [1m[96m|[0m
+   [1m[96m|[0m              [1m[96margument has type `UcHookId`[0m
+   [1m[96m|[0m
+   [1m[96m= [0m[1m[97mnote[0m: `#[warn(dropping_copy_types)]` on by default
+[1m[96mhelp[0m: use `let _ = ...` to ignore the expression or result
+   [1m[96m|[0m
+[1m[96m98[0m [91m- [0m        [91mdrop([0mpre_hook.0[91m)[0m;
+[1m[96m98[0m [92m+ [0m        [92mlet _ = [0mpre_hook.0;
+   [1m[96m|[0m
+
+[1m[93mwarning[0m: `mcu_simulater` (test "m_unicorn_bn_bug") generated 1 warning
+[1m[93mwarning[0m: `mcu_simulater` (lib test) generated 2 warnings (run `cargo fix --lib -p mcu_simulater --tests` t
+o apply 1 suggestion)
+[1m[93mwarning[0m: `mcu_simulater` (test "m_jos_acceptance") generated 3 warnings (run `cargo fix --test "m_jos_acce
+ptance" -p mcu_simulater` to apply 1 suggestion)
+[1m[93mwarning[0m: `mcu_simulater` (test "m_jos_diag") generated 1 warning (run `cargo fix --test "m_jos_diag" -p mc
+u_simulater` to apply 1 suggestion)
+[1m[92m    Finished[0m ]8;;https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles\`test` profile
+ [unoptimized + debuginfo]]8;;\ target(s) in 15.29s
+[1m[92m     Running[0m unittests src\lib.rs (target\debug\deps\mcu_simulater-6032dfb09b3d288f.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m unittests src\main.rs (target\debug\deps\mcu_simulater-111b90326bda1bc1.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\bench_mips.rs (target\debug\deps\bench_mips-e017ed54bee5a170.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\bench_probe.rs (target\debug\deps\bench_probe-eb221242841c135c.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\bench_tb.rs (target\debug\deps\bench_tb-e65011ab3c9207d3.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m0_acceptance.rs (target\debug\deps\m0_acceptance-491d7da6468e47ec.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m10_pwr.rs (target\debug\deps\m10_pwr-9d41e3bc615d75a8.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m11_rtc.rs (target\debug\deps\m11_rtc-b8207635084dd065.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m12_dcmi.rs (target\debug\deps\m12_dcmi-f10be72871b69ffd.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m13_fsmc.rs (target\debug\deps\m13_fsmc-d5e7dd5c914e03db.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m14_sdio.rs (target\debug\deps\m14_sdio-69bc3d96f2f2811f.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m15_can.rs (target\debug\deps\m15_can-d6c153a9586942a4.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m16_usb.rs (target\debug\deps\m16_usb-55ed12f24b9681dd.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m17_gpio_fghi.rs (target\debug\deps\m17_gpio_fghi-de89f1896b1e71d5.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m18_malloc.rs (target\debug\deps\m18_malloc-915899e93676bc4e.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m1_mmio.rs (target\debug\deps\m1_mmio-063e8ce2f31c9fb9.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m2_irq.rs (target\debug\deps\m2_irq-f45989fa6b207b32.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m2_mpu.rs (target\debug\deps\m2_mpu-f04bc37145e054c6.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m3_peripherals.rs (target\debug\deps\m3_peripherals-fc72d96eca0f19c5.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m4_dma.rs (target\debug\deps\m4_dma-fe496809f90de747.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m4_dma2.rs (target\debug\deps\m4_dma2-a9c12dd4812db94e.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m4_exti.rs (target\debug\deps\m4_exti-b1654be1b8564d87.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m4_mpu.rs (target\debug\deps\m4_mpu-4c63eb356b58aec8.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m4_rcc.rs (target\debug\deps\m4_rcc-1b67e3795e5543d6.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m4_wdog.rs (target\debug\deps\m4_wdog-c7adc20d6ec265aa.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m5_adc.rs (target\debug\deps\m5_adc-c4ec1790693c2234.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m5_i2c_dma.rs (target\debug\deps\m5_i2c_dma-a1aa59002550726e.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m5_i2c_irq.rs (target\debug\deps\m5_i2c_irq-dcac12d7db0037de.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m5_spi_dma.rs (target\debug\deps\m5_spi_dma-92e4ee6b0ba05567.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m5_spi_irq.rs (target\debug\deps\m5_spi_irq-70dcb6c81c64151e.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m5_terminal.rs (target\debug\deps\m5_terminal-a1a7fe62b81557bc.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m5_tim_dma.rs (target\debug\deps\m5_tim_dma-c77300cf369dbbda.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m5_uart.rs (target\debug\deps\m5_uart-6402e81aa5720724.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m5_usart_dma.rs (target\debug\deps\m5_usart_dma-c624f1a9b332b5e7.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m6_tim9_14.rs (target\debug\deps\m6_tim9_14-344d833cfe9af0f4.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m6_tim_advanced.rs (target\debug\deps\m6_tim_advanced-719b6c1711809f0f.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m7_dac.rs (target\debug\deps\m7_dac-c45dc44864f0535c.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m8_crc.rs (target\debug\deps\m8_crc-42671a47b6e1ab2e.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m9_rng.rs (target\debug\deps\m9_rng-4ebe8d012889ac1c.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m_jos_acceptance.rs (target\debug\deps\m_jos_acceptance-72666ad2e9929422.exe)
+
+running 1 test
+[sym] 0x080024CD uart_log_sink
+[sym] 0x080153A0 uart_dev_vtable
+[sym] 0x080153CC uart_stream_vtable
+[sym] 0x0800308D uart_stream_flush
+[sym] 0x08003091 uart_stream_read_frame
+[sym] 0x08003099 uart_getc
+[sym] 0x080030D5 uart_free_engine
+[sym] 0x08003121 uart_stream_submit
+[sym] 0x0800325D uart_stream_read
+[sym] 0x08003389 uart_dev_read
+[sym] 0x0800338D uart_dev_irq_id
+[sym] 0x08003395 uart_select_rx_engine
+[sym] 0x08003435 uart_setup_engine
+[sym] 0x0800352D uart_dev_close
+[sym] 0x0800358D uart_isr
+[sym] 0x0800373D uart_stream_write
+[sym] 0x0800386D uart_dev_write
+[sym] 0x08003871 uart_stream_write_frame
+[sym] 0x08003879 uart_dev_ioctl
+[sym] 0x0800393D uart_dev_open
+[sym] 0x08003BA9 uart_set_baudrate
+[sym] 0x08009AB5 board_tick_cb
+[sym] 0x2000237C g_board_ticks
+[sym] 0x00000000 uart_hal.c
+[sym] 0x00000000 libc_a-malloc.o
+[sym] 0x00000000 libc_a-mallocr.o
+[sym] 0x0800F7C1 rtos_kobj_register
+[sym] 0x080122FD _malloc_usable_size_r
+[sym] 0x0800A03D uart_hal_disable_idle_irq
+[sym] 0x0800A0E5 uart_hal_get_dr_addr
+[sym] 0x0800A0FD uart_hal_disable_tx_dma
+[sym] 0x0800A009 uart_hal_tx_ready
+[sym] 0x08009F41 uart_hal_deinit
+[sym] 0x08011225 __malloc_unlock
+[sym] 0x0800A0C9 uart_hal_get_baudrate
+[sym] 0x08009FD9 uart_hal_disable_rx_irq
+[sym] 0x0800A02D uart_hal_enable_idle_irq
+[sym] 0x0800A059 uart_hal_clear_idle
+[sym] 0x08009F11 uart_hal_init
+[sym] 0x0800A0D9 uart_hal_get_cr1
+[sym] 0x08009B11 board_ticks
+[sym] 0x08009AC5 board_tick_init
+[sym] 0x080110B5 malloc
+[sym] 0x0800A079 uart_hal_irq_id
+[sym] 0x08009121 irq_register
+[sym] 0x08009FBD uart_hal_read_dr
+[sym] 0x20003390 __lock___malloc_recursive_mutex
+[sym] 0x0800A065 uart_hal_clear_errors
+[sym] 0x08009F69 uart_hal_set_parity
+[sym] 0x0800305D uart_init
+[sym] 0x080153B8 uart_fun
+[sym] 0x08009F89 uart_hal_set_stopbits
+[sym] 0x0800A0D1 uart_hal_get_brr
+[sym] 0x0800A015 uart_hal_rx_pending
+[sym] 0x08009EF9 uart_hal_create
+[sym] 0x08009B1D board_init
+[sym] 0x0800A10D uart_hal_enable_rx_dma
+[sym] 0x08011219 __malloc_lock
+[sym] 0x08009F55 uart_hal_set_baudrate
+[sym] 0x08009FA1 uart_hal_putc
+[sym] 0x08011119 _malloc_r
+[sym] 0x08009181 irq_unregister
+[sym] 0x08003721 uart_destroy
+[sym] 0x0800A071 uart_hal_write_dr
+[sym] 0x08003C39 uart_console_putc
+[sym] 0x0800A0E1 uart_hal_set_inverted
+[sym] 0x08003BB5 uart_create
+[sym] 0x08003089 uart_deinit
+[sym] 0x08009FC9 uart_hal_enable_rx_irq
+[sym] 0x08009FF9 uart_hal_disable_tx_irq
+[sym] 0x0800A021 uart_hal_ore_pending
+[sym] 0x20003248 __malloc_sbrk_start
+[sym] 0x0800A11D uart_hal_disable_rx_dma
+[sym] 0x0800A0ED uart_hal_enable_tx_dma
+[sym] 0x2000324C __malloc_free_list
+[sym] 0x0800A04D uart_hal_idle_pending
+[sym] 0x08009939 device_manager_register
+[sym] 0x0800F831 rtos_kobj_deregister
+[sym] 0x08009F0D uart_hal_destroy
+[sym] 0x20002328 g_debug_uart_hal
+[sym] 0x08009FE9 uart_hal_enable_tx_irq
+[symbols] board_init=0x08009B1C uart_create=0x08003BB4 uart_hal_create=0x08009EF8 register=0x08009938 malloc=0x080110B4
+ _malloc_r=0x08011118
+[trace] board_init entry
+[trace] register name="pinmux" dev=0x20000228
+[trace] malloc entry size=0x1C
+[trace] register name="clk" dev=0x200006C8
+[trace] uart_create entry r0(config)=0x08015DFC lr=0x08009B2B
+[trace] uart_create code: B538 2101 4605 2048 F00D FA5E 2800 D02D 4604 E9D5 0101 F006 F995 4603 6220 B310
+[trace] uart_create RETURNS r0=0x00000000 (caller_lr=0x08009B2A)
+[trace] uart_create entry r0(config)=0x08015DE0 lr=0x08009B2B
+[trace] uart_create code: B538 2101 4605 2048 F00D FA5E 2800 D02D 4604 E9D5 0101 F006 F995 4603 6220 B310
+[trace] uart_create RETURNS r0=0x00000000 (caller_lr=0x08009B2A)
+[trace] uart_create entry r0(config)=0x08015DC4 lr=0x08009B2B
+[trace] uart_create code: B538 2101 4605 2048 F00D FA5E 2800 D02D 4604 E9D5 0101 F006 F995 4603 6220 B310
+[trace] uart_create RETURNS r0=0x00000000 (caller_lr=0x08009B2A)
+[trace] uart_create entry r0(config)=0x08015DA8 lr=0x08009B2B
+[trace] uart_create code: B538 2101 4605 2048 F00D FA5E 2800 D02D 4604 E9D5 0101 F006 F995 4603 6220 B310
+[trace] uart_create RETURNS r0=0x00000000 (caller_lr=0x08009B2A)
+[trace] malloc entry size=0x50
+[trace] malloc entry size=0x24
+[trace] malloc entry size=0x20
+[trace] board_init 后 PC=0x08000238
+test m_jos_board_init_trace ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.14s
+
+[1m[92m     Running[0m tests\m_jos_diag.rs (target\debug\deps\m_jos_diag-cafe9d8db7530b08.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests\m_unicorn_bn_bug.rs (target\debug\deps\m_unicorn_bn_bug-da930c8d29889309.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+

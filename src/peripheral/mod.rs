@@ -10,6 +10,7 @@ pub mod crc;
 pub mod dac;
 pub mod dcmi;
 pub mod dma;
+pub mod dwt;
 pub mod exti;
 pub mod fsmc;
 pub mod gpio;

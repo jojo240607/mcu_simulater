@@ -777,6 +777,18 @@ static inline void gen_set_condexec(DisasContext *s)
         TCGv_i32 tmp = tcg_temp_new_i32(tcg_ctx);
         tcg_gen_movi_i32(tcg_ctx, tmp, val);
         store_cpu_field(tcg_ctx, tmp, condexec_bits);
+    } else {
+        /* Unicorn fix: also clear env->condexec_bits when the IT block ends
+         * (mask becomes 0). The original code only wrote env back while
+         * mask != 0; if a TB finished mid-IT (mask != 0) it stored a stale
+         * IT state (e.g. 0x23) into env, and later TBs with mask == 0 never
+         * cleared it. That leaked IT state into following thread-mode code,
+         * so a legal conditional branch right after an IT block (jOS
+         * rtos_msleep 0xED4A bmi) was mis-decoded as unallocated and raised
+         * UC_ERR_INSN_INVALID. */
+        TCGv_i32 tmp = tcg_temp_new_i32(tcg_ctx);
+        tcg_gen_movi_i32(tcg_ctx, tmp, 0);
+        store_cpu_field(tcg_ctx, tmp, condexec_bits);
     }
 }
 
@@ -10540,7 +10552,13 @@ static bool trans_LDM_t16(DisasContext *s, arg_ldst_block *a)
 
 static bool trans_B(DisasContext *s, arg_i *a)
 {
-    gen_jmp(s, read_pc(s) + a->imm);
+    /* Unicorn fix: avoid gen_goto_tb (direct TB linking) which has a bug
+     * in Unicorn 2.1.5's TB jump cache patching (tb_add_jump/tb_set_jmp_target).
+     * Use gen_set_pc_im + DISAS_JUMP to force a full TB lookup via gen_goto_ptr
+     * each time, bypassing the broken direct jump mechanism.
+     * This matches QEMU's behavior when use_goto_tb() returns false. */
+    gen_set_pc_im(s, read_pc(s) + a->imm);
+    s->base.is_jmp = DISAS_JUMP;
     return true;
 }
 
@@ -10555,7 +10573,9 @@ static bool trans_B_cond_thumb(DisasContext *s, arg_ci *a)
         return true;
     }
     arm_skip_unless(s, a->cond);
-    gen_jmp(s, read_pc(s) + a->imm);
+    /* Unicorn fix: same as trans_B, avoid broken TB direct linking */
+    gen_set_pc_im(s, read_pc(s) + a->imm);
+    s->base.is_jmp = DISAS_JUMP;
     return true;
 }
 

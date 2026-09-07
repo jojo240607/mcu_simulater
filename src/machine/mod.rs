@@ -9,7 +9,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use object::{Object, ObjectSection, SectionKind};
+use object::read::elf::{ElfFile, FileHeader, ProgramHeader};
+use object::read::ReadRef;
+use object::{elf, Object, ObjectSection, ObjectSegment, SectionFlags, SectionKind};
 use unicorn_engine::{HookType, MemType, Prot, RegisterARM, Unicorn};
 
 use crate::bus::Bus;
@@ -21,6 +23,7 @@ use crate::peripheral::dac::Dac;
 use crate::peripheral::console::Console;
 use crate::peripheral::crc::Crc;
 use crate::peripheral::dcmi::{Dcmi, DCMI_IRQ};
+use crate::peripheral::dwt::Dwt;
 use crate::peripheral::terminal::Terminal;
 use crate::peripheral::dma::{Dma, DmaDir, DMA1_BASE, DMA1_STREAM_IRQ, DMA2_BASE, DMA2_STREAM_IRQ};
 use crate::peripheral::usb_otg::{UsbOtg, USB_OTG_FS_BASE};
@@ -47,9 +50,6 @@ use crate::peripheral::wdog::{Iwdg, ResetReason, WdogResetReq, Wwdg};
 use crate::peripheral::{Peripheral};
 use crate::sim::status::{Status, BIT_ANY_ACTIVE, BIT_MPU, BIT_NVIC_PENDING, BIT_WDOG};
 use crate::sim::timing::VirtualClock;
-
-/// 块级加权周期的平均周期/指令（见 [`crate::sim::timing::BlockWeighted`]）
-const AVG_CYCLES_PER_INS: u64 = 3;
 
 /// block hook 冷路径状态（MPU/NVIC/外设 tick 列表），捆进单个 Arc 以缩小闭包捕获体
 ///（bench_probe：H13d 6 字段捕获 97.7 → H13e 3 字段 121+ MIPS，闭包捕获字段数即热路径成本）。
@@ -126,12 +126,18 @@ pub struct Machine {
     rtc_active: Arc<AtomicBool>,
     /// 看门狗复位请求（IWDG/WWDG/PWR 待机唤醒置位，block hook 经 BIT_WDOG 停机，run() 执行系统复位）
     pub wdog_req: Arc<WdogResetReq>,
+    /// 数据访问 MEM hook 是否已安装（MPU 使能后才懒安装；见 [`Machine::install_data_access_hook`]）
+    data_hook_installed: Arc<AtomicBool>,
     /// 初始 SP（向量表首字）
     pub initial_sp: u32,
     /// 复位向量（向量表第二字，含 Thumb 位处理见 [`Machine::reset`]）
     pub entry: u32,
     /// run() 外层循环迭代次数（探测 emu_start 是否频繁提前返回，纯调试用）
     run_iterations: std::cell::Cell<u64>,
+    /// 异常入场计数（按向量号，诊中断暴风/唤醒停滞用；Switch 停机每进一次加 1）
+    vec_entries: std::cell::RefCell<Vec<u64>>,
+    /// 最近一次异常抢占前的 PC（= 被中断块的 PC，诊在何处不停被抢）
+    last_switch_pc: std::cell::Cell<u32>,
 }
 
 impl Machine {
@@ -212,9 +218,12 @@ impl Machine {
             wwdg_active,
             rtc_active,
             wdog_req,
+            data_hook_installed: Arc::new(AtomicBool::new(false)),
             initial_sp: 0,
             entry: 0,
             run_iterations: std::cell::Cell::new(0),
+            vec_entries: std::cell::RefCell::new(vec![0u64; 97]),
+            last_switch_pc: std::cell::Cell::new(0),
         })
     }
 
@@ -224,10 +233,14 @@ impl Machine {
         self.cpu.mem_map(0x0800_0000, 0x0008_0000, Prot::ALL)?; // FLASH 512KB
         self.cpu.mem_map(0x2000_0000, 0x0002_0000, Prot::ALL)?; // SRAM1+SRAM2 128KB
         self.cpu.mem_map(0x1000_0000, 0x0001_0000, Prot::ALL)?; // CCM SRAM 64KB
+        self.cpu.mem_map(0x1FFF_0000, 0x0001_0000, Prot::ALL)?; // 系统存储区（电子签名/flash大小等）
         // 系统控制空间（SCB/NVIC/SysTick/MPU，含 CPACR@0xE000ED88）。
         // 仍映射为普通内存避免读写异常，同时由 mem hook 转发到总线上的 SCB 外设。
         self.cpu.mem_map(0xE000_E000, 0x0000_1000, Prot::ALL)?;
         self.attach_system_control()?;
+        // DWT 调试部件（0xE0001000，CYCCNT 周期计数）：jOS 用其测调度延迟。
+        self.cpu.mem_map(0xE000_1000, 0x0000_1000, Prot::ALL)?;
+        self.attach_dwt()?;
         // M3 T1 外设集：GPIOA-I + USART1-3 + TIM2 + RCC 存根
         self.attach_t1_peripherals()?;
         // 中断投递 hook 最后注册：此时 timers/tick_actives 已挂载完毕，
@@ -261,11 +274,19 @@ impl Machine {
         let bus = self.bus.clone();
         bus.lock()
             .unwrap()
-            .attach(SCB_BASE as u32, SCB_SIZE, "SCB", scb)?;
+            .attach(SCB_BASE as u32, SCB_SIZE, "SCB", scb.clone())?;
+        // SysTick 定时器随虚拟时钟推进：加入周期外设列表（block hook 按 active 标记
+        // 跳过未激活外设；SysTick 活动标记由 CTRL.ENABLE 置位）
+        self.timers.lock().unwrap().push(scb.clone());
+        self.tick_actives
+            .lock()
+            .unwrap()
+            .push(scb.lock().unwrap().active.clone());
 
         // 1) MMIO 入口：先 MPU 检查，再转发总线
         let bus2 = bus.clone();
         let mpu_mmio = self.mpu.clone();
+        let status_scb = self.status.clone();
         self.cpu.add_mmio_hook(
             SCB_BASE,
             SCB_BASE + SCB_SIZE as u64,
@@ -289,6 +310,12 @@ impl Machine {
                     MemType::WRITE => {
                         let _ =
                             bus2.lock().unwrap().write(addr as u32, size as u32, value as u32);
+                        // SysTick ENABLE(0xE000E010 bit0) 置位 → 置 BIT_ANY_ACTIVE，
+                        // 使 block hook 的 tick 循环推进 SysTick（此前仅外设区写会置位，
+                        // SysTick 从不计数）。
+                        if addr == 0xE000_E010 && value as u32 & 1 != 0 {
+                            status_scb.set(BIT_ANY_ACTIVE);
+                        }
                     }
                     _ => {}
                 }
@@ -296,8 +323,10 @@ impl Machine {
             },
         )?;
 
-        // 2) RAM/Flash/CCM 数据访问入口（MPU 全强制）
-        self.attach_data_access_hook()?;
+        // 2) RAM/Flash/CCM 数据访问入口（MPU 全强制）——懒安装：MPU 使能后才挂载
+        //    （启动早期挂载会让每条内存访问走 hook helper 翻译，触发 Unicorn 2.1.5
+        //    "新译 TB 首条 32 位指令副作用丢失"缺陷，见 [`Machine::install_data_access_hook`]）。
+        //    由 block hook 检到 BIT_MPU 置位且未安装时经 run() 安装。
 
         // 3) 取指 XN 检查——并入 block hook（attach_interrupt_delivery，块级判定），
         //    不再注册每指令 code hook：每指令 FFI 会强制单指令翻译块，
@@ -307,6 +336,58 @@ impl Machine {
         //（见 map_stm32f407_layout），此处不再调用。
 
         log::info!("SCB+MPU+NVIC 已挂载：0x{SCB_BASE:08X} +0x{SCB_SIZE:X}");
+        Ok(())
+    }
+
+    /// 挂载 DWT 调试部件（0xE0001000..0xE0002000）。
+    ///
+    /// CYCCNT 周期计数由虚拟时钟驱动（block hook 推进），供固件做调度延迟测量
+    /// （jOS 的 `rtos_cycle_now`）。与 SCB 相同的 MMIO 转发链路：读注入 / 写转发，
+    /// 无 MPU 检查（调试部件不在 MPU 管理的程序/数据区语义内）。
+    pub fn attach_dwt(&mut self) -> Result<()> {
+        const DWT_BASE: u64 = 0xE000_1000;
+        const DWT_SIZE: u32 = 0x1000;
+
+        let dwt = Arc::new(Mutex::new(Dwt::new()));
+        let bus = self.bus.clone();
+        bus.lock()
+            .unwrap()
+            .attach(DWT_BASE as u32, DWT_SIZE, "DWT", dwt.clone())?;
+        // CYCCNT 随虚拟时钟推进：加入周期外设列表（tick 时按 active 标记跳过）
+        self.timers.lock().unwrap().push(dwt.clone());
+        self.tick_actives
+            .lock()
+            .unwrap()
+            .push(dwt.lock().unwrap().active.clone());
+
+        let bus2 = bus.clone();
+        let status_dwt = self.status.clone();
+        self.cpu.add_mmio_hook(
+            DWT_BASE,
+            DWT_BASE + DWT_SIZE as u64,
+            move |uc, ty, addr, size, value| {
+                match ty {
+                    MemType::READ => {
+                        if let Ok(v) = bus2.lock().unwrap().read(addr as u32, size as u32) {
+                            let _ = uc.mem_write(addr, &v.to_le_bytes()[..size]);
+                        }
+                    }
+                    MemType::WRITE => {
+                        let _ =
+                            bus2.lock().unwrap().write(addr as u32, size as u32, value as u32);
+                        // DWT.CTRL(0xE0001000) bit0=CYCCNTENA → 置 BIT_ANY_ACTIVE，
+                        // 使 CYCCNT 随虚拟时钟推进（rtos_cycle_now 调度延迟测量）。
+                        if addr == 0xE000_1000 && value as u32 & 1 != 0 {
+                            status_dwt.set(BIT_ANY_ACTIVE);
+                        }
+                    }
+                    _ => {}
+                }
+                false // 放行：RAM 视图保持与总线一致
+            },
+        )?;
+
+        log::info!("DWT 已挂载：0x{DWT_BASE:08X} +0x{DWT_SIZE:X}");
         Ok(())
     }
 
@@ -1282,10 +1363,22 @@ impl Machine {
             // 冻结活动标记列表：所有外设已挂载，转成 Vec，block hook 快路径免加锁
             tick_actives: self.tick_actives.lock().unwrap().clone(),
         });
+        // 数据 hook 安装标记：MPU 首次使能且未安装时停机一次，交 run() 懒安装
+        let dh_installed = self.data_hook_installed.clone();
         self.cpu.add_block_hook(1, 0, move |uc, _addr, size| {
             // 热路径单次原子 load，按位测试 MPU/外设激活/看门狗/中断挂起四个低频标志
             //（bench_probe：H2 独立原子 37.8 → H12 单状态字 115.1 MIPS）
             let s = status.raw();
+            // MPU 使能但数据 hook 未装：停机由 run() 懒安装（含刷 TB）
+            if s & BIT_MPU != 0 && !dh_installed.load(Ordering::Relaxed) {
+                cold
+                    .nvic
+                    .lock()
+                    .unwrap()
+                    .set_stop_reason(StopReason::MpuEnable);
+                let _ = uc.emu_stop();
+                return;
+            }
             // 取指 XN 检查（块级）：MPU 未使能时无锁跳过。
             // 块执行前触发，块内指令同属一个区域，等效原每指令检查。
             if s & BIT_MPU != 0 {
@@ -1299,8 +1392,11 @@ impl Machine {
                     return;
                 }
             }
-            // 块级加权周期推进虚拟时钟，并 tick 活动外设（TIM/DMA/DAC/RTC/IWDG/WWDG）。
-            let cycles = size as u64 * AVG_CYCLES_PER_INS;
+            // 块级推进虚拟时钟，并 tick 活动外设（TIM/DMA/DAC/RTC/IWDG/WWDG）。
+            // 对齐 QEMU icount 口径：每个 TB 按「访客字节 = 虚拟周期」折算，使 SysTick
+            // reload(168000 周期) 大致对应 ~6 万条退休指令（真机 1ms 同量级）。原 ×AVG=3
+            // 使 SysTick 密 ~3.1 倍（校准见 x_sys_retire_calib: 每 SysTick≈1.98e4 退休）。
+            let cycles = size as u64;
             clock.advance(cycles);
             // 快路径：BIT_ANY_ACTIVE 由外设区 MMIO 写置位（外设激活只可能发生在 MMIO 写，
             // 见 attach_peripherals 的 TICK_REGIONS 判定），block hook 免去每块全扫
@@ -1318,37 +1414,99 @@ impl Machine {
                 let _ = uc.emu_stop();
                 return;
             }
-            // 挂起中断抢占检查（快路径：无挂起中断时跳过加锁的 select_pending）
+            // 挂起中断抢占检查（快路径：无挂起中断时跳过加锁的 select_pending_vector）
             if s & BIT_NVIC_PENDING != 0 {
                 let primask = uc.reg_read(RegisterARM::PRIMASK).unwrap_or(0) != 0;
                 let basepri = (uc.reg_read(RegisterARM::BASEPRI).unwrap_or(0) & 0xF) as u8;
                 let mut n = cold.nvic.lock().unwrap();
-                if let Some(irq) = n.select_pending(primask, basepri) {
-                    n.set_stop_reason(StopReason::Switch(irq));
+                if let Some(vector) = n.select_pending_vector(primask, basepri) {
+                    n.set_stop_reason(StopReason::Switch(vector));
                     let _ = uc.emu_stop();
                 }
             }
         })?;
 
-        // 2) intr hook：EXC_RETURN 异常返回（Unicorn 的 do_v7m_exception_exit 被置空，
-        //    现场恢复完全由本回调完成：弹出异常栈、按 EXC_RETURN 选栈出栈、恢复寄存器）
+        // 2) intr hook：EXC_RETURN 异常返回（intno=8）与 SVC 异常入口（intno=2）。
+        //    - Unicorn 的 do_v7m_exception_exit / v7m_exception_taken 均被置空：
+        //      * 异常返回：现场恢复完全由本回调完成（弹出异常栈、按 EXC_RETURN 选栈出栈）；
+        //      * SVC 入口：arm_v7m_cpu_do_interrupt 已调 v7m_push_stack 把 8 字异常帧压栈，
+        //        但"进入 handler"（LR/IPSR/PC）被空置，故此处补全入口设置。
         let nvic2 = self.nvic.clone();
         self.cpu.add_intr_hook(move |uc, intno| {
-            if intno != 8 {
-                return; // 仅处理 EXCP_EXCEPTION_EXIT
+            if intno == 8 {
+                let exc_return = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                if let Err(e) = exception_return(uc, &nvic2, exc_return) {
+                    log::error!("异常返回失败：{e:?}");
+                }
+                nvic2
+                    .lock()
+                    .unwrap()
+                    .set_stop_reason(StopReason::ExceptionReturn);
+                let _ = uc.emu_stop();
+            } else if intno == 2 {
+                // EXCP_SWI（SVC 指令）：Unicorn 通过 intr hook 完全接管异常处理，
+                // QEMU 原生 v7m_push_stack / v7m_exception_taken 均被绕过，
+                // 故此处需完整补全 Cortex-M 异常入口：压 8 字异常帧 + 设置 LR/IPSR/PC。
+                let in_handler = nvic2.lock().unwrap().in_handler();
+                let control = uc.reg_read(RegisterARM::CONTROL).unwrap_or(0) as u32;
+                let exc_return: u32 = if in_handler {
+                    0xFFFF_FFF1 // 从 handler 进入，恒 MSP
+                } else if control & 2 != 0 {
+                    0xFFFF_FFFD // 线程模式 + PSP
+                } else {
+                    0xFFFF_FFF9 // 线程模式 + MSP
+                };
+                // 选栈：与 enter_exception/exception_return 一致，显式读写 MSP/PSP
+                let sp = if in_handler || exc_return == 0xFFFF_FFF9 {
+                    uc.reg_read(RegisterARM::MSP).unwrap_or(0) as u32
+                } else {
+                    uc.reg_read(RegisterARM::PSP).unwrap_or(0) as u32
+                };
+                // 采集被中断现场（SVC 后 PC 已指向下一条指令，Unicorn 保证）
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let r12 = uc.reg_read(RegisterARM::R12).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                let pc_saved = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let xpsr = uc.reg_read(RegisterARM::XPSR).unwrap_or(0) as u32 & 0xFF00_0000;
+                // 压 8 字帧（低地址→高地址：r0 r1 r2 r3 r12 LR PC xPSR），SP -= 32
+                let sp = sp - 32;
+                let mut frame = [0u8; 32];
+                for (i, v) in [r0, r1, r2, r3, r12, lr, pc_saved, xpsr]
+                    .iter()
+                    .enumerate()
+                {
+                    frame[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                let _ = uc.mem_write(sp as u64, &frame);
+                if in_handler || exc_return == 0xFFFF_FFF9 {
+                    let _ = uc.reg_write(RegisterARM::MSP, sp as u64);
+                } else {
+                    let _ = uc.reg_write(RegisterARM::PSP, sp as u64);
+                }
+                // 进入 handler：LR=EXC_RETURN，IPSR=11，PC=向量表[11]|1
+                let handler = uc
+                    .mem_read_as_vec(0x0800_0000 + 11 * 4, 4)
+                    .ok()
+                    .and_then(|b| b.try_into().ok())
+                    .map(u32::from_le_bytes)
+                    .unwrap_or(0);
+                let _ = uc.reg_write(RegisterARM::LR, exc_return as u64);
+                let _ = uc.reg_write(RegisterARM::IPSR, 11);
+                let _ = uc.reg_write(RegisterARM::PC, (handler | 1) as u64);
+                nvic2.lock().unwrap().push_exception(11);
+                nvic2.lock().unwrap().set_stop_reason(StopReason::SvcEntry);
+                log::info!(
+                    "SVC 进入：vector=11 handler=0x{handler:08X} EXC_RETURN=0x{exc_return:08X} sp=0x{sp:08X}"
+                );
+                let _ = uc.emu_stop();
             }
-            let exc_return = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-            if let Err(e) = exception_return(uc, &nvic2, exc_return) {
-                log::error!("异常返回失败：{e:?}");
-            }
-            nvic2
-                .lock()
-                .unwrap()
-                .set_stop_reason(StopReason::ExceptionReturn);
-            let _ = uc.emu_stop();
         })?;
 
-        log::info!("中断投递 hook 已挂载（block 抢占检查 + EXC_RETURN 拦截）");
+        log::info!("中断投递 hook 已挂载（block 抢占检查 + SVC 入口 + EXC_RETURN 拦截）");
+
         Ok(())
     }
 
@@ -1357,7 +1515,16 @@ impl Machine {
     /// 区间覆盖 FLASH(0x08000000)/CCM(0x10000000)/SRAM(0x20000000)，
     /// 不含 SCB（0xE0000000+，由 MMIO hook 单独处理）。
     /// 快速路径：MPU 未使能时直接放行，保持 RAM 无 hook 的原有行为（仅一次判读）。
-    fn attach_data_access_hook(&mut self) -> Result<()> {
+    ///
+    /// **懒安装**：MPU 关闭期（固件启动早期）不挂载本 hook——该阶段挂载会使每条
+    /// 内存访问经 hook helper 调用翻译（Unicorn 2.1.5 存在"带 hook 的新译 TB 首条
+    /// 32 位指令副作用丢失"缺陷，board_tick_init 的 ldmia.w 曾因此空转）。MPU 使能
+    /// （block hook 见 BIT_MPU 且未安装）时经 [`Machine::run`] 的 StopReason::MpuEnable
+    /// 安装并刷 TB，使此后（含已缓存 TB 重译）的内存访问都被 MPU 检查覆盖。
+    fn install_data_access_hook(&mut self) -> Result<()> {
+        if self.data_hook_installed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         const DATA_BEGIN: u64 = 0x0800_0000;
         const DATA_END: u64 = 0x2002_0000; // 覆盖 FLASH/CCM/SRAM，止于 SRAM 末端
 
@@ -1388,7 +1555,10 @@ impl Machine {
                 false
             },
         )?;
-        log::info!("RAM/Flash/CCM 数据访问 hook 已挂载（MPU 全强制）");
+        self.data_hook_installed.store(true, Ordering::Relaxed);
+        // 刷 TB：已按"无 hook"翻译的缓存 TB 需重译，使内存访问纳入 MPU 检查
+        let _ = self.cpu.raw().ctl_flush_tb();
+        log::info!("RAM/Flash/CCM 数据访问 hook 已挂载（MPU 使能懒安装，TB 已刷新）");
         Ok(())
     }
 
@@ -1407,6 +1577,10 @@ impl Machine {
     /// - 异常返回（EXC_RETURN，intr hook 停机）→ 现场已恢复，继续；
     /// - 看门狗复位请求（block hook 停机）→ 记录 RCC_CSR 复位标志 + 系统复位，继续。
     /// `count` 以线程模式指令计：每次 emu_start 命中 `remaining` 即结束。
+    ///
+    /// 风暴护栏：若某外设/中断使 emu_start 频繁提前返回（单次调用迭代段数超上限、
+    /// 仍未消耗完 count），记录诊断并提前返回 Ok，避免挂起中断风暴下无限自旋
+    ///（由调用方继续分步推进）。
     /// 是否有外设处于活动状态（探测/调试用）。
     pub fn peripheral_any_active(&self) -> bool {
         self.status.has(BIT_ANY_ACTIVE)
@@ -1432,16 +1606,55 @@ impl Machine {
         self.status.has(BIT_MPU)
     }
 
+    /// 数据访问 hook 是否已安装（MPU 使能懒安装；探测/调试用）。
+    pub fn data_hook_active(&self) -> bool {
+        self.data_hook_installed.load(Ordering::Relaxed)
+    }
+
     /// run() 外层循环迭代次数（探测 emu_start 是否频繁提前返回）。
     pub fn run_iterations(&self) -> u64 {
         self.run_iterations.get()
     }
 
+    /// 异常入场计数快照（按向量号 0..=96；诊中断暴风归因用）。
+    pub fn vec_entries(&self) -> Vec<(u32, u64)> {
+        self.vec_entries
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(v, n)| (v as u32, *n))
+            .collect()
+    }
+
+    /// 最近一次异常抢占前的 PC（被中断的块地址）。
+    pub fn last_switch_pc(&self) -> u32 {
+        self.last_switch_pc.get()
+    }
+
     pub fn run(&mut self, count: usize) -> Result<()> {
+        // 风暴护栏：正常时 count 预算在单次 emu_start 内耗尽即返回；但若某外设/中断
+        // 持续可抢占，emu_start 每段都提前返回而 remaining 不递减，本循环会无限自旋
+        //（jOS 调度器启动后即可能触发）。达上限时记诊断并提前返回（调用方继续分步）。
+        const MAX_ITERS_PER_CALL: u64 = 1_000_000;
+        let base_iters = self.run_iterations.get();
         let remaining = count;
         while remaining > 0 {
-            self.run_iterations
-                .set(self.run_iterations.get() + 1);
+            let iters = self.run_iterations.get();
+            if iters - base_iters >= MAX_ITERS_PER_CALL {
+                let pc = self.cpu.reg_read_u32(RegisterARM::PC)?;
+                let exc = self
+                    .nvic
+                    .lock()
+                    .unwrap()
+                    .current_exception();
+                log::warn!(
+                    "run() 风暴护栏触发：单调用 {MAX_ITERS_PER_CALL} 段未耗尽 count={count}，\
+                     提前返回 pc=0x{pc:08X} exc={exc}"
+                );
+                break;
+            }
+            self.run_iterations.set(iters + 1);
             let pc = self.cpu.reg_read_u32(RegisterARM::PC)?;
             self.cpu.emu_start(pc as u64, 0, 0, remaining)?;
 
@@ -1465,8 +1678,23 @@ impl Machine {
 
             let reason = self.nvic.lock().unwrap().take_stop_reason();
             match reason {
-                StopReason::Switch(irq) => self.enter_exception(irq)?,
+                StopReason::Switch(vector) => {
+                    // 诊断：记录被抢占点与按向量入场计数（中断暴风/唤醒停滞归因）
+                    if let Ok(pc) = self.cpu.reg_read_u32(RegisterARM::PC) {
+                        self.last_switch_pc.set(pc);
+                    }
+                    self.vec_entries
+                        .borrow_mut()
+                        .get_mut(vector as usize)
+                        .map(|c| *c += 1);
+                    self.enter_exception(vector)?;
+                }
                 StopReason::ExceptionReturn => {}
+                StopReason::SvcEntry => {} // SVC 入口已由 intr hook 补全，继续执行 handler
+                StopReason::MpuEnable => {
+                    // MPU 已使能：懒安装数据访问 hook（含刷 TB），此后内存访问受 MPU 检查
+                    self.install_data_access_hook()?;
+                }
                 StopReason::None => break, // 达到指令数上限
             }
         }
@@ -1499,8 +1727,12 @@ impl Machine {
     /// r0 r1 r2 r3 r12 LR(被中断现场) PC xPSR；SP -= 32。
     /// 栈选择与 EXC_RETURN：handler 模式恒 MSP(0xFFFFFFF1)；
     /// 线程模式按 CONTROL.SPSEL：MSP(0xFFFFFFF9) 或 PSP(0xFFFFFFFD)。
-    fn enter_exception(&mut self, irq: u32) -> Result<()> {
-        let vector = 16 + irq; // 向量号（IRQ0 = vector 16）
+    ///
+    /// `vector` 为向量号：可配置系统异常（PendSV=14 / SysTick=15）或外部中断
+    /// （IRQ0..81 → vector 16..97，由 block hook 的 select_pending_vector 给出）。
+    fn enter_exception(&mut self, vector: u32) -> Result<()> {
+        // 外部中断的 IRQ 号（向量号 >= 16 时；系统异常无对应 IRQ）
+        let irq = vector.checked_sub(16);
 
         let in_handler = self.nvic.lock().unwrap().in_handler();
         let control = self.cpu.reg_read_u32(RegisterARM::CONTROL)?;
@@ -1550,15 +1782,20 @@ impl Machine {
         );
         self.cpu.reg_write(RegisterARM::PC, (handler | 1) as u64)?;
 
-        // NVIC 状态：清挂起、置活跃、压异常栈
+        // NVIC 状态：清挂起（外部中断清 ISPR+置 IABR 活跃；系统异常清 sys_pending）、
+        // 压异常栈（表示该异常活跃，供 EXC_RETURN 返回时弹栈）
         let mut n = self.nvic.lock().unwrap();
-        n.clear_pending(irq);
-        n.set_active(irq);
+        if let Some(irq) = irq {
+            n.clear_pending(irq);
+            n.set_active(irq);
+        } else {
+            n.clear_sys_pending(vector);
+        }
         n.push_exception(vector);
         drop(n);
 
         log::info!(
-            "中断进入：IRQ{irq} → vector={vector} handler=0x{handler:08X} EXC_RETURN=0x{exc_return:08X}"
+            "中断进入：vector={vector} handler=0x{handler:08X} EXC_RETURN=0x{exc_return:08X}"
         );
         Ok(())
     }
@@ -1570,16 +1807,23 @@ impl Machine {
         let file = object::File::parse(&*data).map_err(|e| CoreError::Io(e.to_string()))?;
 
         for section in file.sections() {
-            let kind = section.kind();
-            let is_alloc = matches!(
-                kind,
-                SectionKind::Text
-                    | SectionKind::Data
-                    | SectionKind::ReadOnlyData
-                    | SectionKind::ReadOnlyDataWithRel
-                    | SectionKind::ReadOnlyString
-                    | SectionKind::UninitializedData
-            );
+            // 以 ELF SHF_ALLOC 判断节是否占用目标内存（覆盖 .init_array/.fini_array/
+            // .ARM.exidx 等 kind 分类为 Unknown/Other 但确实需要加载的节）。
+            let is_alloc = match section.flags() {
+                SectionFlags::Elf { sh_flags, .. } => sh_flags.contains(elf::SHF_ALLOC),
+                _ => {
+                    let kind = section.kind();
+                    matches!(
+                        kind,
+                        SectionKind::Text
+                            | SectionKind::Data
+                            | SectionKind::ReadOnlyData
+                            | SectionKind::ReadOnlyDataWithRel
+                            | SectionKind::ReadOnlyString
+                            | SectionKind::UninitializedData
+                    )
+                }
+            };
             if !is_alloc {
                 continue;
             }
@@ -1607,6 +1851,16 @@ impl Machine {
             );
         }
 
+        // 对 p_paddr != p_vaddr 的 PT_LOAD 段，把文件内容额外写入 LMA。
+        // 固件启动代码（Reset_Handler 的 LoopCopyDataInit）以 FLASH 中 LMA
+        // 为源把 .data/.rodata 拷贝到 RAM；若只写 VMA，拷贝源为 0，会覆盖掉
+        // 模拟器预置的正确 .data。
+        match &file {
+            object::File::Elf32(elf) => write_lma_image(&mut self.cpu, elf)?,
+            object::File::Elf64(elf) => write_lma_image(&mut self.cpu, elf)?,
+            _ => {}
+        }
+
         // 从向量表读取初始 SP 与复位向量（Cortex-M 启动约定）
         let sp = u32::from_le_bytes(
             self.cpu.mem_read(0x0800_0000, 4)?.try_into().unwrap(),
@@ -1620,6 +1874,39 @@ impl Machine {
         Ok(())
     }
 
+    /// 加载 App 分区镜像（轨 B 双分区）：把 app.bin 原样写入 APP_FLASH 起点
+    /// 0x08060000（XIP 运行，无需重定位）。
+    ///
+    /// 与 joc-base `app_slot_load_app()` 的契约一致：镜像须以 32B `app_header_t`
+    /// 开头（magic=0x41504800 "APH\0" / abi_version / entry 绝对地址 / app_size /
+    /// reserved[4]）；系统启动后自举读头、校验 magic/abi_version、清零 App RAM、
+    /// 创建 app_host 任务异步调入口。本方法仅负责把镜像放进 Flash 分区。
+    pub fn load_app_partition(&mut self, path: &Path) -> Result<()> {
+        const APP_FLASH_BASE: u64 = 0x0806_0000;
+        const APP_HEADER_MAGIC: u32 = 0x4150_4800;
+
+        let data = std::fs::read(path).map_err(|e| CoreError::Io(e.to_string()))?;
+        if data.len() < 32 {
+            return Err(CoreError::Io(format!(
+                "App 分区镜像过小：{}B（不足 32B 头部）",
+                data.len()
+            )));
+        }
+        let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        if magic != APP_HEADER_MAGIC {
+            return Err(CoreError::Io(format!(
+                "App 分区头部 magic 错误：0x{magic:08X}（期望 0x{APP_HEADER_MAGIC:08X}）"
+            )));
+        }
+        let entry = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        self.cpu.mem_write(APP_FLASH_BASE, &data)?;
+        log::info!(
+            "App 分区镜像已写入 0x{APP_FLASH_BASE:08X}: size={} entry=0x{entry:08X}",
+            data.len()
+        );
+        Ok(())
+    }
+
     /// 复位：设置 SP 与 PC（PC 置 Thumb 位）
     pub fn reset(&mut self) -> Result<()> {
         let sp = self.initial_sp;
@@ -1629,6 +1916,30 @@ impl Machine {
         log::info!("复位：SP=0x{sp:08X}  PC=0x{pc:08X}");
         Ok(())
     }
+}
+
+/// 把 PT_LOAD 段内容额外写入 LMA（p_paddr != p_vaddr 时），供固件启动代码
+/// 从 FLASH 拷贝 .data/.rodata 到 RAM 使用。见 [`Machine::load_elf`]。
+fn write_lma_image<'data, Elf: FileHeader, R: ReadRef<'data>>(
+    cpu: &mut Cpu,
+    elf: &ElfFile<'data, Elf, R>,
+) -> Result<()> {
+    for segment in elf.segments() {
+        let vaddr = segment.address();
+        let data = segment.data().map_err(|e| CoreError::Io(e.to_string()))?;
+        let paddr: u64 = segment
+            .elf_program_header()
+            .p_paddr(segment.elf_file().endian())
+            .into();
+        if paddr != vaddr && !data.is_empty() {
+            log::info!(
+                "ELF LMA 段 0x{paddr:08X} <- vaddr 0x{vaddr:08X}  size={}",
+                data.len()
+            );
+            cpu.mem_write(paddr, data)?;
+        }
+    }
+    Ok(())
 }
 
 /// 将 Unicorn 内存事件映射为 MPU 数据访问类型（取指由 code hook 单独处理）
@@ -1661,15 +1972,15 @@ fn fault_and_stop(uc: &mut Unicorn<()>, mpu: &Arc<Mutex<Mpu>>, f: MemManageFault
 ///
 /// 被中断的 8 字帧布局（低地址→高地址）：
 /// r0 r1 r2 r3 r12 LR(现场) PC(返回地址) xPSR。
-/// 按 EXC_RETURN 解码返回模式与栈：bit1=0 回 handler（MSP），bit1=1 回线程
+/// 按 EXC_RETURN 解码返回模式与栈：bit3=0 回 handler，bit3=1 回线程
 /// （bit2=0 → MSP，bit2=1 → PSP）。
 fn exception_return<'b>(
     uc: &mut Unicorn<'b, ()>,
     nvic: &Arc<Mutex<Nvic>>,
     exc_return: u32,
 ) -> Result<()> {
-    let return_to_thread = exc_return & 0x2 != 0;
-    let use_psp = exc_return & 0x4 != 0;
+    let return_to_thread = (exc_return & 0x8) != 0;
+    let use_psp = (exc_return & 0x4) != 0;
 
     // 出栈帧
     let sp_reg = if use_psp {
