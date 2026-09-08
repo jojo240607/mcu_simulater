@@ -13,7 +13,7 @@ use unicorn_engine::RegisterARM;
 
 use mcu_simulater::machine::Machine;
 
-const JOS_ELF: &str = r"D:\project\mcu\oop\joc-base\build_rel\stm32f407_minimal.elf";
+const JOS_ELF: &str = r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
 
 fn load_jos() -> Machine {
     let elf = Path::new(JOS_ELF);

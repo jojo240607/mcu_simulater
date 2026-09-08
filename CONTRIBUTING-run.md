@@ -44,21 +44,28 @@ cargo test --release --offline --test x_jos_app      # 系统 + joc-app(flyctrl)
    退休指令 **19786 → 52639**（对齐 icount 后，逼近真机 ~60k）。
 3. **SCHED_ASSERT `sched.c:280`（ready_add 双挂）在节拍对齐后消失**（drv 不再出现该行；
    起因即“1# SysTick 过密 → 任务秒睡秒醒 → sleep_head 335 万次重入 → TCB sched 字段自坏”）。
-4. **未收敛（下一目标）**：节拍对了、调度也不再双挂，但 joc-app flyctrl 的周期心跳
-   `hb seq=` **300s 不出现**。空闲时观测 **PendSV ≈ 109× / 每 SysTick**（x_jos_hb: step0
-   pendSV≈493k / sysTick≈4.5k），高上下文切换密度把墙钟吃满，任务即便被 SysTick 唤醒也难跑满
-   250 次控制循环打到 hb。→ 判定：这是第二量纲——**PendSV 在“让出/空闲/从 SysTick 退平”点的
-   高密度自激/非严格一次性**，与我早先“PendSV 未切走”判据被确认为假（pend_stats 曾显示 48.5 万
-   次被正常切走、无掩码）不矛盾：现在反而是“切太多/太密”。
+4. **✅ 已收敛（本次修复）**：周期心跳 `hb seq=` / `alive seq=` 已打通（x_jos_app /
+   x_jos_hb 均绿，demo-app 心跳每虚拟秒一条）。根因与修复（两部分）：
+   - **RTOS 侧（joc-base sched.c rtos_yield）**：idle 任务是 `for(;;) rtos_yield();`
+     忙等；当所有任务睡眠时它是唯一就绪任务，每轮 yield 空切一次 PendSV
+     （rtos_pendsv_switch 的 `if (!nxt) nxt = cur` 切回自身），实测 **~124 次 PendSV/
+     每 SysTick**。修复：yield 时若就绪队列除自己外无更高优先级/同伴候选，跳过置
+     PENDSVSET（空切防护）。真机同样受益（不再白烧 CPU）。
+   - **模拟器侧（machine run()）**：旧实现 `let remaining = count` 恒不递减，每次
+     emu_start 都拿全额预算，只能靠风暴护栏（1M 段）兜底——PendSV 风暴消失后每段
+     很长（到 SysTick 才被抢，~25-52K 指令/段），护栏 1M 段 × 每段 ~40ms = 永不返回。
+     修复：block hook 累计退休字节，run() 每轮按实际退休量递减 count，预算耗尽即返回。
+   - 效果：x_jos_plain 47.8s → 7.6s；x_jos_app 48s → 14.5s（且 hb 断言通过）；
+     PendSV/SysTick ≈ 124 → ≈ 1/2。
 
 ### 推荐下一步（对新引擎/干净会话可续）
-1. 先量 idle 时那 ~109 次/每 SysTick PendSV 在**切谁**：采样 PendSV 抢占点 PC/被切任务
-   （diagnostic `last_switch_pc()` + `g_running`0x10006040）判断是「同一 idle 任务自我空切」
-   还是「系统每 Tick 不停唤醒再让出」。
-2. 若 idle 自我空切 → 给 PendSV 上 QEMU 语义：“退到线程的最低优先级、至多一次、且只在
-   SysTick/更高 ISR 全部退出后才被取”的门控（machine/nvic，勿绕 SCB SYST 语义）。
-3. 判据：`x_jos_hb` / `x_jos_app` 出 `hb seq=`；`x_drv_bringup` 保持绿且无 `[SCHED_ASSERT]`；
-   校准探针保持每 SysTick≈60k。
+1. ~~先量 idle 时那 ~109 次/每 SysTick PendSV 在**切谁**~~（已采样确认：PendSV 抢占点
+   PC=0x080038F6=console_run 的 msleep(1) 循环尾；空闲期是 idle 任务 `for(;;) rtos_yield()`
+   自我空切，见 §二.4 修复记录）。
+2. ~~若 idle 自我空切 → 给 PendSV 上 QEMU 语义门控~~（未走该路线：直接在 RTOS 侧
+   rtos_yield 做空切防护更干净，见 §二.4）。
+3. 判据：`x_jos_hb` / `x_jos_app` 出 `hb seq=` / `alive seq=`（已通过）；`x_drv_bringup`
+   保持绿且无 `[SCHED_ASSERT]`；校准探针保持每 SysTick≈60k。
 
 ## 三、配置化一键运行（推荐）
 

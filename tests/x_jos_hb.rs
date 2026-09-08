@@ -1,13 +1,14 @@
-//! 第二段验收：icount 节拍下，joc-app-rust(flyctrl) 周期任务能否真正被周期唤醒并打出
-//! ctrl 的 `hb seq=`；同时应无 [SCHED_ASSERT]。
+//! 第二段验收：icount 节拍下，应用分区周期任务能否真正被周期唤醒并打出
+//! `hb seq=`（flyctrl）/ `alive seq=`（demo-app）心跳；同时应无 [SCHED_ASSERT]。
+//! （PendSV 高密度风暴修复后该链路已打通，见 CONTRIBUTING-run.md §二.4）
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
 use mcu_simulater::machine::Machine;
 
-const SYS: &str = r"D:\project\mcu\oop\joc-base\build_rel\stm32f407_minimal.elf";
-const APP: &str = r"D:\project\mcu\oop\joc-app-rust\app.bin";
+const SYS: &str = r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
+const APP: &str = r"/home/ubuntu/work/joc-rtos-app-sdk/app.bin";
 
 #[test]
 fn hb_periodic() {
@@ -33,7 +34,7 @@ fn hb_periodic() {
     let t0 = std::time::Instant::now();
     let mut hb = false;
     let mut schd = false;
-    for step in 0..400u32 {
+    for step in 0..600u32 {
         if t0.elapsed().as_secs() > 300 {
             eprintln!(">>> 超时(300s) 无 hb");
             break;
@@ -43,7 +44,7 @@ fn hb_periodic() {
             let outv = m.console.lock().unwrap().output().to_vec();
             String::from_utf8_lossy(&outv).into_owned()
         };
-        if text.contains("hb seq=") {
+        if text.contains("hb seq=") || text.contains("alive seq=") {
             eprintln!("\n>>> 心跳出现（step {step}）");
             hb = true;
         }
@@ -72,7 +73,7 @@ fn hb_periodic() {
         if hb {
             break;
         }
-        if step > 300 {
+        if step > 580 {
             break;
         }
     }

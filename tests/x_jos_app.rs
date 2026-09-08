@@ -6,8 +6,10 @@
 //!   ready    = "READY. Commands" + "mounting app layer"
 //!   mounted  = "RUST app mounted"        （rust_app_start 自报，App 分区挂载成功）
 //!   tasks    = 任一 "task started"       （ctrl/sensor/telem/uplink 业务任务被调度）
-//!   hb       = "hb seq="                 （ctrl 节流心跳，≈1s 一条）
-//! 断言至少到 tasks（App 挂载 + 业务任务拉起）；hb 作为运行深度加分项。
+//!   hb       = "hb seq=" / "alive seq=" （周期心跳，≈1s 一条；demo-app 用 alive）
+//! 断言到 hb：周期心跳依赖「任务睡眠后 SysTick 唤醒推进」——该能力随
+//! PendSV 高密度风暴修复（joc-base rtos_yield 空切防护 + 本仓库 run() 预算递减）
+//! 已打通，故 hb 从加分项升级为必需判据（回归守卫）。
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -16,8 +18,8 @@ use mcu_simulater::machine::Machine;
 
 #[test]
 fn app_partition_boot() {
-    let elf = Path::new(r"D:\project\mcu\oop\joc-base\build_rel\stm32f407_minimal.elf");
-    let app = Path::new(r"D:\project\mcu\oop\joc-app-rust\app.bin");
+    let elf = Path::new(r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf");
+    let app = Path::new(r"/home/ubuntu/work/joc-rtos-app-sdk/app.bin");
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     m.load_elf(&elf).unwrap();
@@ -44,7 +46,8 @@ fn app_partition_boot() {
     let mut mounted = false;
     let mut tasks = false;
     let mut hb = false;
-    for step in 0..400u32 {
+    let mut mount_reported = false;
+    for step in 0..700u32 {
         if t_start.elapsed().as_secs() > 300 {
             eprintln!(">>> 超时（300s）终止");
             break;
@@ -64,7 +67,7 @@ fn app_partition_boot() {
         if text.contains("task started") {
             tasks = true;
         }
-        if text.contains("hb seq=") {
+        if text.contains("hb seq=") || text.contains("alive seq=") {
             hb = true;
         }
         if step % 5 == 0 || (!tasks && mounted) {
@@ -85,12 +88,14 @@ fn app_partition_boot() {
             }
             Ok(()) => {}
         }
-        if mounted && tasks {
-            // App 分区已挂载 + 全部业务任务已拉起并跑完首轮。心跳(hb)需要
-            // 周期定时唤醒持续推进，依赖独立的"任务睡眠后 SysTick 唤醒推进"
-            // 能力（当前模拟器在某 task 进入 period 睡眠后陷入 idle 停滞，
-            // 见风暴/死区问题），故不作为本条目的必需判据——挂载即达成目标。
+        if mounted && tasks && !mount_reported {
+            // App 分区已挂载 + 业务任务拉起。继续跑到周期心跳出现（demo 任务
+            // 每 50ms 醒一次、每 20 醒打一条 alive ≈ 1 虚拟秒；窗口留 ~700 步），
+            // 验证 SysTick 周期唤醒推进链路（本次修复目标）；超窗则 hb 断言失败。
             eprintln!(">>> App 挂载 + 业务任务拉起（step {step}; hb={hb}）");
+            mount_reported = true;
+        }
+        if mounted && tasks && hb {
             break;
         }
     }
@@ -101,4 +106,5 @@ fn app_partition_boot() {
     assert!(ready, "jOS 未到达 READY");
     assert!(mounted, "App 分区未挂载（无 RUST app mounted）");
     assert!(tasks, "App 业务任务未启动（无 task started 日志）");
+    assert!(hb, "周期心跳未出现（alive/hb seq=）：SysTick 唤醒推进链路异常（PendSV 风暴回归？）");
 }

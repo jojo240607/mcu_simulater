@@ -7,8 +7,8 @@ use std::sync::Arc;
 use unicorn_engine::RegisterARM;
 use mcu_simulater::machine::Machine;
 
-const SYS: &str = r"D:\project\mcu\oop\joc-base\build_rel\stm32f407_minimal.elf";
-const APP: &str = r"D:\project\mcu\oop\drv-bringup-app-rust\app.bin";
+const SYS: &str = r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
+const APP: &str = r"/home/ubuntu/work/drv-bringup-app-rust/app.bin";
 const CCM_POOL_LO: u32 = 0x1000_6000;
 const CCM_POOL_HI: u32 = 0x1000_8b00;
 

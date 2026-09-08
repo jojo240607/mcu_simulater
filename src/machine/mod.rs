@@ -6,7 +6,7 @@
 //!     与中断投递（NVIC 挂起抢占 + 异常入栈/出栈）。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use object::read::elf::{ElfFile, FileHeader, ProgramHeader};
@@ -58,6 +58,8 @@ struct BlockHookCold {
     nvic: Arc<Mutex<Nvic>>,
     timers: Vec<Arc<Mutex<dyn Peripheral>>>,
     tick_actives: Vec<Arc<AtomicBool>>,
+    /// 退休指令计数（block hook 每块累加 TB 字节≈Thumb 指令数×2；run() 按此递减预算）
+    retired: Arc<AtomicU64>,
 }
 
 /// 一台仿真的 MCU
@@ -134,6 +136,8 @@ pub struct Machine {
     pub entry: u32,
     /// run() 外层循环迭代次数（探测 emu_start 是否频繁提前返回，纯调试用）
     run_iterations: std::cell::Cell<u64>,
+    /// 退休指令计数（block hook 累加，run() 每轮据此递减 count 预算，保证正常终止）
+    retired_insts: Arc<AtomicU64>,
     /// 异常入场计数（按向量号，诊中断暴风/唤醒停滞用；Switch 停机每进一次加 1）
     vec_entries: std::cell::RefCell<Vec<u64>>,
     /// 最近一次异常抢占前的 PC（= 被中断块的 PC，诊在何处不停被抢）
@@ -222,6 +226,7 @@ impl Machine {
             initial_sp: 0,
             entry: 0,
             run_iterations: std::cell::Cell::new(0),
+            retired_insts: Arc::new(AtomicU64::new(0)),
             vec_entries: std::cell::RefCell::new(vec![0u64; 97]),
             last_switch_pc: std::cell::Cell::new(0),
         })
@@ -1362,6 +1367,7 @@ impl Machine {
             timers: self.timers.lock().unwrap().clone(),
             // 冻结活动标记列表：所有外设已挂载，转成 Vec，block hook 快路径免加锁
             tick_actives: self.tick_actives.lock().unwrap().clone(),
+            retired: self.retired_insts.clone(),
         });
         // 数据 hook 安装标记：MPU 首次使能且未安装时停机一次，交 run() 懒安装
         let dh_installed = self.data_hook_installed.clone();
@@ -1369,6 +1375,9 @@ impl Machine {
             // 热路径单次原子 load，按位测试 MPU/外设激活/看门狗/中断挂起四个低频标志
             //（bench_probe：H2 独立原子 37.8 → H12 单状态字 115.1 MIPS）
             let s = status.raw();
+            // 退休指令计数：每块累加 TB 字节（run() 按此递减预算，保证正常终止）。
+            // Thumb 下字节≈2×指令；预算只作工作量的粗粒度上界，误差可接受。
+            cold.retired.fetch_add(size as u64, Ordering::Relaxed);
             // MPU 使能但数据 hook 未装：停机由 run() 懒安装（含刷 TB）
             if s & BIT_MPU != 0 && !dh_installed.load(Ordering::Relaxed) {
                 cold
@@ -1638,7 +1647,13 @@ impl Machine {
         //（jOS 调度器启动后即可能触发）。达上限时记诊断并提前返回（调用方继续分步）。
         const MAX_ITERS_PER_CALL: u64 = 1_000_000;
         let base_iters = self.run_iterations.get();
-        let remaining = count;
+        // 预算递减基准：每次 run() 从该点起按 block hook 累计的退休量扣减 count。
+        // 【修复】旧实现 `let remaining = count` 恒不递减，每次 emu_start 都拿全额预算：
+        // 只有风暴护栏(1M 段)兜底。空闲固件（无 PendSV 风暴）时每段很长（到 SysTick 才被抢，
+        // ~25-52K 指令/段），1M 段 × 每段 ~40ms = 永不返回。现在每轮按实际退休量递减，
+        // count 耗尽即正常返回；风暴护栏仅作为"段内 0 退休"的异常风暴安全网。
+        let retired_base = self.retired_insts.load(Ordering::Relaxed);
+        let mut remaining = count;
         while remaining > 0 {
             let iters = self.run_iterations.get();
             if iters - base_iters >= MAX_ITERS_PER_CALL {
@@ -1697,6 +1712,11 @@ impl Machine {
                 }
                 StopReason::None => break, // 达到指令数上限
             }
+
+            // 按本轮实际退休量递减预算（block hook 已累计；看门狗 continue 分支因未退休指令，
+            // 用累计式扣减不受影响——下一轮仍按"本次 run() 起点以来的总退休量"计算）。
+            let retired = self.retired_insts.load(Ordering::Relaxed) - retired_base;
+            remaining = count.saturating_sub(retired as usize);
         }
         Ok(())
     }

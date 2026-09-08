@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use mcu_simulater::machine::Machine;
 
-const SYS: &str = r"D:\project\mcu\oop\joc-base\build_rel\stm32f407_minimal.elf";
-const APP: &str = r"D:\project\mcu\oop\drv-bringup-app-rust\app.bin";
+const SYS: &str = r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
+const APP: &str = r"/home/ubuntu/work/drv-bringup-app-rust/app.bin";
 
 #[test]
 fn sys_retire_calib() {

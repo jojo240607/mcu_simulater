@@ -16,8 +16,8 @@ use unicorn_engine::RegisterARM;
 
 use mcu_simulater::machine::Machine;
 
-const JOS_ELF: &str = r"D:\project\mcu\oop\joc-base\build_rel\stm32f407_minimal.elf";
-const OUT: &str = r"D:\project\mcu\oop\joc-base\build_rel\jos_diag_out.txt";
+const JOS_ELF: &str = r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
+const OUT: &str = r"/home/ubuntu/work/joc-base/build_rel/jos_diag_out.txt";
 
 const ADDR_SBRK: u64 = 0x0800_151C; // _sbrk 本体入口: R0 = incr
 const ADDR_SBRK_FAIL: u64 = 0x0800_1542; // _sbrk 失败返回点 (R0=0xFFFFFFFF)

@@ -28,8 +28,8 @@ fn vecname(v: u32) -> String {
 
 #[test]
 fn storm_diag() {
-    let elf = Path::new(r"D:\project\mcu\oop\joc-base\build_rel\stm32f407_minimal.elf");
-    let app = Path::new(r"D:\project\mcu\oop\joc-app-rust\app.bin");
+    let elf = Path::new(r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf");
+    let app = Path::new(r"/home/ubuntu/work/joc-rtos-app-sdk/app.bin");
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     m.load_elf(&elf).unwrap();
