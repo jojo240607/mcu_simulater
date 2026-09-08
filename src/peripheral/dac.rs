@@ -257,9 +257,18 @@ impl Dac {
         };
         if let Some(v) = ch1 {
             self.dhr[0] = v as u16;
+            // RM0090：TENx=0（无触发）时 DHR 写入自动转到 DOR（驱动 HAL 注释
+            // "TENx=0 => DHR auto-transfers to DOR" 依赖此语义）；TENx=1 则由
+            // 触发沿（SWTRIGR/定时器）锁存，CPU 写 DHR 不直接反映到 DOR。
+            if !self.ten(1) && self.enabled(1) {
+                self.latch(1);
+            }
         }
         if let Some(v) = ch2 {
             self.dhr[1] = v as u16;
+            if !self.ten(2) && self.enabled(2) {
+                self.latch(2);
+            }
         }
         // 寄存器文件回读镜像：原样存写值（硬件 DHR 可读回上次写入值）
         self.regs[(offset / 4) as usize] = value;

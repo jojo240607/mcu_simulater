@@ -63,6 +63,8 @@ const CSR_LPWRRSTF: u32 = 1 << 31;
 const CSR_IWDGRSTF: u32 = 1 << 28;
 const CSR_WWDGRSTF: u32 = 1 << 27;
 const CSR_RMVF: u32 = 1 << 24;
+const CSR_LSIRDY: u32 = 1 << 1; // LSI 就绪（LSION 置位后立即置位，简化）
+const CSR_LSION: u32 = 1 << 0;  // LSI 使能（可写；RTC/独立看门狗时钟源）
 /// 全部复位标志（RMVF 写 1 时清除这些位）
 const CSR_RESET_FLAGS: u32 = CSR_LPWRRSTF | CSR_IWDGRSTF | CSR_WWDGRSTF;
 
@@ -197,11 +199,20 @@ impl Peripheral for Rcc {
         }
         let idx = (offset / 4) as usize;
         let slot = self.regs.get_mut(idx).ok_or(BusError::OutOfRange)?;
-        // CSR 只读（除 RMVF 写 1 清除复位标志）：不直接存值
+        // CSR 只读（除 RMVF 写 1 清除复位标志，LSION 可写）：不直接存整值
         if offset == OFF_CSR {
-            if value & CSR_RMVF != 0 {
-                *slot &= !CSR_RESET_FLAGS;
+            let mut csr = *slot;
+            // LSI 启动：LSION(bit0) 置位 → LSIRDY(bit1) 立即置位（简化立即就绪；
+            // LSI 是 RTC/独立看门狗的时钟源，rtc_hal_enable 会自旋等 LSIRDY）。
+            if value & CSR_LSION != 0 {
+                csr |= CSR_LSION | CSR_LSIRDY;
+            } else {
+                csr &= !(CSR_LSION | CSR_LSIRDY);
             }
+            if value & CSR_RMVF != 0 {
+                csr &= !CSR_RESET_FLAGS;
+            }
+            *slot = csr;
             return Ok(());
         }
         *slot = value;

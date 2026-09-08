@@ -239,6 +239,14 @@ impl Machine {
         self.cpu.mem_map(0x2000_0000, 0x0002_0000, Prot::ALL)?; // SRAM1+SRAM2 128KB
         self.cpu.mem_map(0x1000_0000, 0x0001_0000, Prot::ALL)?; // CCM SRAM 64KB
         self.cpu.mem_map(0x1FFF_0000, 0x0001_0000, Prot::ALL)?; // 系统存储区（电子签名/flash大小等）
+        // F407 出厂校准字（系统存储区只读，固件 create 时直读）：
+        //   VREFINT_CAL @0x1FFF7A10 = 0x03F8（1.21V 参考电压 12 位码，25°C）
+        //   TS_CAL1 @0x1FFF7A2C = 0x0482（内部温度传感器 30°C 码）
+        //   TS_CAL2 @0x1FFF7A2E = 0x05F6（内部温度传感器 110°C 码）
+        // 代表性量产值：temp_sensor 驱动据此算温度，缺了会 cal1=cal2=0 → 0/0=NaN。
+        self.cpu.mem_write(0x1FFF_7A10, &0x03F8u32.to_le_bytes())?;
+        self.cpu.mem_write(0x1FFF_7A2C, &0x0482u16.to_le_bytes())?;
+        self.cpu.mem_write(0x1FFF_7A2E, &0x05F6u16.to_le_bytes())?;
         // 系统控制空间（SCB/NVIC/SysTick/MPU，含 CPACR@0xE000ED88）。
         // 仍映射为普通内存避免读写异常，同时由 mem hook 转发到总线上的 SCB 外设。
         self.cpu.mem_map(0xE000_E000, 0x0000_1000, Prot::ALL)?;

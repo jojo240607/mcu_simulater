@@ -64,7 +64,10 @@ impl Adc {
             port,
             irq,
             regs: [0; REG_COUNT],
-            conversion_value: 0,
+            // 默认锁存值 = F407 TS_CAL1 量产值（0x0482，≈30°C 室温）：无外部注入时
+            // 转换读回该值，temp_sensor 公式产出 30.0°C（模拟"上电室温环境"）。
+            // 外部注入（Event::AdcValue → feed_value）仍覆盖它。
+            conversion_value: 0x0482,
             _bus: bus,
             nvic,
         }
