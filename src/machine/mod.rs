@@ -6,7 +6,7 @@
 //!     与中断投递（NVIC 挂起抢占 + 异常入栈/出栈）。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use object::read::elf::{ElfFile, FileHeader, ProgramHeader};
@@ -61,6 +61,11 @@ struct BlockHookCold {
     tick_actives: Vec<Arc<AtomicBool>>,
     /// 退休指令计数（block hook 每块累加 TB 字节≈Thumb 指令数×2；run() 按此递减预算）
     retired: Arc<AtomicU64>,
+    /// DMA 控制器（块 hook 每 N 块只读 pending 位图；有请求则停机让 run() 搬）
+    dma1: Arc<Mutex<Dma>>,
+    dma2: Arc<Mutex<Dma>>,
+    /// 块计数器（每 256 块检查一次 DMA 待搬运请求）
+    dma_ticks: AtomicU32,
 }
 
 /// 一台仿真的 MCU
@@ -910,23 +915,34 @@ impl Machine {
                     if *p != 1 {
                         return;
                     }
-                    let stream = match dir {
-                        DmaDir::PeriphToMem => 3, // DMA2_Stream3（RX）
-                        DmaDir::MemToPeriph => 6, // DMA2_Stream6（TX）
-                    };
                     let mut d = dma2_sdio.lock().unwrap();
+                    // SDIO 单请求线：写恒走 DMA2_Stream6_Ch4（固件 joc-base 与
+                    // m14 sdio_demo 一致）；读方向先按 RM0090 RX 流（DMA2_Stream3
+                    // _Ch4，m14 固件语义），未配置（joc-base 驱动恒 acquire S6）
+                    // 时 fallback 到 S6——两种固件行为均服务。
                     match dir {
                         // 读：FIFO 现成字数一次搬完
-                        DmaDir::PeriphToMem => d.service_stream_n(
-                            stream,
-                            4,
-                            *dir,
-                            crate::peripheral::dma::DmaTarget::Sdio(*p),
-                            *items,
-                        ),
+                        DmaDir::PeriphToMem => {
+                            let served = d.service_stream_n(
+                                3,
+                                4,
+                                *dir,
+                                crate::peripheral::dma::DmaTarget::Sdio(*p),
+                                *items,
+                            );
+                            if !served {
+                                d.service_stream_n(
+                                    6,
+                                    4,
+                                    *dir,
+                                    crate::peripheral::dma::DmaTarget::Sdio(*p),
+                                    *items,
+                                );
+                            }
+                        }
                         // 写：items=0，由 service_stream 取 NDTR 一次搬完
                         DmaDir::MemToPeriph => d.service_stream(
-                            stream,
+                            6,
                             4,
                             *dir,
                             crate::peripheral::dma::DmaTarget::Sdio(*p),
@@ -1389,6 +1405,9 @@ impl Machine {
             // 冻结活动标记列表：所有外设已挂载，转成 Vec，block hook 快路径免加锁
             tick_actives: self.tick_actives.lock().unwrap().clone(),
             retired: self.retired_insts.clone(),
+            dma1: self.dma.clone(),
+            dma2: self.dma2.clone(),
+            dma_ticks: AtomicU32::new(0),
         });
         // 数据 hook 安装标记：MPU 首次使能且未安装时停机一次，交 run() 懒安装
         let dh_installed = self.data_hook_installed.clone();
@@ -1443,6 +1462,17 @@ impl Machine {
             if s & BIT_WDOG != 0 {
                 let _ = uc.emu_stop();
                 return;
+            }
+            // DMA 待搬运检查（每 256 块，仅读位图无内存访问）：CPU 忙等外设标志
+            //（SDIO DATAEND / DMA 完成信号量）时 emu_start 不返回 → run() 循环的
+            // process 永不执行 → DMA 请求饿死。此处停机让 run() 返回后搬运（真机
+            // DMA 与 CPU 并行，模拟器以此对齐）。无 pending 时快速返回，热路径可忽略。
+            if cold.dma_ticks.fetch_add(1, Ordering::Relaxed) & 0xFF == 0 {
+                let p1 = cold.dma1.lock().unwrap().has_pending();
+                let p2 = cold.dma2.lock().unwrap().has_pending();
+                if p1 || p2 {
+                    let _ = uc.emu_stop();
+                }
             }
             // 挂起中断抢占检查（快路径：无挂起中断时跳过加锁的 select_pending_vector）
             if s & BIT_NVIC_PENDING != 0 {

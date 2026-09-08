@@ -60,7 +60,7 @@
 
 /* DMA CR 位（F407） */
 #define DMA_CR_EN      (1u << 0)
-#define DMA_CR_TCIE    (1u << 5)
+#define DMA_CR_TCIE    (1u << 4)
 #define DMA_CR_DIR_M2P (1u << 6)      /* 01 = 内存→外设（TX） */
 #define DMA_CR_MINC    (1u << 10)
 #define DMA_CR_MSIZE_H (1u << 13)     /* MSIZE = 01 = 半字（16 位） */

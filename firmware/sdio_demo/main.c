@@ -27,8 +27,8 @@
 #define SDIO_RESP1   (*(volatile uint32_t *)0x40012C14u)
 #define SDIO_DLEN    (*(volatile uint32_t *)0x40012C28u)
 #define SDIO_DCTRL   (*(volatile uint32_t *)0x40012C2Cu)
-#define SDIO_STATUS  (*(volatile uint32_t *)0x40012C38u)
-#define SDIO_ICR     (*(volatile uint32_t *)0x40012C3Cu)
+#define SDIO_STATUS  (*(volatile uint32_t *)0x40012C34u)  /* STA @ 0x34（真机 F4；原 0x38 错位为 ICR） */
+#define SDIO_ICR     (*(volatile uint32_t *)0x40012C38u)  /* ICR @ 0x38（真机 F4） */
 #define SDIO_FIFO    (*(volatile uint32_t *)0x40012C80u)
 
 /* SDIO 位 */
@@ -58,8 +58,8 @@
 /* DMA2 流配置：CHSEL=4（SDIO）、PSIZE=MSIZE=字、MINC；DIR 区分读/写 */
 #define DMA_CFG_RX (1u << 0 | (1u << 10) | (2u << 11) | (2u << 13) | (4u << 25)) /* DIR=00 外设→内存 */
 #define DMA_CFG_TX (1u << 0 | (1u << 6) | (1u << 10) | (2u << 11) | (2u << 13) | (4u << 25)) /* DIR=01 内存→外设 */
-#define DMA2_LISR_TCIF3 (1u << 23)     /* Stream3 传输完成（LISR） */
-#define DMA2_HISR_TCIF6 (1u << 17)     /* Stream6 传输完成（HISR） */
+#define DMA2_LISR_TCIF3 (1u << 27)     /* Stream3 传输完成（LISR；S3 偏移 22+5） */
+#define DMA2_HISR_TCIF6 (1u << 21)     /* Stream6 传输完成（HISR；S6 偏移 16+5） */
 
 /* 结果区 */
 #define G_INIT_OK  (*(volatile uint32_t *)0x20000000u)

@@ -34,7 +34,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::core::Cpu;
 use crate::peripheral::adc::Adc;
 use crate::peripheral::dac::Dac;
 use crate::peripheral::dcmi::Dcmi;
@@ -54,6 +53,27 @@ pub const DMA2_BASE: u32 = 0x4002_6400;
 pub const DMA1_STREAM_IRQ: [u32; 8] = [11, 12, 13, 14, 15, 16, 17, 47];
 /// DMA2 各流中断号（Stream0..7，F407：Stream0-4=56-60，Stream5-7=68-70）
 pub const DMA2_STREAM_IRQ: [u32; 8] = [56, 57, 58, 59, 60, 68, 69, 70];
+
+/// DMA 搬运所需的内存读写接口：CPU（run() 间隙）与 Unicorn（块 hook 内）均实现，
+/// 使 DMA 在 CPU 忙等外设标志（如 SDIO DATAEND）时也能于块间搬运——真机 DMA 与
+/// CPU 并行，模拟器以此对齐（否则忙等期间 DMA 请求永不搬运 → 传输超时）。
+pub trait DmaMem {
+    fn dma_read(
+        &mut self,
+        addr: u64,
+        size: usize,
+    ) -> std::result::Result<Vec<u8>, crate::core::CoreError>;
+    fn dma_write(
+        &mut self,
+        addr: u64,
+        buf: &[u8],
+    ) -> std::result::Result<(), crate::core::CoreError>;
+}
+
+// 注意：块 hook（unicorn 回调）内直接调 uc.mem_read 会卡死（unicorn 块 hook 回调
+// 中嵌套内存访问不安全），故 DmaMem 仅由 Cpu 实现、在 run() 循环（emu_start 返回后）
+// 使用。CPU 忙等外设标志期间通过 run() 的 pending 感知小段预算让出推进。
+
 
 /// DMA 传输方向（CR.DIR bit7:6）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +130,8 @@ pub trait DmaByteIo: Send {
 
 /// CR 控制位
 const CR_EN: u32 = 1 << 0; // 使能
-const CR_TCIE: u32 = 1 << 5; // 传输完成中断使能
+const CR_TCIE: u32 = 1 << 4; // 传输完成中断使能（F4 DMA_SxCR bit4；bit5 是 PFCTRL——
+// 旧值 1<<5 与固件写入的 bit4 永不匹配，TC 中断从不触发 → wait_done 超时）
 const CR_PINC: u32 = 1 << 9; // 外设地址递增
 const CR_MINC: u32 = 1 << 10; // 内存地址递增
 // DIR bit7:6：00=外设→内存, 01=内存→外设, 10=内存→内存
@@ -152,6 +173,10 @@ pub struct Dma {
     pending_items: [u32; 8],
     /// 各流待搬运的外设目标（None = 内存方向/未登记）
     pending_target: [Option<DmaTarget>; 8],
+    /// 各流待搬运方向（service 发布时登记；外设侧以发布方向为准，
+    /// 不读 CR.DIR——joc-base SDIO acquire 恒 M2P，读路径发布 P2M 时
+    /// CR.DIR 仍为 M2P，若按 CR.DIR 搬运会走错分支导致读卡不排空）
+    pending_dir: [u32; 8],
     /// 注册的 USART 句柄（index 0..5 = USART1..6，外设方向搬运直接读写 DR）
     usart_handles: [Option<Arc<Mutex<Usart>>>; 6],
     /// 注册的 I2C 句柄（index 0..2 = I2C1..3，外设方向搬运直接读写 DR）
@@ -193,6 +218,7 @@ impl Dma {
             nvic,
             pending_transfer: 0,
             pending_items: [0; 8],
+            pending_dir: [0; 8],
             pending_target: [None; 8],
             usart_handles: Default::default(),
             i2c_handles: Default::default(),
@@ -315,6 +341,9 @@ impl Dma {
     ///
     /// 同 [`Dma::service_stream`]（校验 EN/CHSEL/DIR），但搬运项数由外设决定：
     /// 适合一次注入即生成多字数据的批量外设（如 DCMI 注入一帧 → 一次搬完整帧）。
+    /// 登记一次外设 DMA 搬运请求；校验流 EN/CHSEL（对 Sdio 目标跳过 DIR 检查：
+    /// SDIO 单请求线，方向由外设发布决定，固件 joc-base acquire 恒 M2P 故
+    /// CR.DIR 与读方向发布不一致）。返回是否登记成功（供调用方 fallback）。
     pub fn service_stream_n(
         &mut self,
         stream: usize,
@@ -322,23 +351,25 @@ impl Dma {
         dir: DmaDir,
         target: DmaTarget,
         items: u32,
-    ) {
+    ) -> bool {
         let cr = self.stream_reg(stream, 0);
         if cr & CR_EN == 0 {
-            return; // 流未使能：忽略请求
+            return false; // 流未使能：忽略请求
         }
         if (cr >> CR_CHSEL_SHIFT) & 0x7 != channel {
-            return; // CHSEL 不匹配（本流不服务该外设通道）
+            return false; // CHSEL 不匹配（本流不服务该外设通道）
         }
-        if (cr >> 6) & 0x3 != dir.bits() {
-            return; // CR.DIR 与请求方向不一致
+        if !matches!(target, DmaTarget::Sdio(_)) && (cr >> 6) & 0x3 != dir.bits() {
+            return false; // CR.DIR 与请求方向不一致
         }
         if items == 0 {
-            return;
+            return false;
         }
         self.pending_transfer |= 1 << stream;
         self.pending_items[stream] = items;
+        self.pending_dir[stream] = dir.bits();
         self.pending_target[stream] = Some(target);
+        true
     }
 
     /// 状态位所属中断状态寄存器索引（低 4 流 → LISR，高 4 流 → HISR）
@@ -350,9 +381,13 @@ impl Dma {
         }
     }
 
-    /// 流 s 状态位在 ISR/IFCR 内的偏移（流内 6 位）
+    /// 流 s 状态位在 ISR/IFCR 内的偏移（流内 6 位）。
+    /// 真机 F4 LISR/HISR 布局（RM0090）：S0=0, S1=6, S2=16, S3=22（HISR 同构
+    /// S4-7）——bit 12-15 为保留位，故 S2/S6 偏移是 16 而非 12。joc-base
+    /// dma_hal.c 的 dma_fsr_shift={0,6,16,22} 即按此（模拟器旧实现 (s%4)*6 使
+    /// S2/S6 错位 → TCIF6 读不到 → DMA TC 中断/忙等永不完成，C 类块读写暴露）。
     fn flag_offset(s: usize) -> u32 {
-        ((s % 4) as u32) * 6
+        [0u32, 6, 16, 22][s % 4]
     }
 
     /// 置位流状态位
@@ -378,7 +413,12 @@ impl Dma {
     /// - 外设方向：内存侧用 CPU 内存 API，外设侧经已注册 USART 句柄直接读写 DR
     ///   （TX：M0AR → [`Usart::dma_write_dr`]；RX：[`Usart::dma_read_dr`] → M0AR），
     ///   完成后 NDTR 清零、EN 自动清零、TCIF 置位、TCIE 时挂起流中断。
-    pub fn process(&mut self, cpu: &mut Cpu) {
+    /// 是否有待搬运的 DMA 请求（run() 据此决定是否用小段预算让 CPU 频繁让出）
+    pub fn has_pending(&self) -> bool {
+        self.pending_transfer != 0
+    }
+
+    pub fn process<'a>(&mut self, mem: &mut (dyn DmaMem + 'a)) {
         let mut mask = self.pending_transfer;
         while mask != 0 {
             let s = mask.trailing_zeros() as usize;
@@ -389,7 +429,11 @@ impl Dma {
                 continue;
             }
             let cr = self.stream_reg(s, 0);
-            let dir = (cr >> 6) & 0x3; // 00=外设→内存, 01=内存→外设, 10=内存→内存
+            // 方向：M2M（CR.DIR=10）走 CR.DIR；外设方向以 service 发布时登记的
+            // pending_dir 为准（外设知道真实方向；CR.DIR 可能因驱动 acquire
+            // 固定而不反映本次 xfer 方向）
+            let cr_dir = (cr >> 6) & 0x3; // 00=外设→内存, 01=内存→外设, 10=内存→内存
+            let dir = if cr_dir == 2 { 2 } else { self.pending_dir[s] };
             let psize = ((cr >> 11) & 0x3) as usize; // 0=字节,1=半字,2=字
             let msize = ((cr >> 13) & 0x3) as usize;
             let pw = 1usize << psize;
@@ -403,9 +447,9 @@ impl Dma {
                 // 内存到内存：PAR → M0AR（原 M4 路径）
                 let mut buf = [0u8; 4];
                 for _ in 0..items {
-                    if let Ok(data) = cpu.mem_read(src as u64, pw) {
+                    if let Ok(data) = mem.dma_read(src as u64, pw) {
                         buf[..pw].copy_from_slice(&data[..pw]);
-                        let _ = cpu.mem_write(dst as u64, &buf[..mw]);
+                        let _ = mem.dma_write(dst as u64, &buf[..mw]);
                     }
                     if pinc {
                         src += pw as u32;
@@ -483,12 +527,13 @@ impl Dma {
             if dir == 1 {
                 // 内存 → 外设（TX）：M0AR → 外设 DR（按 MSIZE 取宽拼 u32）
                 for _ in 0..items {
-                    if let Ok(data) = cpu.mem_read(dst as u64, mw) {
+                    if let Ok(data) = mem.dma_read(dst as u64, mw) {
                         let mut value = 0u32;
                         for (i, b) in data[..mw].iter().enumerate() {
                             value |= (*b as u32) << (8 * i);
                         }
                         dev.dma_write_dr(value);
+                    } else {
                     }
                     if minc {
                         dst += mw as u32;
@@ -498,7 +543,7 @@ impl Dma {
                 // 外设 → 内存（RX）：外设 DR → M0AR（按 MSIZE 取宽写内存）
                 for _ in 0..items {
                     let value = dev.dma_read_dr().to_le_bytes();
-                    let _ = cpu.mem_write(dst as u64, &value[..mw]);
+                    let _ = mem.dma_write(dst as u64, &value[..mw]);
                     if minc {
                         dst += mw as u32;
                     }
@@ -605,6 +650,7 @@ impl Peripheral for Dma {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Cpu;
     use unicorn_engine::Prot;
 
     fn dma() -> Dma {
@@ -623,7 +669,8 @@ mod tests {
     #[test]
     fn register_layout_and_flag_position() {
         let mut d = dma();
-        // 流 3 的 TCIF 在 LISR bit 5+18=23；流 4 的 TCIF 在 HISR bit5
+        // 真机 F4 布局（RM0090）：S0=0,S1=6,S2=16,S3=22 → S3 TCIF=22+5=27；
+        // S4 在 HISR 偏移 0 → TCIF=5（joc-base dma_hal.c dma_fsr_shift={0,6,16,22}）
         for s in [3usize, 4] {
             let base = OFF_CR + s as u32 * 0x18;
             d.write(base, 4, CR_EN | CR_DIR_MM | CR_TCIE).unwrap();
@@ -632,7 +679,7 @@ mod tests {
             d.write(base + 0x0C, 4, 0x2000_0200).unwrap();
         }
         d.tick(1);
-        assert_eq!(d.regs[0] & (1 << 23), 1 << 23, "Stream3 TCIF 应在 LISR bit23");
+        assert_eq!(d.regs[0] & (1 << 27), 1 << 27, "Stream3 TCIF 应在 LISR bit27（真机布局）");
         assert_eq!(d.regs[1] & (1 << 5), 1 << 5, "Stream4 TCIF 应在 HISR bit5");
         assert_eq!(d.regs[0] & (1 << 5), 0, "Stream0 未使能不置 LISR bit5");
     }

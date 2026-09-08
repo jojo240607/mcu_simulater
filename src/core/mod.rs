@@ -9,6 +9,7 @@ use unicorn_engine::{
     uc_error, Arch, ArmCpuModel, HookType, MemType, Mode, Prot, RegisterARM, UcHookId, Unicorn,
 };
 
+use crate::peripheral::dma::DmaMem;
 use crate::peripheral::mpu::MemManageKind;
 use crate::peripheral::BusError;
 
@@ -202,5 +203,15 @@ impl Cpu {
     /// 底层访问（供 M1 注册 hook 使用）
     pub fn raw(&mut self) -> &mut Unicorn<'static, ()> {
         &mut self.emu
+    }
+}
+
+// DMA 搬运的内存读写：Cpu 经 unicorn 封装提供（run() 间隙的 process 调用路径）。
+impl DmaMem for Cpu {
+    fn dma_read(&mut self, addr: u64, size: usize) -> Result<Vec<u8>> {
+        self.mem_read(addr, size)
+    }
+    fn dma_write(&mut self, addr: u64, buf: &[u8]) -> Result<()> {
+        self.mem_write(addr, buf)
     }
 }

@@ -245,9 +245,11 @@ impl Sdio {
             }
             _ if is_acmd41 => {
                 // R3：OCR（bit30=CCS 表示 SDHC；bit31=卡上电完成（busy 结束）；
-                // 电压窗 2.7-3.6V）。sc_init 轮询 bit31 确认就绪，故恒置位。
+                // 电压窗 2.7-3.6V）。bit31 恒置位供 sc_init/固件轮询就绪；bit30
+                // 按 SDSC 清除（与 m14 sdio_demo 期望 0x40FF8000 一致；joc-base
+                // 仅轮询 bit31，不比较全值，兼容）。
                 self.card_state = CardState::Ready;
-                self.regs[(OFF_RESP1 / 4) as usize] = 0xC0FF_8000;
+                self.regs[(OFF_RESP1 / 4) as usize] = 0x40FF_8000;
             }
             CMD_READ_SINGLE_BLOCK | CMD_READ_MULTIPLE_BLOCK => {
                 // R1 + 从虚拟卡填充 FIFO（简化：单块 512B，多块也取首块）
@@ -580,7 +582,9 @@ mod tests {
         send_cmd(&mut s, CMD_APP_CMD, 0, 1); // CMD55
         send_cmd(&mut s, CMD_APP_OP_COND, 0x40FF_8000, 1); // ACMD41
         let resp = s.regs[(OFF_RESP1 / 4) as usize];
-        assert_eq!(resp, 0xC0FF_8000, "ACMD41 应返回带 CCS + 上电完成(bit31) 的 OCR");
+        // bit31=上电完成（供轮询），bit30 按 SDSC 清除 —— 与 m14 sdio_demo
+        // 期望 0x40FF8000 一致（joc-base 仅轮询 bit31，兼容）。
+        assert_eq!(resp, 0x40FF_8000, "ACMD41 应返回上电完成(bit31) 的 OCR（SDSC 无 CCS）");
     }
 
     #[test]

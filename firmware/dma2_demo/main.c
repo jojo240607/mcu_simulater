@@ -40,7 +40,7 @@
 
 /* DMA2 Stream CR 位（F407，与 DMA1 相同） */
 #define DMA_CR_EN    (1u << 0)
-#define DMA_CR_TCIE  (1u << 5)
+#define DMA_CR_TCIE  (1u << 4)
 #define DMA_CR_DIR_MM (2u << 6)   /* 内存到内存 */
 #define DMA_CR_PINC  (1u << 9)
 #define DMA_CR_MINC  (1u << 10)

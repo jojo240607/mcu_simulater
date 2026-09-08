@@ -60,7 +60,7 @@
 #define TI_IDE    (1u << 2)
 #define STID(id)  ((id) << 21)   /* 标准帧 ID 在 [31:21] */
 #define EXID(id)  ((id) << 3)    /* 扩展帧 ID 在 [31:3] */
-#define DLC(n)    ((n) << 16)    /* 数据长度在 [19:16] */
+#define DLC(n)    ((n) & 0xFu)          /* 数据长度 DLC[3:0]（真机 bxCAN TDTR/RDT0R 均在 bit0-3；原宏 <<16 错位使模拟器解析 dlc=0） */
 
 /* 结果区 */
 #define G_TX2RX_OK (*(volatile uint32_t *)0x20000000u)
