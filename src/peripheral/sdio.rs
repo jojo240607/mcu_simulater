@@ -44,11 +44,11 @@ const OFF_DTIMER: u32 = 0x24;
 const OFF_DLEN: u32 = 0x28;
 const OFF_DCTRL: u32 = 0x2C;
 const OFF_DCOUNT: u32 = 0x30;
-const OFF_STATUS: u32 = 0x38;
-const OFF_ICR: u32 = 0x3C;
-const OFF_MASK: u32 = 0x40;
-const OFF_FIFOCNT: u32 = 0x44;
-/// 数据 FIFO 基址（F4：32 个 32 位字，0x80..0x100）
+const OFF_STATUS: u32 = 0x34;
+const OFF_ICR: u32 = 0x38;
+const OFF_MASK: u32 = 0x3C;
+const OFF_FIFOCNT: u32 = 0x48;
+/// 数据 FIFO 基址（0x80..）
 const OFF_FIFO: u32 = 0x80;
 
 // ---- 寄存器可写位（功能无关位按写值存储）----
@@ -244,9 +244,10 @@ impl Sdio {
                 self.regs[(OFF_RESP1 / 4) as usize] = self.r1_status() | (1 << 31);
             }
             _ if is_acmd41 => {
-                // R3：OCR（bit30=CCS 表示 SDHC；电压窗 2.7-3.6V）
+                // R3：OCR（bit30=CCS 表示 SDHC；bit31=卡上电完成（busy 结束）；
+                // 电压窗 2.7-3.6V）。sc_init 轮询 bit31 确认就绪，故恒置位。
                 self.card_state = CardState::Ready;
-                self.regs[(OFF_RESP1 / 4) as usize] = 0x40FF_8000;
+                self.regs[(OFF_RESP1 / 4) as usize] = 0xC0FF_8000;
             }
             CMD_READ_SINGLE_BLOCK | CMD_READ_MULTIPLE_BLOCK => {
                 // R1 + 从虚拟卡填充 FIFO（简化：单块 512B，多块也取首块）
@@ -579,7 +580,7 @@ mod tests {
         send_cmd(&mut s, CMD_APP_CMD, 0, 1); // CMD55
         send_cmd(&mut s, CMD_APP_OP_COND, 0x40FF_8000, 1); // ACMD41
         let resp = s.regs[(OFF_RESP1 / 4) as usize];
-        assert_eq!(resp, 0x40FF_8000, "ACMD41 应返回带 CCS 的 OCR");
+        assert_eq!(resp, 0xC0FF_8000, "ACMD41 应返回带 CCS + 上电完成(bit31) 的 OCR");
     }
 
     #[test]

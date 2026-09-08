@@ -64,7 +64,7 @@ fn drvtest_all_drivers_pass() {
         if text.contains("hb n=") {
             hb = true;
         }
-        // 解析 "DRVTEST REPORT total=21 pass=21 fail=0 skip=0"
+        // 解析 "DRVTEST REPORT total=28 pass=28 fail=0 skip=0"
         if report.is_none() {
             for line in text.lines() {
                 if let Some(rest) = line.strip_prefix("R/I/drvtest: DRVTEST REPORT") {

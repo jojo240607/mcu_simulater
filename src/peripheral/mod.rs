@@ -13,6 +13,7 @@ pub mod dma;
 pub mod dwt;
 pub mod exti;
 pub mod fsmc;
+pub mod flash;
 pub mod gpio;
 pub mod i2c;
 pub mod mpu;

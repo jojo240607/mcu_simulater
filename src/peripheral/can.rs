@@ -118,6 +118,11 @@ const ESR_LEC_MASK: u32 = 0x7 << 3; // [5:3] 上次错误代码
 /// BTR 位（位时序；简化仅存储回读，不参与时序）
 const BTR_WR_MASK: u32 = 0xFFFF_FFFF;
 
+/// CAN_BTR_LBKM（bit30，F407）：回环模式。置位时控制器把自身 TX 帧回环到
+/// RX FIFO（自测模式，无需外部收发器/总线）。Machine 的 CanFrame 路由据此
+/// 回喂本端口。
+pub const BTR_LBKM: u32 = 1 << 30;
+
 /// 发送邮箱标识符寄存器位
 const TI_TXRQ: u32 = 1 << 0; // 发送请求
 const TI_RTR: u32 = 1 << 1; // 远程帧
@@ -125,8 +130,8 @@ const TI_IDE: u32 = 1 << 2; // 扩展帧
 const TI_EXID_MASK: u32 = 0xFFFF_FFF8; // [31:3] 扩展 ID（29 位）
 const TI_STID_MASK: u32 = 0xFFE0_0000; // [31:21] 标准 ID
 
-/// 数据长度寄存器位
-const TDT_DLC_MASK: u32 = 0xF << 16; // [19:16] 数据长度
+/// 数据长度寄存器位（bxCAN 权威布局：DLC[3:0] = bits 0:3，TGT = bit8）
+const TDT_DLC_MASK: u32 = 0xF; // [3:0] 数据长度
 
 /// 一帧 CAN 报文（总线级互联/注入载体）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,7 +175,7 @@ impl Mailbox {
         } else {
             (self.ti & TI_STID_MASK) >> 21
         };
-        let dlc = ((self.tdt & TDT_DLC_MASK) >> 16) as u8;
+        let dlc = (self.tdt & TDT_DLC_MASK) as u8;
         let mut data = [0u8; 8];
         data[0] = (self.dl & 0xFF) as u8;
         data[1] = ((self.dl >> 8) & 0xFF) as u8;
@@ -278,6 +283,12 @@ impl Can {
         }
     }
 
+    /// 回环模式（BTR.LBKM）状态：Machine 的 CanFrame 路由据此把本端口 TX 帧
+    /// 回喂到自己的 RX FIFO（自测模式，无需外部总线）。
+    pub fn loopback(&self) -> bool {
+        self.btr & BTR_LBKM != 0
+    }
+
     /// 注入错误状态（模拟总线异常；on=true 置位，false 清除）。
     /// EWGF/EPVF/BOFF 互斥推进；ERRIE 使能时挂起 SCE IRQ。
     pub fn inject_error(&mut self, ewgf: bool, epvf: bool, boff: bool) {
@@ -335,7 +346,13 @@ impl Can {
         if let Some(ev) = &self.events {
             ev.lock()
                 .unwrap()
-                .publish(&Event::CanFrame { frame: Box::new(frame) });
+                .publish(&Event::CanFrame { frame: Box::new(frame.clone()) });
+        }
+        // 回环模式（BTR.LBKM，自测）：本控制器 TX 帧直接回喂自己的 RX FIFO。
+        // 在锁内直接 feed_rx（不经 EventBus 路由，避免 machine 订阅回调对
+        // 本控制器二次加锁 → 重入死锁）。
+        if self.loopback() {
+            self.feed_rx(frame);
         }
         // 清发送请求并置完成/成功/邮箱空
         self.tx[m].ti &= !TI_TXRQ;
@@ -373,7 +390,7 @@ impl Can {
                 }
                 v
             }
-            1 => (f.dlc as u32) << 16, // RDT0R：DLC（FMI/TIME 简化 0）
+            1 => f.dlc as u32, // RDT0R：DLC[3:0]（FMI/TIME 简化 0）
             2 => {
                 // RDL0R：DATA0-3
                 let mut v = 0;
@@ -610,7 +627,7 @@ mod tests {
         )));
         // 配置邮箱0：标准帧 ID=0x123，DLC=2，数据 0x11 0x22
         c.write(TX_MAILBOX_BASE + 0, 4, 0x123 << 21 | TI_TXRQ).unwrap();
-        c.write(TX_MAILBOX_BASE + 4, 4, 2 << 16).unwrap();
+        c.write(TX_MAILBOX_BASE + 4, 4, 2).unwrap(); // TDTR：DLC[3:0]
         c.write(TX_MAILBOX_BASE + 8, 4, 0x22_11).unwrap();
         c.write(TX_MAILBOX_BASE + 0, 4, 0x123 << 21 | TI_TXRQ).unwrap(); // 再次写触发发送
         assert_eq!(c.read(OFF_TSR, 4).unwrap() & TSR_TXOK[0], TSR_TXOK[0], "应置 TXOK");
@@ -662,7 +679,7 @@ mod tests {
         let (mut c, _, _) = make();
         c.feed_rx(frame(0x123, false, 4, [1, 2, 3, 4, 0, 0, 0, 0]));
         assert_eq!(c.read(RX_FIFO_BASE + 0, 4).unwrap(), 0x123 << 21, "RI0R 标准 ID");
-        assert_eq!(c.read(RX_FIFO_BASE + 4, 4).unwrap(), 4 << 16, "RDT0R DLC");
+        assert_eq!(c.read(RX_FIFO_BASE + 4, 4).unwrap(), 4, "RDT0R DLC[3:0]");
         assert_eq!(c.read(RX_FIFO_BASE + 8, 4).unwrap(), 0x0403_0201, "RDL0R 数据低 4 字节");
     }
 
@@ -699,7 +716,7 @@ mod tests {
         )));
         // 扩展帧 ID=0x1FFEDCBA，DLC=8
         c.write(TX_MAILBOX_BASE + 0, 4, TI_IDE | (0x1FFEDCBA << 3) | TI_TXRQ).unwrap();
-        c.write(TX_MAILBOX_BASE + 4, 4, 8 << 16).unwrap();
+        c.write(TX_MAILBOX_BASE + 4, 4, 8).unwrap(); // TDTR：DLC[3:0]
         c.write(TX_MAILBOX_BASE + 8, 4, 0x8877_6655).unwrap();
         c.write(TX_MAILBOX_BASE + 12, 4, 0x4433_2211).unwrap();
         c.write(TX_MAILBOX_BASE + 0, 4, TI_IDE | (0x1FFEDCBA << 3) | TI_TXRQ).unwrap();

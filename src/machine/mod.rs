@@ -28,6 +28,7 @@ use crate::peripheral::terminal::Terminal;
 use crate::peripheral::dma::{Dma, DmaDir, DMA1_BASE, DMA1_STREAM_IRQ, DMA2_BASE, DMA2_STREAM_IRQ};
 use crate::peripheral::usb_otg::{UsbOtg, USB_OTG_FS_BASE};
 use crate::peripheral::exti::{Exti, EXTI_BASE};
+use crate::peripheral::flash::Flash;
 use crate::peripheral::fsmc::{
     Fsmc, FSMC_BANK1_BASE, FSMC_BANK2_BASE, FSMC_BANK3_BASE, FSMC_BANK4_BASE, FSMC_BANK_SIZE,
     FSMC_BASE,
@@ -113,6 +114,8 @@ pub struct Machine {
     pub can1: Arc<Mutex<Can>>,
     /// CAN2 控制器局域网（@0x40006800，APB1；同上，与 CAN1 互联）
     pub can2: Arc<Mutex<Can>>,
+    /// FLASH 控制器寄存器区（@0x40023C00，AHB1；ACR/KEYR/SR/CR 最小模型）
+    pub flash: Arc<Mutex<Flash>>,
     /// USB OTG FS 全速设备控制器（@0x50000000，AHB1；设备模式核心寄存器/端点/
     /// FIFO/枚举 + 虚拟主机 UsbSetup 事件注入 + OTG_FS_IRQ=67）
     pub usb_otg: Arc<Mutex<UsbOtg>>,
@@ -205,6 +208,7 @@ impl Machine {
             sdio: Arc::new(Mutex::new(Sdio::new(events.clone(), nvic.clone()))),
             can1: Arc::new(Mutex::new(Can::new(1, Some(events.clone()), nvic.clone()))),
             can2: Arc::new(Mutex::new(Can::new(2, Some(events.clone()), nvic.clone()))),
+            flash: Arc::new(Mutex::new(Flash::new())),
             usb_otg: Arc::new(Mutex::new(UsbOtg::new(
                 Some(events.clone()),
                 nvic.clone(),
@@ -942,6 +946,12 @@ impl Machine {
         self.bus.lock().unwrap().attach(CAN1_BASE, 0x400, "CAN1", can1)?;
         let can2 = self.can2.clone();
         self.bus.lock().unwrap().attach(CAN2_BASE, 0x400, "CAN2", can2)?;
+        // FLASH 控制器寄存器区（@0x40023C00，AHB1，外设区 hook 覆盖内直接 attach）。
+        let flash = self.flash.clone();
+        self.bus
+            .lock()
+            .unwrap()
+            .attach(0x4002_3C00, 0x100, "FLASH", flash)?;
         // CanFrame 事件 → 路由到对端 CAN（CAN1↔CAN2 互联；feed_rx 只挂 IRQ 不发布，
         // 无事件重入死锁风险）
         let c1 = self.can1.clone();
@@ -950,6 +960,8 @@ impl Machine {
             move |ev: &Event| {
                 if let Event::CanFrame { frame } = ev {
                     match frame.port {
+                        // 总线级互联：对端接收（CAN1↔CAN2）。发送端回环（LBKM）
+                        // 在 Can::transmit 内自行 feed_rx，不经此处（避免锁重入）。
                         1 => c2.lock().unwrap().feed_rx((**frame).clone()),
                         2 => c1.lock().unwrap().feed_rx((**frame).clone()),
                         _ => {}

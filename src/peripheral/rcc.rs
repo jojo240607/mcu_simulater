@@ -53,6 +53,8 @@ const CR_HSEON: u32 = 1 << 16;
 const CR_HSERDY: u32 = 1 << 17;
 const CR_PLLON: u32 = 1 << 24;
 const CR_PLLRDY: u32 = 1 << 25;
+const CR_PLLI2SON: u32 = 1 << 26;
+const CR_PLLI2SRDY: u32 = 1 << 27;
 
 /// CSR 复位标志位（F407 硬件位）
 /// - bit31 LPWRRSTF：低功耗唤醒复位标志
@@ -229,6 +231,11 @@ impl Peripheral for Rcc {
                     cr |= CR_PLLRDY;
                 } else {
                     cr &= !CR_PLLRDY;
+                }
+                if cr & CR_PLLI2SON != 0 {
+                    cr |= CR_PLLI2SRDY;
+                } else {
+                    cr &= !CR_PLLI2SRDY;
                 }
                 *slot = cr;
                 self.recompute_sws(); // HSE/PLL 就绪状态变化可能影响 SWS

@@ -36,7 +36,7 @@ const OFF_RESPCMD: u32 = 0x10;
 const OFF_RESP1: u32 = 0x14;
 const OFF_DLEN: u32 = 0x28;
 const OFF_DCTRL: u32 = 0x2C;
-const OFF_STATUS: u32 = 0x38;
+const OFF_STATUS: u32 = 0x34; // F4: STA@0x34
 const OFF_FIFO: u32 = 0x80;
 
 /// 位定义（与 src/peripheral/sdio.rs 一致）
@@ -153,7 +153,7 @@ fn m14_sdio_bus_cmd() {
 
     // CMD0（无响应）：清状态后写 → 仅 CMDSENT，无 CMDREND
     bus.lock().unwrap().write(SDIO_BASE + OFF_STATUS, 4, 0x0).unwrap_err(); // 只读
-    bus.lock().unwrap().write(SDIO_BASE + 0x3C, 4, 0x3FF).unwrap(); // ICR 清 bit0-9
+    bus.lock().unwrap().write(SDIO_BASE + 0x38, 4, 0x3FF).unwrap(); // ICR@0x38 清 bit0-9
     bus.lock()
         .unwrap()
         .write(SDIO_BASE + OFF_CMD, 4, 0 | CMD_CPSMEN)
