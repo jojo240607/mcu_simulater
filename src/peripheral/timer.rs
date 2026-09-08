@@ -90,6 +90,9 @@ pub struct TimerConfig {
     /// 基本定时器（TIM6/7）= 0（仅时基 + 更新事件）
     pub channels: u8,
     pub irq: TimerIrq,
+    /// 定时器内核时钟（F407：APB1 定时器 84MHz，APB2 定时器 168MHz）。
+    /// 模拟器全局虚拟时钟按 84MHz 折算；168MHz 定时器 tick 时钟 ×2。
+    pub clk_hz: u32,
 }
 
 /// CR1 控制位
@@ -176,6 +179,8 @@ pub struct Timer {
     pub bits: u32,
     /// 中断表
     pub irq: TimerIrq,
+    /// 定时器内核时钟（折算 tick 频率用）
+    clk_hz: u32,
     /// 寄存器文件（CR1..DMAR 共 20 个 32 位寄存器）
     regs: [u32; REG_COUNT],
     /// 计数器时钟余数（PSC 分频的亚周期累积）
@@ -229,6 +234,7 @@ impl Timer {
             kind: cfg.kind,
             bits: cfg.bits,
             irq: cfg.irq,
+            clk_hz: cfg.clk_hz,
             regs: [0; REG_COUNT],
             prescaler_remainder: 0,
             dma_burst_index: 0,
@@ -705,6 +711,9 @@ impl Peripheral for Timer {
     }
 
     fn tick(&mut self, cycles: u64) {
+        // 168MHz（APB2）定时器按 2× 虚拟周期推进，使溢出间隔与真机一致
+        //（模拟器全局虚拟时钟按 84MHz 折算）。
+        let cycles = cycles.saturating_mul(self.clk_hz as u64 / 84_000_000);
         // 计数器未使能（CEN=0）时不推进；UDIS 仅禁止更新事件，计数器仍计数
         let cr1 = self.regs[OFF_CR1 as usize / 4];
         if cr1 & CR1_CEN == 0 {
@@ -787,6 +796,7 @@ mod tests {
             kind: TimerKind::General,
             bits: 32,
             channels: 4,
+            clk_hz: 84_000_000,
             irq: TimerIrq { brk: 28, up: 28, trig_com: 28, cc: 28 },
         };
         (Timer::new(2, cfg, bus.clone(), nvic.clone()), nvic, bus)
@@ -801,6 +811,7 @@ mod tests {
             kind: TimerKind::Advanced,
             bits: 16,
             channels: 4,
+            clk_hz: 84_000_000,
             irq: TimerIrq { brk: 24, up: 25, trig_com: 26, cc: 27 },
         };
         (Timer::new(1, cfg, bus.clone(), nvic.clone()), nvic, bus)
@@ -953,6 +964,7 @@ mod tests {
             kind: TimerKind::General,
             bits: 16,
             channels: 4,
+            clk_hz: 84_000_000,
             irq: TimerIrq { brk: 29, up: 29, trig_com: 29, cc: 29 },
         };
         let mut t3 = Timer::new(3, cfg, bus, nvic);
@@ -1196,6 +1208,7 @@ mod tests {
             kind: TimerKind::General,
             bits: 16,
             channels: 2,
+            clk_hz: 84_000_000,
             irq: TimerIrq { brk: 24, up: 24, trig_com: 24, cc: 24 }, // 共享 TIM1_BRK 行
         };
         let mut t9 = Timer::new(9, cfg, bus, nvic.clone());
@@ -1232,6 +1245,7 @@ mod tests {
             bits: 16,
             channels: 1,
             irq: TimerIrq { brk: 25, up: 25, trig_com: 25, cc: 25 }, // 共享 TIM1_UP 行
+            clk_hz: 84_000_000,
         };
         let mut t10 = Timer::new(10, cfg, bus10, nvic.clone());
         assert_eq!(t10.channels(), 1, "TIM10 应为 1 通道");
@@ -1260,6 +1274,7 @@ mod tests {
             bits: 16,
             channels: 0,
             irq: TimerIrq { brk: 54, up: 54, trig_com: 54, cc: 54 },
+            clk_hz: 84_000_000,
         };
         let mut t = Timer::new(6, cfg, bus, nvic.clone());
         t.write(OFF_PSC, 4, 0).unwrap();

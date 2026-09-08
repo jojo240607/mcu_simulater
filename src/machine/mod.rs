@@ -1034,39 +1034,40 @@ impl Machine {
         // （TIM9↔TIM1_BRK24、TIM10↔TIM1_UP25、TIM11↔TIM1_TRG_COM26、
         // TIM12↔TIM8_BRK43、TIM13↔TIM8_UP44、TIM14↔TIM8_TRG_COM45）。
         // 更新事件 DMA 映射采用 HAL 默认流（TIM1/8 → DMA2，TIM2-7 → DMA1）。
-        let tim_cfgs: &[(u8, u32, &str, TimerKind, u32, u8, TimerIrq)] = &[
-            // (port, base, name, kind, bits, channels, irq)
+        // (port, base, name, kind, bits, channels, irq, clk_hz)
+        let tim_cfgs: &[(u8, u32, &str, TimerKind, u32, u8, TimerIrq, u32)] = &[
+            // APB2 定时器（TIM1/8/9/10/11）168MHz，其余 APB1 84MHz。
             (1, 0x4001_0000, "TIM1", TimerKind::Advanced, 16, 4,
-             TimerIrq { brk: 24, up: 25, trig_com: 26, cc: 27 }),
+             TimerIrq { brk: 24, up: 25, trig_com: 26, cc: 27 }, 168_000_000),
             (2, 0x4000_0000, "TIM2", TimerKind::General, 32, 4,
-             TimerIrq { brk: 28, up: 28, trig_com: 28, cc: 28 }),
+             TimerIrq { brk: 28, up: 28, trig_com: 28, cc: 28 }, 84_000_000),
             (3, 0x4000_0400, "TIM3", TimerKind::General, 16, 4,
-             TimerIrq { brk: 29, up: 29, trig_com: 29, cc: 29 }),
+             TimerIrq { brk: 29, up: 29, trig_com: 29, cc: 29 }, 84_000_000),
             (4, 0x4000_0800, "TIM4", TimerKind::General, 16, 4,
-             TimerIrq { brk: 30, up: 30, trig_com: 30, cc: 30 }),
+             TimerIrq { brk: 30, up: 30, trig_com: 30, cc: 30 }, 84_000_000),
             (5, 0x4000_0C00, "TIM5", TimerKind::General, 32, 4,
-             TimerIrq { brk: 50, up: 50, trig_com: 50, cc: 50 }),
+             TimerIrq { brk: 50, up: 50, trig_com: 50, cc: 50 }, 84_000_000),
             (6, 0x4000_1000, "TIM6", TimerKind::Basic, 16, 0,
-             TimerIrq { brk: 54, up: 54, trig_com: 54, cc: 54 }),
+             TimerIrq { brk: 54, up: 54, trig_com: 54, cc: 54 }, 84_000_000),
             (7, 0x4000_1400, "TIM7", TimerKind::Basic, 16, 0,
-             TimerIrq { brk: 55, up: 55, trig_com: 55, cc: 55 }),
+             TimerIrq { brk: 55, up: 55, trig_com: 55, cc: 55 }, 84_000_000),
             (8, 0x4001_0400, "TIM8", TimerKind::Advanced, 16, 4,
-             TimerIrq { brk: 43, up: 44, trig_com: 45, cc: 46 }),
+             TimerIrq { brk: 43, up: 44, trig_com: 45, cc: 46 }, 168_000_000),
             (9, 0x4001_4000, "TIM9", TimerKind::General, 16, 2,
-             TimerIrq { brk: 24, up: 24, trig_com: 24, cc: 24 }),
+             TimerIrq { brk: 24, up: 24, trig_com: 24, cc: 24 }, 168_000_000),
             (10, 0x4001_4400, "TIM10", TimerKind::General, 16, 1,
-             TimerIrq { brk: 25, up: 25, trig_com: 25, cc: 25 }),
+             TimerIrq { brk: 25, up: 25, trig_com: 25, cc: 25 }, 168_000_000),
             (11, 0x4001_4800, "TIM11", TimerKind::General, 16, 1,
-             TimerIrq { brk: 26, up: 26, trig_com: 26, cc: 26 }),
+             TimerIrq { brk: 26, up: 26, trig_com: 26, cc: 26 }, 168_000_000),
             (12, 0x4000_1800, "TIM12", TimerKind::General, 16, 2,
-             TimerIrq { brk: 43, up: 43, trig_com: 43, cc: 43 }),
+             TimerIrq { brk: 43, up: 43, trig_com: 43, cc: 43 }, 84_000_000),
             (13, 0x4000_1C00, "TIM13", TimerKind::General, 16, 1,
-             TimerIrq { brk: 44, up: 44, trig_com: 44, cc: 44 }),
+             TimerIrq { brk: 44, up: 44, trig_com: 44, cc: 44 }, 84_000_000),
             (14, 0x4000_2000, "TIM14", TimerKind::General, 16, 1,
-             TimerIrq { brk: 45, up: 45, trig_com: 45, cc: 45 }),
+             TimerIrq { brk: 45, up: 45, trig_com: 45, cc: 45 }, 84_000_000),
         ];
-        for (port, base, name, kind, bits, channels, irq) in tim_cfgs {
-            let cfg = TimerConfig { name, kind: *kind, bits: *bits, channels: *channels, irq: *irq };
+        for (port, base, name, kind, bits, channels, irq, clk_hz) in tim_cfgs {
+            let cfg = TimerConfig { name, kind: *kind, bits: *bits, channels: *channels, irq: *irq, clk_hz: *clk_hz };
             let tim_active = Arc::new(AtomicBool::new(false));
             let tim = Arc::new(Mutex::new(Timer::with_active(
                 *port,
