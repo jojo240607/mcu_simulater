@@ -123,5 +123,21 @@ fn drvtest_all_drivers_pass() {
     assert!(total >= 20, "用例总数异常（total={total}）");
     assert_eq!(fail, 0, "存在驱动用例失败（fail={fail}，pass={pass}，skip={skip}）");
     assert_eq!(pass, total - skip, "pass 数不吻合（total={total} pass={pass} skip={skip}）");
+
+    // 宿主字节级判据（C 类 uart DMA TX 真机判据）：uart0 DMA TX 的模式串必须
+    // 以完整 48 字节序列出现在虚拟主机（console）的原始接收缓冲里——证明数据
+    // **真实从 TX 发出**（到达终端侧），而非仅写入 USART 数据寄存器。模式串与
+    // d_uart::uart0_dma_tx_real 完全一致：18 字节标记头 + 30 字节递增字节。
+    {
+        let mut pattern: Vec<u8> = b"DRVTEST-DMA-TX-REAL:".to_vec();
+        // 与 d_uart::uart0_dma_tx_real 完全一致：20 字节标记头 + 28 字节递增
+        //（App 侧 skip(hdr.len())=skip(20)，首递增字节 i=20 → 0x9C）。
+        for i in 20u8..48 {
+            pattern.push(i.wrapping_mul(7).wrapping_add(0x10));
+        }
+        let found = out.windows(pattern.len()).any(|w| w == pattern.as_slice());
+        assert!(found, "宿主未捕获到 uart0 DMA TX 模式串（{pattern:?}）——数据未真实发出");
+        eprintln!(">>> 宿主捕获 uart0 DMA TX 模式串（{}B，字节级一致）", pattern.len());
+    }
     eprintln!(">>> 验收通过：{pass}/{total} 通过，{skip} 跳过，0 失败");
 }
