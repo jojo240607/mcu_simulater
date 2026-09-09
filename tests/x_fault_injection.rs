@@ -95,7 +95,7 @@ fn nack_from_boot_fdir_critical() {
     let mut baro_ok = false;
     let mut crit_seen = false;
     let mut panic_seen = false;
-    for step in 0..1200u32 {
+    for step in 0..2000u32 {
         if t_start.elapsed().as_secs() > 300 {
             break;
         }

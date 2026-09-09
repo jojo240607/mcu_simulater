@@ -264,14 +264,14 @@ fn build_i2c_slave(
     node: &TopologyNode,
 ) -> Result<Box<dyn crate::peripheral::vperiph::VirtualI2cSlave>, String> {
     use crate::peripheral::vperiph::data_source::{StaticBaro, StaticImu, StaticMag};
-    use crate::peripheral::vperiph::models;
+    use crate::peripheral::vperiph::i2c::{bmp280, mpu6050, qmc5883};
     let boxed: Box<dyn crate::peripheral::vperiph::VirtualI2cSlave> = match (
         node.model.as_str(),
         node.source.as_str(),
     ) {
-        ("mpu6050", "imu") => Box::new(models::mpu6050(StaticImu::default())),
-        ("bmp280", "baro") => Box::new(models::bmp280(StaticBaro::default())),
-        ("qmc5883", "mag") => Box::new(models::qmc5883(StaticMag::default())),
+        ("mpu6050", "imu") => Box::new(mpu6050(StaticImu::default())),
+        ("bmp280", "baro") => Box::new(bmp280(StaticBaro::default())),
+        ("qmc5883", "mag") => Box::new(qmc5883(StaticMag::default())),
         (m, s) => {
             return Err(format!(
                 "[i2c_slave] `{}` 不支持的 model/source 组合: ({m}, {s})（支持 mpu6050/imu、bmp280/baro、qmc5883/mag）",

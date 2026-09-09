@@ -50,7 +50,7 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
     let mut baro_ok = false;
     let mut gps_ok = false;
     let mut panic_seen = false;
-    for step in 0..800u32 {
+    for step in 0..2000u32 {
         if t_start.elapsed().as_secs() > 300 {
             eprintln!(">>> 超时（300s）终止");
             break;

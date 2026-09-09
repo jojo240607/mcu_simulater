@@ -150,6 +150,9 @@ pub struct Machine {
     run_iterations: std::cell::Cell<u64>,
     /// 退休指令计数（block hook 累加，run() 每轮据此递减 count 预算，保证正常终止）
     retired_insts: Arc<AtomicU64>,
+    /// 上一次推进虚拟从设备时钟时的退休指令数（run() 起点按 Δretired 推进，
+    /// 与 emu 段数解耦——修复：段数随中断风暴膨胀会把虚拟时间/推流速率自放大）
+    last_virt_retired: std::cell::Cell<u64>,
     /// 异常入场计数（按向量号，诊中断暴风/唤醒停滞用；Switch 停机每进一次加 1）
     vec_entries: std::cell::RefCell<Vec<u64>>,
     /// 最近一次异常抢占前的 PC（= 被中断块的 PC，诊在何处不停被抢）
@@ -242,6 +245,7 @@ impl Machine {
             entry: 0,
             run_iterations: std::cell::Cell::new(0),
             retired_insts: Arc::new(AtomicU64::new(0)),
+            last_virt_retired: std::cell::Cell::new(0),
             vec_entries: std::cell::RefCell::new(vec![0u64; 97]),
             last_switch_pc: std::cell::Cell::new(0),
         })
@@ -362,7 +366,7 @@ impl Machine {
     /// 便捷装配：把默认 3 个 I2C 传感器（mpu6050/bmp280/qmc5883）挂到 i2c1。
     pub fn attach_default_sensors(&self) {
         use crate::peripheral::vperiph::data_source::{StaticBaro, StaticImu, StaticMag};
-        use crate::peripheral::vperiph::models::{bmp280, mpu6050, qmc5883};
+        use crate::peripheral::vperiph::i2c::{bmp280, mpu6050, qmc5883};
         self.register_i2c_slave(1, Box::new(mpu6050(StaticImu::default())));
         self.register_i2c_slave(1, Box::new(bmp280(StaticBaro::default())));
         self.register_i2c_slave(1, Box::new(qmc5883(StaticMag::default())));
@@ -1831,6 +1835,19 @@ impl Machine {
         // ~25-52K 指令/段），1M 段 × 每段 ~40ms = 永不返回。现在每轮按实际退休量递减，
         // count 耗尽即正常返回；风暴护栏仅作为"段内 0 退休"的异常风暴安全网。
         let retired_base = self.retired_insts.load(Ordering::Relaxed);
+
+        // 虚拟从设备时钟按退役指令数推进（每个 run() 一次）：
+        //   dt = Δretired / VIRT_INSN_PER_SEC。口径 = 当前非风暴稳态（~13 段 × 1ms
+        //   每 run(400K) → ~30M 指令/虚拟秒）。段内逐段推进（旧实现每段 dt=0.001）
+        //   会在中断风暴下自放大：段数膨胀 → 虚拟时间膨胀 → 推流字节膨胀 → 更多中断。
+        //   改为指令基准后推流速率恒定（GPS 20Hz / SBUS 100Hz），与中断频率无关。
+        const VIRT_INSN_PER_SEC: f32 = 30.0e6;
+        let retired_now = self.retired_insts.load(Ordering::Relaxed);
+        let dt = (retired_now - self.last_virt_retired.get()) as f32 / VIRT_INSN_PER_SEC;
+        self.last_virt_retired.set(retired_now);
+        self.step_virtual_slaves(dt);
+        self.step_virtual_uart(dt);
+
         let mut remaining = count;
         while remaining > 0 {
             let iters = self.run_iterations.get();
@@ -1868,11 +1885,6 @@ impl Machine {
             // DMA 内存搬运：CPU 空闲间隙执行（tick 已把完成流登记到待搬运位图）
             self.dma.lock().unwrap().process(&mut self.cpu);
             self.dma2.lock().unwrap().process(&mut self.cpu);
-
-            // 虚拟外设推进：I2C 从设备 Math 模型步进 + UART 推流从设备
-            // （GPS NMEA / SBUS）按迭代步进（固定 dt≈1ms/迭代；帧率不需精确，固件读走即可）
-            self.step_virtual_slaves(0.001);
-            self.step_virtual_uart(0.001);
 
             let reason = self.nvic.lock().unwrap().take_stop_reason();
             match reason {

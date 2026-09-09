@@ -9,12 +9,33 @@
 //! - **数据源**：Constant（固定寄存器值/WHO_AM_I）+ Math（物理模型，随仿真时间
 //!   推进 step）；后续可扩展 Replay（真机数据回放）/Script（脚本注入）。
 //!
+//! # 目录组织（一器件一文件）
+//!
+//! ```text
+//! vperiph/
+//! ├── mod.rs          总线从设备 trait + RegFileSlave（通用寄存器文件从设备）
+//! ├── data_source.rs  DataSource（Const/Math）+ SensorModel + 静态物理模型
+//! ├── i2c/             I2C 总线从设备器件（一器件一文件）
+//! │   ├── mod.rs       子模块声明 + 工厂 re-export + default_i2c_slaves()
+//! │   ├── mpu6050.rs   六轴 IMU @0x68
+//! │   ├── bmp280.rs    气压 @0x76
+//! │   └── qmc5883.rs   磁力 @0x0D
+//! └── uart/             UART 推流从设备器件（一器件一文件）
+//!     ├── mod.rs       VirtualUartSlave trait + NMEA 工具 + re-export
+//!     ├── nmea_gps.rs  $GNGGA 推流 GPS
+//!     └── sbus.rs      SBUS 遥控帧
+//! ```
+//!
+//! **新增器件**：在 `i2c/`（或 `uart/`）下新建 `<device>.rs`（寄存器布局/帧构造 +
+//! 工厂函数 + 单元测试），在对应 `mod.rs` 加 `pub mod <device>;` + re-export；
+//! 总线外设只依赖 trait，与具体器件解耦。
+//!
 //! 首批覆盖（对齐 flyctrl real-sensors 全链路）：
 //! - I2C：mpu6050(0x68) / bmp280(0x76) / qmc5883(0x0D)
-//! - UART：ublox gps(usart1) / sbus(usart2) —— 见 `uart.rs`（推流）
+//! - UART：ublox gps(usart1) / sbus(usart2)
 
 pub mod data_source;
-pub mod models;
+pub mod i2c;
 pub mod uart;
 
 use data_source::DataSource;
@@ -218,94 +239,5 @@ impl VirtualI2cSlave for RegFileSlave {
         let v = self.regs[idx];
         self.ptr = self.ptr.wrapping_add(1);
         Some(v)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::peripheral::vperiph::data_source::{StaticBaro, StaticImu, StaticMag};
-    use crate::peripheral::vperiph::models::{bmp280, mpu6050, qmc5883};
-
-    /// 模拟固件 `i2c_write_read(addr, reg, n)`：写事务设寄存器指针 → 读事务连续读。
-    fn write_read(slave: &mut dyn VirtualI2cSlave, reg: u8, n: usize) -> Vec<u8> {
-        slave.on_start(I2cDir::Write);
-        slave.on_write(reg);
-        slave.on_start(I2cDir::Read);
-        (0..n).map(|_| slave.on_read().unwrap()).collect()
-    }
-
-    #[test]
-    fn mpu6050_static_hover_registers() {
-        let mut s = mpu6050(StaticImu::default());
-        // WHO_AM_I
-        assert_eq!(s.peek(0x75), Some(0x68));
-        // i2c_write_read(0x3B, 14)：accel BE i16 + temp + gyro BE i16
-        let raw = write_read(&mut s, 0x3B, 14);
-        // accel.z = 9.81 → raw = 16384 = 0x4000（BE 高字节在前）
-        assert_eq!(&raw[4..6], &[0x40, 0x00], "accel.z 应为 +1g");
-        // accel.x/y = 0
-        assert_eq!(&raw[0..2], &[0x00, 0x00]);
-        assert_eq!(&raw[2..4], &[0x00, 0x00]);
-        // gyro 全 0
-        assert_eq!(&raw[8..14], &[0u8; 6]);
-    }
-
-    #[test]
-    fn mpu6050_write_pwr_mgmt() {
-        let mut s = mpu6050(StaticImu::default());
-        // 唤醒写：PWR_MGMT_1(0x6B) ← 0x00（写事务：寄存器地址 + 数据）
-        s.on_start(I2cDir::Write);
-        s.on_write(0x6B);
-        s.on_write(0x00);
-        assert_eq!(s.peek(0x6B), Some(0x00));
-        assert_eq!(s.n_writes, 2);
-    }
-
-    #[test]
-    fn bmp280_pressure_read() {
-        let mut s = bmp280(StaticBaro::default());
-        assert_eq!(s.peek(0xD0), Some(0x58)); // ID
-        // i2c_write_read(0xF7, 6)：20bit 压力原始值（Pa<<4）
-        let raw = write_read(&mut s, 0xF7, 6);
-        let p20 = ((raw[0] as u32) << 16) | ((raw[1] as u32) << 8) | (raw[2] as u32);
-        let p = p20 >> 4;
-        assert_eq!(p, 101_325, "压力原始值应为海平面气压");
-    }
-
-    #[test]
-    fn qmc5883_le_mag_read() {
-        let mut s = qmc5883(StaticMag::default());
-        // i2c_write_read(0x00, 6)：LE i16 三轴
-        let raw = write_read(&mut s, 0x00, 6);
-        // mag.x = 0.2G → raw = 0.2*32768/2 = 3276.8 → 截断 3276（LE：低字节在前）
-        let x = i16::from_le_bytes([raw[0], raw[1]]);
-        assert_eq!(x, 3276, "mag.x 0.2G → raw 3276");
-        // mag.z = 0.4G → 6553.6 → 截断 6553
-        let z = i16::from_le_bytes([raw[4], raw[5]]);
-        assert_eq!(z, 6553, "mag.z 0.4G → raw 6553");
-    }
-
-    #[test]
-    fn nack_injection_returns_none() {
-        let mut s = mpu6050(StaticImu::default());
-        s.on_start(I2cDir::Write);
-        s.on_write(0x3B);
-        s.on_start(I2cDir::Read);
-        s.nack = true; // 故障注入：断线
-        assert!(s.on_read().is_none());
-    }
-
-    #[test]
-    fn read_preserves_pointer_across_transactions() {
-        // 真实硬件：寄存器指针跨事务保持（写设指针 → 读直接从指针吐）
-        let mut s = bmp280(StaticBaro::default());
-        s.on_start(I2cDir::Write);
-        s.on_write(0xF7);
-        // 读事务直接读，无需再写寄存器地址
-        s.on_start(I2cDir::Read);
-        let first = s.on_read().unwrap();
-        let p20 = ((first as u32) << 16) | ((s.on_read().unwrap() as u32) << 8) | (s.on_read().unwrap() as u32);
-        assert_eq!(p20 >> 4, 101_325);
     }
 }
