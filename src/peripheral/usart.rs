@@ -17,9 +17,12 @@
 
 use std::sync::{Arc, Mutex};
 
+use std::collections::VecDeque;
+
 use crate::events::{Event, EventBus};
 use crate::peripheral::dma::DmaDir;
 use crate::peripheral::nvic::Nvic;
+use crate::peripheral::vperiph::uart::VirtualUartSlave;
 use crate::peripheral::{BusError, Peripheral};
 
 /// USART NVIC IRQ（STM32F407）
@@ -35,12 +38,14 @@ const SR_TXE: u32 = 1 << 7;  // 发送数据寄存器空
 const SR_TC: u32 = 1 << 6;   // 发送完成
 const SR_RXNE: u32 = 1 << 5; // 接收数据寄存器非空
 const SR_ORE: u32 = 1 << 3;  // 过载错误
+const SR_IDLE: u32 = 1 << 4; // 空闲线路（帧结束标记；读 SR 后清）
 
 /// CR1 控制位
 const CR1_UE: u32 = 1 << 13;    // 使能
 const CR1_RE: u32 = 1 << 2;     // 接收使能
 const CR1_TE: u32 = 1 << 3;     // 发送使能
 const CR1_RXNEIE: u32 = 1 << 5; // RXNE 中断使能
+const CR1_IDLEIE: u32 = 1 << 4; // IDLE 中断使能（帧结束 → 固件 flush ring）
 const CR1_TCIE: u32 = 1 << 6;   // TC 中断使能
 const CR1_TXEIE: u32 = 1 << 7;  // TXE 中断使能
 
@@ -68,6 +73,12 @@ pub struct Usart {
     bus: Arc<Mutex<EventBus>>,
     /// NVIC（RXNE/TC/TXE → 置挂起）
     nvic: Arc<Mutex<Nvic>>,
+    /// 虚拟 UART 从设备（推流：GPS NMEA / SBUS 遥控帧）
+    slaves: Vec<Box<dyn VirtualUartSlave>>,
+    /// 虚拟推流 RX FIFO：从设备字节排队，固件逐字节读走（不因 RXNE 未清而 ORE 丢弃）。
+    /// 模拟硬件 USART 数据寄存器被 DMA/中断及时搬走的语义；POLL 读（uart_hal_read_dr）
+    /// 与 DMA 读（PeriphToMem 读 DR）都从队首消费。
+    rx_fifo: VecDeque<u8>,
 }
 
 impl Usart {
@@ -84,7 +95,37 @@ impl Usart {
             rx_byte: 0,
             bus,
             nvic,
+            slaves: Vec::new(),
+            rx_fifo: VecDeque::new(),
         }
+    }
+
+    /// 注册虚拟 UART 从设备（推流：GPS NMEA / SBUS）。
+    pub fn register_slave(&mut self, slave: Box<dyn VirtualUartSlave>) {
+        self.slaves.push(slave);
+    }
+
+    /// 从设备表（观测）。
+    pub fn slaves(&self) -> &[Box<dyn VirtualUartSlave>] {
+        &self.slaves
+    }
+
+    /// 推进所有 UART 从设备（`dt` 秒），收集推流字节（不喂入）。
+    ///
+    /// 返回本次推流的字节；由 Machine 直路由喂入（feed_rx + DMA 搬运），
+    /// 不经事件总线（避免每字节全订阅者分发 + 锁开销）。
+    pub fn collect_slave_bytes(&mut self, dt: f32) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        if self.slaves.is_empty() {
+            return out;
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        for sl in &mut self.slaves {
+            buf.clear();
+            sl.step(dt, &mut |b| buf.push(b));
+            out.extend_from_slice(&buf);
+        }
+        out
     }
 
     /// 发送字节（发布 UartByte 事件；仅 TE+UE 生效）
@@ -94,6 +135,16 @@ impl Usart {
             byte,
         };
         self.bus.lock().unwrap().publish(&ev);
+    }
+
+    /// 帧结束通知（虚拟推流从设备推完一帧后由 Machine 调用）：
+    /// 置 SR.IDLE + 按 IDLEIE 挂起中断——固件 IDLE ISR 读 SR/DR 清 IDLE 并
+    /// flush 环形 DMA 缓冲（uart_idle_flush），read() 才有字节可读。
+    pub fn notify_frame_end(&mut self) {
+        self.regs[0] |= SR_IDLE;
+        if self.regs[3] & CR1_IDLEIE != 0 {
+            self.nvic.lock().unwrap().set_pending(self.irq);
+        }
     }
 
     /// RXNE/ORE 置位后按 RXNEIE 挂起中断（RM：RXNE 中断事件含 ORE）
@@ -126,6 +177,26 @@ impl Usart {
         // （见 [`Usart::dma_rx_pending`]）。
     }
 
+    /// 虚拟推流注入接收字节：入队 + 置 RXNE（不因未读走而 ORE 丢弃）。
+    ///
+    /// 真实硬件上 USART DR 由 DMA/中断及时搬走，字节不会积压；虚拟从设备整帧
+    /// 推流时模拟器无法模拟逐字节时序，故用 FIFO 缓冲，固件逐字节读走。
+    /// 仅 UE+RE 使能时接收（与 [`Usart::feed_rx`] 相同门槛）。
+    pub fn feed_rx_queued(&mut self, byte: u8) {
+        let cr1 = self.regs[3];
+        if (cr1 & (CR1_UE | CR1_RE)) != (CR1_UE | CR1_RE) {
+            return;
+        }
+        self.rx_fifo.push_back(byte);
+        self.regs[0] |= SR_RXNE;
+        self.set_pending_if_rx();
+    }
+
+    /// 虚拟推流 FIFO 当前长度（观测/断言：固件是否消费了推流字节）。
+    pub fn rx_fifo_len(&self) -> usize {
+        self.rx_fifo.len()
+    }
+
     /// 是否有待 DMA 搬运的接收请求（CR3.DMAR 使能且 RXNE 置位）。
     ///
     /// 供 Machine 在 feed_rx 之后直接路由 RX DMA（避免在事件分发内二次 publish）。
@@ -140,11 +211,19 @@ impl Usart {
 
     /// DMA 读 DR（外设→内存方向）：返回接收字节并清 RXNE。
     ///
-    /// 与 CPU 读 DR 同语义（读清 RXNE），供 DMA 控制器搬运调用。
+    /// 与 CPU 读 DR 同语义（读清 RXNE，虚拟推流 FIFO 优先），供 DMA 控制器搬运调用。
     pub fn dma_read_dr(&mut self) -> u32 {
-        let byte = self.rx_byte;
-        self.regs[0] &= !SR_RXNE;
-        byte as u32
+        if let Some(b) = self.rx_fifo.pop_front() {
+            self.rx_byte = b;
+            if !self.rx_fifo.is_empty() {
+                self.regs[0] |= SR_RXNE; // 还有字节：DMA 可继续请求
+            } else {
+                self.regs[0] &= !SR_RXNE;
+            }
+        } else {
+            self.regs[0] &= !SR_RXNE;
+        }
+        self.rx_byte as u32
     }
 
     /// DMA 写 DR（内存→外设方向）：发送一字节并置 TXE/TC（仿真快速发送）。
@@ -198,12 +277,22 @@ impl Peripheral for Usart {
             return Err(BusError::NotImplemented);
         }
         match offset {
-            OFF_SR => Ok(self.regs[0]),
+            OFF_SR => {
+                // 读 SR 返回状态字；IDLE 位读后清（简化：避免 IDLEIE 反复触发）
+                self.regs[0] &= !SR_IDLE;
+                Ok(self.regs[0])
+            }
             OFF_DR => {
-                // 读 DR 返回接收字节并清 RXNE
-                let v = self.rx_byte as u32;
-                self.regs[0] &= !SR_RXNE;
-                Ok(v)
+                // 读 DR 返回接收字节并清 RXNE；虚拟推流 FIFO 优先（固件逐字节消费）
+                if let Some(b) = self.rx_fifo.pop_front() {
+                    self.rx_byte = b;
+                    if self.rx_fifo.is_empty() {
+                        self.regs[0] &= !SR_RXNE;
+                    }
+                } else {
+                    self.regs[0] &= !SR_RXNE;
+                }
+                Ok(self.rx_byte as u32)
             }
             0x08..=0x18 => Ok(self.regs[(offset / 4) as usize]),
             _ => Err(BusError::OutOfRange),

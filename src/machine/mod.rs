@@ -115,6 +115,10 @@ pub struct Machine {
     pub fsmc: Arc<Mutex<Fsmc>>,
     /// SDIO 安全数字 IO（@0x40012C00；命令/响应 + FIFO + DMA2 + IRQ49 + 虚拟 SD 卡）
     pub sdio: Arc<Mutex<Sdio>>,
+    /// I2C1-3 外设句柄（index = port-1；虚拟从设备挂载点，总线协议级直路由）
+    pub i2c: Arc<Mutex<Vec<Arc<Mutex<I2c>>>>>,
+    /// USART1-6 外设句柄（index = port-1；UART 虚拟从设备挂载点，推流）
+    pub usart: Arc<Mutex<Vec<Arc<Mutex<Usart>>>>>,
     /// CAN1 控制器局域网（@0x40006400，APB1；邮箱/接收 FIFO/过滤 + CanFrame 总线互联）
     pub can1: Arc<Mutex<Can>>,
     /// CAN2 控制器局域网（@0x40006800，APB1；同上，与 CAN1 互联）
@@ -211,6 +215,8 @@ impl Machine {
             dcmi: Arc::new(Mutex::new(Dcmi::new(nvic.clone(), DCMI_IRQ))),
             fsmc: Arc::new(Mutex::new(Fsmc::new())),
             sdio: Arc::new(Mutex::new(Sdio::new(events.clone(), nvic.clone()))),
+            i2c: Arc::new(Mutex::new(Vec::new())),
+            usart: Arc::new(Mutex::new(Vec::new())),
             can1: Arc::new(Mutex::new(Can::new(1, Some(events.clone()), nvic.clone()))),
             can2: Arc::new(Mutex::new(Can::new(2, Some(events.clone()), nvic.clone()))),
             flash: Arc::new(Mutex::new(Flash::new())),
@@ -243,6 +249,110 @@ impl Machine {
 
     /// 映射 STM32F407VET6 基础内存布局（FLASH + SRAM1/SRAM2 + CCM + SCB + T1 外设区）。
     /// M3 起由 DSL 配置驱动，此处为 M0/M1/M2 固化布局 + M3 T1 外设集。
+    /// 注册 I2C 虚拟从设备（总线协议级直路由挂载）。
+    ///
+    /// `port` = I2C 端口（1/2/3）。多个从设备可挂同一总线（地址区分）。
+    pub fn register_i2c_slave(&self, port: u8, slave: Box<dyn crate::peripheral::vperiph::VirtualI2cSlave>) {
+        let idx = (port as usize).saturating_sub(1);
+        if let Some(i) = self.i2c.lock().unwrap().get(idx) {
+            i.lock().unwrap().register_slave(slave);
+        }
+    }
+
+    /// 推进所有虚拟从设备（仿真时间 `dt` 秒；Math 数据源步进 / UART 推流节拍）。
+    pub fn step_virtual_slaves(&self, dt: f32) {
+        for i in self.i2c.lock().unwrap().iter() {
+            i.lock().unwrap().step_slaves(dt);
+        }
+    }
+
+    /// 注册 UART 虚拟从设备（推流：GPS NMEA / SBUS）。
+    pub fn register_uart_slave(&self, port: u8, slave: Box<dyn crate::peripheral::vperiph::uart::VirtualUartSlave>) {
+        let idx = (port as usize).saturating_sub(1);
+        if let Some(u) = self.usart.lock().unwrap().get(idx) {
+            u.lock().unwrap().register_slave(slave);
+        }
+    }
+
+    /// 注入 UART RX 字节（虚拟推流/测试直路由）：feed_rx + RX DMA 搬运路由。
+    ///
+    /// 与 Machine 的 `Event::UartRx` 订阅者同语义（DMA 模式 uart1/2 需在 feed_rx
+    /// 后路由 DMA 搬运，固件才能读到字节），但直调避免事件分发开销。
+    pub fn inject_uart_rx(&self, port: u8, byte: u8) {
+        let idx = (port as usize).saturating_sub(1);
+        let Some(u) = self.usart.lock().unwrap().get(idx).cloned() else {
+            return;
+        };
+        let mut uu = u.lock().unwrap();
+        uu.feed_rx_queued(byte);
+        if uu.dma_rx_pending() {
+            let (ctrl, stream, channel) = match port {
+                1 => (self.dma2.clone(), 2, 4),
+                2 => (self.dma.clone(), 5, 4),
+                3 => (self.dma.clone(), 1, 4),
+                4 => (self.dma.clone(), 2, 4),
+                5 => (self.dma.clone(), 0, 4),
+                6 => (self.dma2.clone(), 1, 5),
+                _ => return,
+            };
+            ctrl.lock().unwrap().service_stream(
+                stream,
+                channel,
+                DmaDir::PeriphToMem,
+                crate::peripheral::dma::DmaTarget::Usart(port),
+            );
+        }
+    }
+
+    /// 推进所有 UART 虚拟从设备（`dt` 秒：推流节拍），字节直路由喂入。
+    pub fn step_virtual_uart(&self, dt: f32) {
+        // 先收集各端口推流字节（避免 usart 表/句柄锁与 inject 重入冲突）
+        let mut feeds: Vec<(u8, Vec<u8>)> = Vec::new();
+        {
+            let uv = self.usart.lock().unwrap();
+            for u in uv.iter() {
+                let mut uu = u.lock().unwrap();
+                let bytes = uu.collect_slave_bytes(dt);
+                if !bytes.is_empty() {
+                    feeds.push((uu.port, bytes));
+                }
+            }
+        }
+        for (port, bytes) in feeds {
+            for b in &bytes {
+                self.inject_uart_rx(port, *b);
+            }
+            // 帧结束（虚拟从设备一次推一帧）→ IDLE 中断 → 固件 flush ring 可读
+            if let Some(u) = self
+                .usart
+                .lock()
+                .unwrap()
+                .get((port as usize).saturating_sub(1))
+            {
+                u.lock().unwrap().notify_frame_end();
+            }
+        }
+    }
+
+    /// 便捷装配：默认 UART 推流从设备。
+    ///
+    /// flyctrl real-sensors：gps 挂 uart1（USART2, port=2）、sbus 挂 uart2（USART3, port=3）。
+    pub fn attach_default_uart_slaves(&self) {
+        use crate::peripheral::vperiph::data_source::{StaticGps, StaticSbus};
+        use crate::peripheral::vperiph::uart::{NmeaGps, Sbus};
+        self.register_uart_slave(2, Box::new(NmeaGps::new(StaticGps::default())));
+        self.register_uart_slave(3, Box::new(Sbus::new(StaticSbus::default())));
+    }
+
+    /// 便捷装配：把默认 3 个 I2C 传感器（mpu6050/bmp280/qmc5883）挂到 i2c1。
+    pub fn attach_default_sensors(&self) {
+        use crate::peripheral::vperiph::data_source::{StaticBaro, StaticImu, StaticMag};
+        use crate::peripheral::vperiph::models::{bmp280, mpu6050, qmc5883};
+        self.register_i2c_slave(1, Box::new(mpu6050(StaticImu::default())));
+        self.register_i2c_slave(1, Box::new(bmp280(StaticBaro::default())));
+        self.register_i2c_slave(1, Box::new(qmc5883(StaticMag::default())));
+    }
+
     pub fn map_stm32f407_layout(&mut self) -> Result<()> {
         self.cpu.mem_map(0x0800_0000, 0x0008_0000, Prot::ALL)?; // FLASH 512KB
         self.cpu.mem_map(0x2000_0000, 0x0002_0000, Prot::ALL)?; // SRAM1+SRAM2 128KB
@@ -466,6 +576,7 @@ impl Machine {
             // 注册 USART 句柄到 DMA1/DMA2（外设方向搬运经句柄直接读写 DR）
             self.dma.lock().unwrap().register_usart(port, uart.clone());
             self.dma2.lock().unwrap().register_usart(port, uart.clone());
+            self.usart.lock().unwrap().push(uart.clone());
             // 虚拟终端/测试发布 UartRx → 对应端口 feed_rx；
             // RX DMA 请求在 feed_rx 之后直接路由（不能在 feed_rx 内二次 publish，
             // 否则事件分发回调中同线程重入 events.lock() 死锁，见 [`Usart::dma_rx_pending`]）
@@ -510,6 +621,7 @@ impl Machine {
                 .attach(base, 0x400, format!("I2C{port}"), i2c.clone())?;
             // 注册 I2C 句柄到 DMA1（I2C DMA 全在 DMA1，外设方向搬运经句柄直接读写 DR）
             self.dma.lock().unwrap().register_i2c(port, i2c.clone());
+            self.i2c.lock().unwrap().push(i2c.clone());
             // 测试/虚拟从机发布 I2cRx → 对应端口 feed_rx；
             // RX DMA 请求在 feed_rx 之后直接路由（不能在 feed_rx 内二次 publish，
             // 否则事件分发回调中同线程重入 events.lock() 死锁，见 [`I2c::dma_rx_pending`]）
@@ -1741,6 +1853,11 @@ impl Machine {
             // DMA 内存搬运：CPU 空闲间隙执行（tick 已把完成流登记到待搬运位图）
             self.dma.lock().unwrap().process(&mut self.cpu);
             self.dma2.lock().unwrap().process(&mut self.cpu);
+
+            // 虚拟外设推进：I2C 从设备 Math 模型步进 + UART 推流从设备
+            // （GPS NMEA / SBUS）按迭代步进（固定 dt≈1ms/迭代；帧率不需精确，固件读走即可）
+            self.step_virtual_slaves(0.001);
+            self.step_virtual_uart(0.001);
 
             let reason = self.nvic.lock().unwrap().take_stop_reason();
             match reason {

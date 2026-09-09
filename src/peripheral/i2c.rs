@@ -16,12 +16,21 @@
 //! 地址映射（I2C1 @ 0x40005400、I2C2 @ 0x40005800、I2C3 @ 0x40005C00，`offset` 相对基址）：
 //! - CR1 0x00 / CR2 0x04 / OAR1 0x08 / OAR2 0x0C / DR 0x10 / SR1 0x14 / SR2 0x18 /
 //!   CCR 0x1C / TRISE 0x20
+//!
+//! 事务级扩展（虚拟外设总线协议级模拟）：CPU 写 DR 路径按真实 master 事务解析——
+//! 写 CR1.START → SB 置位 + 进入地址阶段；写 DR（地址阶段）= 地址字节
+//! （addr7=R/W）→ 匹配 [`VirtualI2cSlave`]：命中置 ADDR（读 SR2 清）、未命中置 AF；
+//! 数据阶段写 → 直路由从设备 `on_write`；读方向（地址 bit0=1）读 SR2 清 ADDR 时
+//! 预取首字节置 RXNE，读 DR 返回并预取下一字节（连续流），供固件 POLL 驱动
+//! （joc-base stm32/i2c_hal.c 轮询 SB/ADDR/TXE/RXNE/BTF）直接跑通。
+//! DMA 路径（`dma_write_dr`/`dma_read_dr`）保持原简化语义（向后兼容既有 DMA 测试）。
 
 use std::sync::{Arc, Mutex};
 
 use crate::events::{Event, EventBus};
 use crate::peripheral::dma::DmaDir;
 use crate::peripheral::nvic::Nvic;
+use crate::peripheral::vperiph::{I2cDir, VirtualI2cSlave};
 use crate::peripheral::{BusError, Peripheral};
 
 /// I2C NVIC IRQ（STM32F407：EV = 事件中断、ER = 错误中断）
@@ -30,6 +39,9 @@ pub const I2C2_EV_IRQ: u32 = 33;
 pub const I2C3_EV_IRQ: u32 = 72;
 
 /// SR1 状态位
+const SR1_SB: u32 = 1 << 0;    // 起始位（START 已发送，等待地址）
+const SR1_ADDR: u32 = 1 << 1;  // 地址已发送/匹配（读 SR2 清除）
+const SR1_BTF: u32 = 1 << 2;   // 字节传输完成
 const SR1_TXE: u32 = 1 << 7;  // 发送数据寄存器空
 const SR1_RXNE: u32 = 1 << 6; // 接收数据寄存器非空
 const SR1_BERR: u32 = 1 << 8;  // 总线错误
@@ -38,7 +50,10 @@ const SR1_AF: u32 = 1 << 10;   // 应答失败
 const SR1_OVR: u32 = 1 << 11;  // 过载/欠载错误
 
 /// CR1 控制位
-const CR1_PE: u32 = 1 << 0; // 外设使能
+const CR1_PE: u32 = 1 << 0;    // 外设使能
+const CR1_ACK: u32 = 1 << 2;   // 应答使能
+const CR1_START: u32 = 1 << 8; // 起始位（写 1 发 START，硬件自清）
+const CR1_STOP: u32 = 1 << 9;  // 停止位
 
 /// CR2 控制位
 const CR2_ITEVTEN: u32 = 1 << 9;  // 事件中断使能
@@ -50,6 +65,7 @@ const OFF_CR1: u32 = 0x00;
 const OFF_CR2: u32 = 0x04;
 const OFF_DR: u32 = 0x10;
 const OFF_SR1: u32 = 0x14;
+const OFF_SR2: u32 = 0x18;
 
 /// 寄存器文件数（CR1/CR2/OAR1/OAR2/DR/SR1/SR2/CCR/TRISE）
 const REG_COUNT: usize = 9;
@@ -68,6 +84,14 @@ pub struct I2c {
     bus: Arc<Mutex<EventBus>>,
     /// NVIC（TxE/RxNE → 挂起 EV IRQ）
     nvic: Arc<Mutex<Nvic>>,
+    /// 虚拟从设备表（总线协议级：地址匹配直路由）
+    slaves: Vec<Box<dyn VirtualI2cSlave>>,
+    /// 地址阶段（写 CR1.START 后、地址字节期待中）
+    addr_phase: bool,
+    /// 当前事务方向（地址字节 bit0：1=读）
+    read_dir: bool,
+    /// 当前匹配从设备索引（地址阶段命中后）
+    cur_slave: Option<usize>,
 }
 
 impl I2c {
@@ -79,6 +103,90 @@ impl I2c {
             rx_byte: 0,
             bus,
             nvic,
+            slaves: Vec::new(),
+            addr_phase: false,
+            read_dir: false,
+            cur_slave: None,
+        }
+    }
+
+    /// 注册虚拟从设备（总线协议级；地址匹配直路由）。
+    pub fn register_slave(&mut self, slave: Box<dyn VirtualI2cSlave>) {
+        self.slaves.push(slave);
+    }
+
+    /// 从设备表（观测/step 推进用）。
+    pub fn slaves(&self) -> &[Box<dyn VirtualI2cSlave>] {
+        &self.slaves
+    }
+
+    /// 推进所有从设备（仿真时间推进 Math 数据源）。
+    pub fn step_slaves(&mut self, dt: f32) {
+        for s in &mut self.slaves {
+            s.step(dt);
+        }
+    }
+
+    /// 从设备数量（观测/断言）。
+    pub fn slave_count(&self) -> usize {
+        self.slaves.len()
+    }
+
+    /// 地址阶段匹配：按 addr7 找从设备（返回索引）。
+    fn match_slave(&self, addr7: u8) -> Option<usize> {
+        self.slaves
+            .iter()
+            .position(|s| s.addr7() == addr7)
+    }
+
+    /// 处理地址字节（地址阶段写 DR）：匹配 → ADDR；未命中 → AF。
+    fn handle_addr_byte(&mut self, byte: u8) {
+        let addr7 = byte >> 1;
+        let rw = byte & 1;
+        // START 阶段结束：清 SB，进入数据阶段
+        self.regs[5] &= !SR1_SB;
+        self.addr_phase = false;
+        self.read_dir = rw == 1;
+        if let Some(idx) = self.match_slave(addr7) {
+            self.cur_slave = Some(idx);
+            // 通知从设备事务开始（方向）
+            self.slaves[idx].on_start(if rw == 1 { I2cDir::Read } else { I2cDir::Write });
+            self.regs[5] |= SR1_ADDR; // 地址匹配 → ADDR（读 SR2 清）
+            self.regs[5] &= !SR1_AF;
+        } else {
+            self.cur_slave = None;
+            self.regs[5] &= !SR1_ADDR;
+            self.regs[5] |= SR1_AF; // 无此从设备 → AF（固件判"no such device"）
+        }
+    }
+
+    /// 数据阶段写：路由到从设备（写方向）。
+    fn handle_data_write(&mut self, byte: u8) {
+        if let Some(idx) = self.cur_slave {
+            self.slaves[idx].on_write(byte);
+        }
+        self.regs[5] |= SR1_TXE;
+        self.regs[5] |= SR1_BTF;
+    }
+
+    /// 预取下一读字节（读方向：从设备 on_read → RXNE；None → AF）。
+    fn prefetch_read(&mut self) {
+        let v = match self.cur_slave {
+            Some(idx) => self.slaves[idx].on_read(),
+            None => None,
+        };
+        match v {
+            Some(b) => {
+                if self.regs[5] & SR1_RXNE != 0 {
+                    self.regs[5] |= SR1_OVR; // 未读走 → 过载（简化覆盖）
+                }
+                self.rx_byte = b;
+                self.regs[5] |= SR1_RXNE;
+                self.regs[5] |= SR1_BTF;
+            }
+            None => {
+                self.regs[5] |= SR1_AF; // 从设备无数据/断线 → AF（固件读失败）
+            }
         }
     }
 
@@ -140,6 +248,9 @@ impl I2c {
     pub fn dma_read_dr(&mut self) -> u32 {
         let byte = self.rx_byte;
         self.regs[5] &= !SR1_RXNE;
+        if self.read_dir {
+            self.prefetch_read();
+        }
         byte as u32
     }
 
@@ -195,14 +306,25 @@ impl Peripheral for I2c {
         }
         match offset {
             OFF_DR => {
-                // 读 DR 返回接收字节并清 RxNE
+                // 读 DR 返回接收字节并清 RxNE；读方向连续流：预取下一字节（保持 RXNE）
                 let v = self.rx_byte as u32;
                 self.regs[5] &= !SR1_RXNE;
+                if self.read_dir {
+                    self.prefetch_read();
+                }
                 Ok(v)
             }
             0x00..=0x20 => {
                 if ((offset / 4) as usize) < REG_COUNT {
-                    Ok(self.regs[(offset / 4) as usize])
+                    let v = self.regs[(offset / 4) as usize];
+                    if offset == OFF_SR2 {
+                        // 读 SR2 清 ADDR（RM：ADDR 读 SR1+SR2 清除）；读方向预取首字节
+                        self.regs[5] &= !SR1_ADDR;
+                        if self.read_dir && self.cur_slave.is_some() {
+                            self.prefetch_read();
+                        }
+                    }
+                    Ok(v)
                 } else {
                     Err(BusError::OutOfRange)
                 }
@@ -224,9 +346,13 @@ impl Peripheral for I2c {
             }
             OFF_DR => {
                 if self.regs[0] & CR1_PE != 0 {
-                    // 发送：发布事件 + 置 TxE（仿真快速发送）
+                    // 发送：发布事件 + 事务解析（地址阶段→地址匹配；数据阶段→路由从设备）
                     self.tx((value & 0xFF) as u8);
-                    self.regs[5] |= SR1_TXE;
+                    if self.addr_phase {
+                        self.handle_addr_byte((value & 0xFF) as u8);
+                    } else {
+                        self.handle_data_write((value & 0xFF) as u8);
+                    }
                     self.set_pending_if_buf();
                 } else {
                     // 未使能发送：数据丢弃
@@ -246,6 +372,11 @@ impl Peripheral for I2c {
                         self.regs[5] |= SR1_TXE;
                     } else {
                         self.regs[5] &= !SR1_TXE;
+                    }
+                    // START 位写 1 → SB 置位 + 进入地址阶段（下一个 DR 写 = 地址字节）
+                    if value & CR1_START != 0 {
+                        self.regs[5] |= SR1_SB;
+                        self.addr_phase = true;
                     }
                     self.set_pending_if_buf();
                 }
