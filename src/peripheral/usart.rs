@@ -93,7 +93,11 @@ impl Usart {
         Self {
             port,
             irq,
-            regs: [0; 7],
+            // 真机复位值：SR.TXE=1 / SR.TC=1（发送数据寄存器空）。Machine::reset 不
+            // 遍历外设 reset，故初值即复位值——否则固件在 uart0 open 前（如
+            // board_init 的设备 create 阶段 log error）调 uart_hal_putc 等 TXE
+            // 会每次超时 10 万条指令，boot 显著变慢甚至超时。
+            regs: [SR_TXE | SR_TC, 0, 0, 0, 0, 0, 0],
             rx_byte: 0,
             bus,
             nvic,
@@ -378,6 +382,10 @@ impl Peripheral for Usart {
 
     fn reset(&mut self) {
         self.regs = [0; 7];
+        // 真机复位值：SR.TXE=1 / SR.TC=1（发送数据寄存器空、上次发送完成）。
+        // 若 TXE 复位为 0，固件在 uart0 open 前（如 board_init 的设备 create
+        // 阶段 log error）调 uart_hal_putc 会每次超时 10 万条指令，boot 显著变慢。
+        self.regs[0] = SR_TXE | SR_TC;
         self.rx_byte = 0;
     }
 }

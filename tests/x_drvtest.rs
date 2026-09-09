@@ -16,7 +16,7 @@ use std::sync::Arc;
 use unicorn_engine::RegisterARM;
 use mcu_simulater::machine::Machine;
 use mcu_simulater::peripheral::vperiph::data_source::StaticImu;
-use mcu_simulater::peripheral::vperiph::spi::Bmi088;
+use mcu_simulater::peripheral::vperiph::spi::{Bmi088, SpiFlash};
 
 #[test]
 fn drvtest_all_drivers_pass() {
@@ -33,6 +33,13 @@ fn drvtest_all_drivers_pass() {
     // 全链路读传感器数据；须在 run() 前挂（系统分区启动时 bmi088_create 会 open
     // spi2 并读 WHO_AM_I 校验——从机此时必须已挂载）。
     m.register_spi_slave(3, Box::new(Bmi088::new((4, 7), (4, 8), StaticImu::default())));
+
+    // SPI NOR Flash 虚拟从机：挂 SPI1（板级 spi_flash0 依赖 "spi1" = SPI2 硬件），
+    // CS=GPIOE9（port4/pin9）。绑定唯一临时文件——固件写数据后宿主机侧
+    // persist_spi_slaves() 把映像写回，据此证明"保存"数据跨 run 存活。
+    let flash_path = std::env::temp_dir().join(format!("drvtest_spiflash_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&flash_path);
+    m.register_spi_slave(2, Box::new(SpiFlash::with_file(64 * 1024, (4, 9), flash_path.clone())));
 
     // INSN_INVALID 兜底：任何非法指令直接判失败（回归守卫）。
     let bad_pc = Arc::new(AtomicU32::new(0));
@@ -198,6 +205,34 @@ fn drvtest_all_drivers_pass() {
         assert!(bmi_ok_raw, "BMI088 accel.z≈10920 断言未命中（数据回填异常？）");
         assert!(access > 0, "SPI2 虚拟从机未被固件访问（access={access}）——链路未打通");
         eprintln!(">>> BMI088 全链路：WHO=1E/0F ✓ accel.z=10920 ✓ 从机访问 {access} 字节 ✓");
+    }
+    // d_spi_flash 全链路验收：JEDEC=EF4018（固件 open 校验已隐含）+ 写读回 + 擦除
+    // + 持久化标记；宿主机侧调用 persist_spi_slaves() 后校验文件映像含标记与数据
+    //（证明固件写入经 SPI 落到可保存的文件，数据跨 run 存活）。
+    {
+        let acc = m.spi.lock().unwrap()[1].lock().unwrap().slave_access();
+        let has_jedec = String::from_utf8_lossy(&out).contains("JEDEC=0xEF4018 正确");
+        let has_wr = String::from_utf8_lossy(&out).contains("写读回 8B 一致");
+        let has_erase = String::from_utf8_lossy(&out).contains("扇区擦除后读回全 0xFF");
+        let has_marker = String::from_utf8_lossy(&out).contains("持久化标记 @0x300 已写入");
+        eprintln!(">>> [FLASH-DIAG] access={acc} jedec={has_jedec} wr={has_wr} erase={has_erase} marker={has_marker}");
+        assert!(has_jedec && has_wr && has_erase && has_marker,
+            "SPI NOR Flash 用例断言未命中（jedec={has_jedec} wr={has_wr} erase={has_erase} marker={has_marker}）");
+        assert!(acc > 0, "SPI1 虚拟从机未被固件访问（access={acc}）——flash 链路未打通");
+
+        // 持久化：触发映像写回文件，校验文件包含固件写入的特征串（跨 run 保存）
+        m.persist_spi_slaves();
+        let img = std::fs::read(&flash_path).expect("flash 持久化文件应存在");
+        let text = String::from_utf8_lossy(&img);
+        assert!(text.contains("SPIFLASH-SAVE"), "持久化文件缺少固件写入的特征串（保存失效）");
+        // 写读回数据段（0x2000 起 8B：DE AD BE EF 01 23 45 67；扇区 2，未被擦除）
+        assert_eq!(&img[0x2000..0x2008], &[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67],
+            "持久化文件 0x2000 写读回数据不一致");
+        // 擦除扇区 0（0x0000-0x0FFF）后：0x0200 应回 0xFF（擦除生效）；
+        // 0x0300 标记在同扇区但为擦除后写入 → 存活；0x2000 数据跨扇区存活。
+        assert_eq!(&img[0x0200..0x0204], &[0xFF; 4], "0x0200 所在扇区擦除后应为 0xFF");
+        assert!(text.contains("SPIFLASH-SAVE"), "持久化文件标记仍在（擦除后写入存活）");
+        eprintln!(">>> SPI NOR Flash 全链路：JEDEC=EF4018 ✓ 写读回 ✓ 擦除 ✓ 持久化文件含标记 ✓（{}B 映像）", img.len());
     }
     eprintln!(">>> 验收通过：{pass}/{total} 通过，{skip} 跳过，0 失败");
 }

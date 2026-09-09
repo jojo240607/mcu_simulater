@@ -115,6 +115,13 @@ impl Spi {
         self.slave.as_ref().map(|s| s.access_count()).unwrap_or(0)
     }
 
+    /// 触发虚拟从设备持久化（SPI NOR Flash 等保存用途器件写回文件）。
+    pub fn persist_slave(&mut self) {
+        if let Some(sl) = &mut self.slave {
+            sl.persist();
+        }
+    }
+
     /// 全双工字节交换：发送 `byte`（发布 SpiByte 事件）；若挂载虚拟从机，按帧
     /// 协议解析并把回送字节锁存为 RX（置 RXNE + 按 RXNEIE 挂中断）。
     ///

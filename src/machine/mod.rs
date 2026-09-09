@@ -281,6 +281,15 @@ impl Machine {
         false
     }
 
+    /// 触发全部 SPI 虚拟从设备持久化（保存用途器件把映像写回绑定文件）。
+    ///
+    /// 供测试/上层在关键检查点（如固件写入 flash 后）调用，证明数据可跨 run 存活。
+    pub fn persist_spi_slaves(&self) {
+        for s in self.spi.lock().unwrap().iter() {
+            s.lock().unwrap().persist_slave();
+        }
+    }
+
     /// 注册 SPI 虚拟从设备（全双工直路由挂载；片选经 GPIO 事件转发）。
     ///
     /// `port` = SPI 端口（1/2/3）。固件用 GPIO 输出拉低 CS 选中从机（无硬件 NSS），

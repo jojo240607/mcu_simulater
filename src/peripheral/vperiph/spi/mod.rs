@@ -26,8 +26,10 @@
 use std::sync::{Arc, Mutex};
 
 pub mod bmi088;
+pub mod flash;
 
 pub use bmi088::Bmi088;
+pub use flash::SpiFlash;
 
 /// SPI 总线从设备接口。
 ///
@@ -54,6 +56,11 @@ pub trait VirtualSpiSlave: Send + Sync {
 
     /// 仿真时间推进（Math 数据源步进；由 Machine 的 step_virtual_slaves 驱动）。
     fn step(&mut self, _dt: f32) {}
+
+    /// 持久化（Machine 统一触发；无持久化能力的器件 no-op）。
+    ///
+    /// SPI NOR Flash 等"保存用途"器件借此把映像写回绑定文件，数据跨 run 存活。
+    fn persist(&mut self) {}
 }
 
 /// 便捷构造（工厂命名与 `i2c/` 一致）：默认 BMI088（静态 IMU 模型）。
