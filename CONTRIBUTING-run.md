@@ -1,7 +1,7 @@
 # mcu_simulater 运行指南 + 当前进度手账
 
 > 目标是给"怎么跑 / 已修到哪 / 下一步"一个可续的底稿，尤其面向 RTOS(joc-base) + App 分区
-> (joc-drvtest-app / joc-app-rust) 的验收。仓库当前**无交互 CLI**（`src/main.rs` 是 M0 骨架，
+> (joc-drvtest-app / flyctrl-app) 的验收。仓库当前**无交互 CLI**（`src/main.rs` 是 M0 骨架，
 > `config.parse`/Monitor/GDB 占位）——固件上线靠 `#[test]` 集成测试驱动。
 
 ## 一、怎么跑（最快可达）
