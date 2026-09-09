@@ -153,6 +153,10 @@ pub struct UsbOtg {
     rx: VecDeque<u8>,
     /// 接收 FIFO 状态队列（读 GRXSTSP 弹出）
     rx_status: VecDeque<u32>,
+    /// 待置 XFRC 的 OUT EP：OUT 数据状态被固件从 GRXSTSP 弹走后，须等 DFIFO
+    /// 数据被固件完整读走（rx 空）再置 XFRC/OEPINT——否则 OEPINT 抢占 RXFLVL
+    /// ISR 的 ReadPacket（xfer_count 尚未累加）→ cdc_DataOut 推 0 字节丢数据。
+    pending_xfrc_ep: Option<usize>,
     /// IN 发送缓冲（写 DFIFOx 追加；host_take_in 弹出）
     tx: [Vec<u8>; EP_COUNT],
     /// 各 IN 端点是否已触发完成（写 EPENA/写 FIFO 时检查）
@@ -171,6 +175,7 @@ impl UsbOtg {
             regs,
             rx: VecDeque::new(),
             rx_status: VecDeque::new(),
+            pending_xfrc_ep: None,
             tx: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             in_pending: [false; EP_COUNT],
         }
@@ -430,12 +435,10 @@ impl Peripheral for UsbOtg {
                         self.pulse();
                     }
                     if pktsts == PKTSTS_OUT_DATA {
-                        // OUT 数据已被固件读走（DFIFO0 弹完）→ 置 DOEPINTx.XFRC +
-                        // OEPINT，让 outepintr 分支完成 DataOut（xfer_count 已正确）。
+                        // OUT 数据：GRXSTSP 状态被固件弹走，但 DFIFO 数据尚未读。
+                        // 延迟到 DFIFO 读空后再置 XFRC（见 DFIFO 读分支）。
                         let epnum = (v & RXS_EPNUM) as usize;
-                        self.regs[(Self::doep_int_off(epnum) >> 2) as usize] |= EPINT_XFRC;
-                        self.set_gint(GINT_OEPINT);
-                        self.pulse();
+                        self.pending_xfrc_ep = Some(epnum);
                     }
                     Ok(v)
                 } else {
@@ -452,6 +455,16 @@ impl Peripheral for UsbOtg {
                 for i in 0..4 {
                     let b = self.rx.pop_front().unwrap_or(0);
                     v |= (b as u32) << (8 * i);
+                }
+                // OUT 数据读空 → 完整接收完成：置 DOEPINTx.XFRC + OEPINT（真机
+                // 在该时刻置 XFRC），让 outepintr 分支在 xfer_count 已累加后
+                // 执行 cdc_DataOut（否则抢占 RXFLVL ISR 会推 0 字节）。
+                if self.rx.is_empty() {
+                    if let Some(epnum) = self.pending_xfrc_ep.take() {
+                        self.regs[(Self::doep_int_off(epnum) >> 2) as usize] |= EPINT_XFRC;
+                        self.set_gint(GINT_OEPINT);
+                        self.pulse();
+                    }
                 }
                 Ok(v)
             }

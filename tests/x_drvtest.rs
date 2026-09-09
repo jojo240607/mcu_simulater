@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
 use mcu_simulater::machine::Machine;
+use mcu_simulater::peripheral::vperiph::data_source::StaticImu;
+use mcu_simulater::peripheral::vperiph::spi::Bmi088;
 
 #[test]
 fn drvtest_all_drivers_pass() {
@@ -25,6 +27,12 @@ fn drvtest_all_drivers_pass() {
     m.load_elf(&elf).unwrap();
     m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
+
+    // SPI 虚拟从机：BMI088 挂 SPI2（板级 g_bmi088 依赖 "spi2"），ACCEL_CS=GPIOE7、
+    // GYRO_CS=GPIOE8（port4/pin7,8）。固件 bmi088 驱动经 GPIO 拉低 CS + SPI XFER
+    // 全链路读传感器数据；须在 run() 前挂（系统分区启动时 bmi088_create 会 open
+    // spi2 并读 WHO_AM_I 校验——从机此时必须已挂载）。
+    m.register_spi_slave(3, Box::new(Bmi088::new((4, 7), (4, 8), StaticImu::default())));
 
     // INSN_INVALID 兜底：任何非法指令直接判失败（回归守卫）。
     let bad_pc = Arc::new(AtomicU32::new(0));
@@ -58,7 +66,7 @@ fn drvtest_all_drivers_pass() {
     ];
     // 21 个用例含若干 msleep（timer 溢出 120ms、exti 死线轮询等）→ 虚拟时间预算
     // 需 ~2.5s；每步 400K 字节 ≈ 2.4ms 虚拟，留 5000 步（~12s 虚拟）充足余量。
-    for step in 0..5000u32 {
+    for step in 0..5600u32 {
         if t_start.elapsed().as_secs() > 300 {
             eprintln!(">>> 超时（300s）终止");
             break;
@@ -178,6 +186,18 @@ fn drvtest_all_drivers_pass() {
         let found = out.windows(pattern.len()).any(|w| w == pattern.as_slice());
         assert!(found, "宿主未捕获到 uart0 DMA TX 模式串（{pattern:?}）——数据未真实发出");
         eprintln!(">>> 宿主捕获 uart0 DMA TX 模式串（{}B，字节级一致）", pattern.len());
+    }
+    // d_bmi088 全链路数值验收：WHO_AM_I 片选区分（1E/0F）+ 原始计数值（accel.z≈10920）
+    // + 模拟器从机真实被访问（固件确实与虚拟从机交换字节，而非仅寄存器回读）。
+    {
+        let bmi_ok_who = String::from_utf8_lossy(&out).contains("WHO accel=0x1E gyro=0x0F");
+        let bmi_ok_raw = String::from_utf8_lossy(&out).contains("az=10920");
+        let access = m.spi.lock().unwrap()[2].lock().unwrap().slave_access();
+        eprintln!(">>> [BMI088-DIAG] access={access} who_str={bmi_ok_who} raw_str={bmi_ok_raw}");
+        assert!(bmi_ok_who, "BMI088 WHO_AM_I 断言未命中（片选区分失败？）");
+        assert!(bmi_ok_raw, "BMI088 accel.z≈10920 断言未命中（数据回填异常？）");
+        assert!(access > 0, "SPI2 虚拟从机未被固件访问（access={access}）——链路未打通");
+        eprintln!(">>> BMI088 全链路：WHO=1E/0F ✓ accel.z=10920 ✓ 从机访问 {access} 字节 ✓");
     }
     eprintln!(">>> 验收通过：{pass}/{total} 通过，{skip} 跳过，0 失败");
 }

@@ -119,6 +119,8 @@ pub struct Machine {
     pub i2c: Arc<Mutex<Vec<Arc<Mutex<I2c>>>>>,
     /// USART1-6 外设句柄（index = port-1；UART 虚拟从设备挂载点，推流）
     pub usart: Arc<Mutex<Vec<Arc<Mutex<Usart>>>>>,
+    /// SPI1-3 外设句柄（index = port-1；SPI 虚拟从设备挂载点，全双工直路由）
+    pub spi: Arc<Mutex<Vec<Arc<Mutex<Spi>>>>>,
     /// CAN1 控制器局域网（@0x40006400，APB1；邮箱/接收 FIFO/过滤 + CanFrame 总线互联）
     pub can1: Arc<Mutex<Can>>,
     /// CAN2 控制器局域网（@0x40006800，APB1；同上，与 CAN1 互联）
@@ -220,6 +222,7 @@ impl Machine {
             sdio: Arc::new(Mutex::new(Sdio::new(events.clone(), nvic.clone()))),
             i2c: Arc::new(Mutex::new(Vec::new())),
             usart: Arc::new(Mutex::new(Vec::new())),
+            spi: Arc::new(Mutex::new(Vec::new())),
             can1: Arc::new(Mutex::new(Can::new(1, Some(events.clone()), nvic.clone()))),
             can2: Arc::new(Mutex::new(Can::new(2, Some(events.clone()), nvic.clone()))),
             flash: Arc::new(Mutex::new(Flash::new())),
@@ -278,10 +281,24 @@ impl Machine {
         false
     }
 
+    /// 注册 SPI 虚拟从设备（全双工直路由挂载；片选经 GPIO 事件转发）。
+    ///
+    /// `port` = SPI 端口（1/2/3）。固件用 GPIO 输出拉低 CS 选中从机（无硬件 NSS），
+    /// 从机构造时需提供其 CS 引脚的 GPIO 坐标（如 BMI088 的 ACCEL_CS/GYRO_CS）。
+    pub fn register_spi_slave(&self, port: u8, slave: Box<dyn crate::peripheral::vperiph::spi::VirtualSpiSlave>) {
+        let idx = (port as usize).saturating_sub(1);
+        if let Some(s) = self.spi.lock().unwrap().get(idx) {
+            s.lock().unwrap().register_slave(slave);
+        }
+    }
+
     /// 推进所有虚拟从设备（仿真时间 `dt` 秒；Math 数据源步进 / UART 推流节拍）。
     pub fn step_virtual_slaves(&self, dt: f32) {
         for i in self.i2c.lock().unwrap().iter() {
             i.lock().unwrap().step_slaves(dt);
+        }
+        for s in self.spi.lock().unwrap().iter() {
+            s.lock().unwrap().step_slave(dt);
         }
     }
 
@@ -678,6 +695,7 @@ impl Machine {
             (3, 0x4000_3C00, SPI3_IRQ, false),      // SPI3 → DMA1
         ] {
             let spi = Arc::new(Mutex::new(Spi::new(port, events.clone(), self.nvic.clone(), irq)));
+            self.spi.lock().unwrap().push(spi.clone());
             self.bus
                 .lock()
                 .unwrap()
@@ -708,6 +726,22 @@ impl Machine {
                                     .unwrap()
                                     .service_stream(stream, channel, DmaDir::PeriphToMem, crate::peripheral::dma::DmaTarget::Spi(*p));
                             }
+                        }
+                    }
+                },
+            )));
+        }
+
+        // SPI 虚拟从机片选转发：固件用 GPIO 输出拉低 CS（无硬件 NSS）→ GpioLevel
+        // 事件 → 各 SPI 从机 on_cs（从机自行过滤关注的引脚；拉低开始新帧）。
+        // 与 SpiRx 订阅同上下文（事件分发回调内只调控制器方法，不二次 publish）。
+        {
+            let spi_vec = self.spi.clone();
+            events.lock().unwrap().subscribe(Arc::new(Mutex::new(
+                move |ev: &Event| {
+                    if let Event::GpioLevel { port, pin, level } = ev {
+                        for s in spi_vec.lock().unwrap().iter() {
+                            s.lock().unwrap().route_cs(*port, *pin, *level);
                         }
                     }
                 },

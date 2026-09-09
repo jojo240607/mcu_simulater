@@ -20,22 +20,27 @@
 //! │   ├── mpu6050.rs   六轴 IMU @0x68
 //! │   ├── bmp280.rs    气压 @0x76
 //! │   └── qmc5883.rs   磁力 @0x0D
+//! ├── spi/             SPI 总线从设备器件（一器件一文件，全双工直路由）
+//! │   ├── mod.rs       VirtualSpiSlave trait + 帧工具 + re-export
+//! │   └── bmi088.rs    双片选六轴 IMU（ACCEL_CS/GYRO_CS）
 //! └── uart/             UART 推流从设备器件（一器件一文件）
 //!     ├── mod.rs       VirtualUartSlave trait + NMEA 工具 + re-export
 //!     ├── nmea_gps.rs  $GNGGA 推流 GPS
 //!     └── sbus.rs      SBUS 遥控帧
 //! ```
 //!
-//! **新增器件**：在 `i2c/`（或 `uart/`）下新建 `<device>.rs`（寄存器布局/帧构造 +
-//! 工厂函数 + 单元测试），在对应 `mod.rs` 加 `pub mod <device>;` + re-export；
+//! **新增器件**：在 `i2c/`（或 `spi/`、`uart/`）下新建 `<device>.rs`（寄存器布局/
+//! 帧构造 + 工厂函数 + 单元测试），在对应 `mod.rs` 加 `pub mod <device>;` + re-export；
 //! 总线外设只依赖 trait，与具体器件解耦。
 //!
 //! 首批覆盖（对齐 flyctrl real-sensors 全链路）：
 //! - I2C：mpu6050(0x68) / bmp280(0x76) / qmc5883(0x0D)
+//! - SPI：bmi088（双片选六轴 IMU，可扩展任意 SPI 传感器）
 //! - UART：ublox gps(usart1) / sbus(usart2)
 
 pub mod data_source;
 pub mod i2c;
+pub mod spi;
 pub mod uart;
 
 use data_source::DataSource;

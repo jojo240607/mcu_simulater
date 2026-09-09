@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use crate::events::{Event, EventBus};
 use crate::peripheral::dma::DmaDir;
 use crate::peripheral::nvic::Nvic;
+use crate::peripheral::vperiph::spi::VirtualSpiSlave;
 use crate::peripheral::{BusError, Peripheral};
 
 /// SPI NVIC IRQ（STM32F407：SPI1/SPI2/SPI3 各一个事件中断）
@@ -68,6 +69,8 @@ pub struct Spi {
     bus: Arc<Mutex<EventBus>>,
     /// NVIC（RXNE/TXE → 挂起 SPI IRQ）
     nvic: Arc<Mutex<Nvic>>,
+    /// 虚拟从设备（挂载后：主机发字节 → on_byte 直路由，回送字节锁存为 RX）
+    slave: Option<Box<dyn VirtualSpiSlave>>,
 }
 
 impl Spi {
@@ -79,7 +82,66 @@ impl Spi {
             rx_byte: 0,
             bus,
             nvic,
+            slave: None,
         }
+    }
+
+    /// 挂载虚拟从设备（总线协议级直路由，仿 I2C `register_slave`）。
+    pub fn register_slave(&mut self, slave: Box<dyn VirtualSpiSlave>) {
+        self.slave = Some(slave);
+    }
+
+    /// 从设备数（观测）
+    pub fn slave_count(&self) -> usize {
+        self.slave.as_ref().map(|_| 1).unwrap_or(0)
+    }
+
+    /// 片选引脚变化转发给虚拟从设备（GPIO 事件；从机自行过滤关注的引脚）。
+    pub fn route_cs(&mut self, port: u8, pin: u8, level: bool) {
+        if let Some(sl) = &mut self.slave {
+            sl.on_cs(port, pin, level);
+        }
+    }
+
+    /// 推进虚拟从设备（仿真时间；Math 数据源步进）。
+    pub fn step_slave(&mut self, dt: f32) {
+        if let Some(sl) = &mut self.slave {
+            sl.step(dt);
+        }
+    }
+
+    /// 虚拟从设备访问计数（观测/断言）。
+    pub fn slave_access(&self) -> u64 {
+        self.slave.as_ref().map(|s| s.access_count()).unwrap_or(0)
+    }
+
+    /// 全双工字节交换：发送 `byte`（发布 SpiByte 事件）；若挂载虚拟从机，按帧
+    /// 协议解析并把回送字节锁存为 RX（置 RXNE + 按 RXNEIE 挂中断）。
+    ///
+    /// RX DMA 不在本方法内登记——本方法可能在 DMA process（`dma_write_dr`）
+    /// 或 CPU 写 DR 上下文被调用，此时发布 SpiDma 会同线程重入 events/dma 锁
+    /// 死锁；RX DMA 请求由 Machine 装配的 SpiRx 订阅在 feed_rx 之后直接路由
+    /// （见 [`Spi::dma_rx_pending`] 与 machine 装配注释）。
+    fn exchange(&mut self, byte: u8) {
+        let reply = if let Some(sl) = &mut self.slave {
+            sl.on_byte(byte)
+        } else {
+            0xFF // 无从机：MISO 默认高
+        };
+        // 全双工真机语义：CPU 写 DR 后 RXNE 必置位（收 MISO；无虚拟从机时
+        // 回送 0xFF）。这样固件 POLL 读（如 bmi088 WHO 校验）在无物理从机的
+        // 环境也不会死等——真机 SPI 8 个 SCK 后 RXNE 照常置位（MISO 悬空读
+        // 0xFF）。多收的隐患仅出现在"写 CR2 使能 RXNEIE 时已有残留 RXNE"的
+        // 场景，已由 CR2 写分支改为仅按 TXE 挂中断规避（见 [`Spi::set_pending_tx_if_irq`]）。
+        if self.regs[0] & CR1_SPE != 0 {
+            if self.regs[2] & SR_RXNE != 0 {
+                self.regs[2] |= SR_OVR; // 上次未读走 → 过载（仿真简化：覆盖）
+            }
+            self.rx_byte = reply;
+            self.regs[2] |= SR_RXNE;
+            self.set_pending_if_irq();
+        }
+        self.tx(byte);
     }
 
     /// 发送字节（发布 SpiByte 事件；仅 SPE 生效）
@@ -98,6 +160,18 @@ impl Spi {
         if (cr2 & CR2_RXNEIE != 0 && sr & SR_RXNE != 0)
             || (cr2 & CR2_TXEIE != 0 && sr & SR_TXE != 0)
         {
+            self.nvic.lock().unwrap().set_pending(self.irq);
+        }
+    }
+
+    /// 写 CR2（使能位变化）时专用：仅按 TXE 挂起。真机使能位变化本身不触发
+    /// 中断——只有事件新上升沿才挂起；模拟器若在此时按已置位的 RXNE 挂中断，
+    /// 会让"问候写 DR 先置 RXNE、随后才使能 RXNEIE"的固件（如 m5_spi_irq）
+    /// 把残留 RXNE 也当一次接收（G_RX 多 1）。
+    fn set_pending_tx_if_irq(&self) {
+        let cr2 = self.regs[1];
+        let sr = self.regs[2];
+        if cr2 & CR2_TXEIE != 0 && sr & SR_TXE != 0 {
             self.nvic.lock().unwrap().set_pending(self.irq);
         }
     }
@@ -145,7 +219,10 @@ impl Spi {
 
     /// DMA 写 DR（内存→外设方向）：发送一字节并置 TXE。
     ///
-    /// 供 DMA 控制器搬运调用，等价 CPU 写 DR 的发送语义。
+    /// 供 DMA 控制器搬运调用，等价 CPU 写 DR 的发送语义。注意此处只发送、
+    /// 不锁存 RX：DMA TX 的虚拟从机回送会额外置 RXNE，干扰独立注入的
+    /// RX DMA 数据（m5_spi_dma 的 RX 由测试 SpiRx 注入，TX 阶段不得抢占）。
+    /// 虚拟从机的全双工回送只发生在 CPU 写 DR（固件 spi_hal_transfer POLL 路径）。
     pub fn dma_write_dr(&mut self, value: u32) {
         self.tx(value as u8);
         self.regs[2] |= SR_TXE;
@@ -190,7 +267,9 @@ impl Peripheral for Spi {
     }
 
     fn read(&mut self, offset: u32, size: u32) -> Result<u32, BusError> {
-        if size != 4 {
+        // STM32 外设寄存器支持 8/16/32 位访问（低字节/低半字有效），固件 spi_hal
+        // 用 `volatile uint8_t*` 访问 DR——若只收 32 位会漏掉固件真实事务。
+        if size != 1 && size != 2 && size != 4 {
             return Err(BusError::NotImplemented);
         }
         match offset {
@@ -212,7 +291,7 @@ impl Peripheral for Spi {
     }
 
     fn write(&mut self, offset: u32, size: u32, value: u32) -> Result<(), BusError> {
-        if size != 4 {
+        if size != 1 && size != 2 && size != 4 {
             return Err(BusError::NotImplemented);
         }
         match offset {
@@ -224,8 +303,8 @@ impl Peripheral for Spi {
             }
             OFF_DR => {
                 if self.regs[0] & CR1_SPE != 0 {
-                    // 发送：发布事件 + 置 TXE（仿真快速发送）
-                    self.tx((value & 0xFF) as u8);
+                    // 发送：全双工交换（虚拟从机回送字节锁存 RX）+ 置 TXE（仿真快速发送）
+                    self.exchange((value & 0xFF) as u8);
                     self.regs[2] |= SR_TXE;
                     self.set_pending_if_irq();
                 } else {
@@ -251,7 +330,7 @@ impl Peripheral for Spi {
                 }
                 // DMA 使能位（CR2.TXDMAEN/RXDMAEN）/中断使能位变化后检查发布请求/挂起
                 if offset == OFF_CR2 {
-                    self.set_pending_if_irq();
+                    self.set_pending_tx_if_irq();
                     self.check_dma_request();
                 }
                 Ok(())
