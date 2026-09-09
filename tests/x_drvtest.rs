@@ -45,6 +45,17 @@ fn drvtest_all_drivers_pass() {
     let mut mounted = false;
     let mut hb = false;
     let mut report: Option<(u32, u32, u32, u32)> = None; // (total, pass, fail, skip)
+    // 虚拟 USB 主机注入（C 类 usb 真实主机通信，逻辑同 cfg-run 两阶段握手）：
+    // READY → 总线复位 + 分步标准枚举；ENUM-OK → OUT EP1 注入 64B 模式数据。
+    let mut usb_stage1 = false;
+    let mut usb_stage2 = false;
+    let mut usb_setup_idx: usize = 0;
+    const USB_SETUPS: [[u8; 8]; 4] = [
+        [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00], // GET_DESCRIPTOR(Device)
+        [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x20, 0x00], // GET_DESCRIPTOR(Config)
+        [0x00, 0x05, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00], // SET_ADDRESS 0x2A
+        [0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00], // SET_CONFIGURATION 1
+    ];
     // 21 个用例含若干 msleep（timer 溢出 120ms、exti 死线轮询等）→ 虚拟时间预算
     // 需 ~2.5s；每步 400K 字节 ≈ 2.4ms 虚拟，留 5000 步（~12s 虚拟）充足余量。
     for step in 0..5000u32 {
@@ -63,6 +74,35 @@ fn drvtest_all_drivers_pass() {
         }
         if text.contains("hb n=") {
             hb = true;
+        }
+        // 虚拟 USB 主机注入（分步，逻辑同 cfg-run；见函数头注释）
+        if !usb_stage1 || !usb_stage2 {
+            if !usb_stage1 && text.contains("DRVTEST-USB-HOST-READY") {
+                m.usb_otg.lock().unwrap().inject_usb_reset();
+                usb_stage1 = true;
+                eprintln!("[usb-host] READY → 注入总线复位");
+            }
+            if usb_stage1 && usb_setup_idx < USB_SETUPS.len() {
+                let (rx_empty, dmsk) = {
+                    let u = m.usb_otg.lock().unwrap();
+                    (u.rx_status_empty(), u.daintmsk())
+                };
+                let ready = if usb_setup_idx == 0 { dmsk != 0 } else { rx_empty };
+                if ready {
+                    m.usb_otg
+                        .lock()
+                        .unwrap()
+                        .inject_setup(USB_SETUPS[usb_setup_idx]);
+                    eprintln!("[usb-host] 注入 SETUP #{}", usb_setup_idx);
+                    usb_setup_idx += 1;
+                }
+            }
+            if !usb_stage2 && text.contains("DRVTEST-USB-ENUM-OK") {
+                let pattern: Vec<u8> = (0..64).map(|i| 0x55u8 + i as u8).collect();
+                m.usb_otg.lock().unwrap().inject_out(1, &pattern);
+                usb_stage2 = true;
+                eprintln!("[usb-host] ENUM-OK → OUT EP1 注入 64B 模式数据");
+            }
         }
         // 解析 "DRVTEST REPORT total=28 pass=28 fail=0 skip=0"
         if report.is_none() {

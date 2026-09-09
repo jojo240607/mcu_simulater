@@ -84,8 +84,10 @@
 #define TSIZ_PKTCNT1   (1u << 19)
 #define TSIZ_STUPCNT1  (1u << 29)
 #define GRX_PKTSTS_MASK (0xFu << 17)
-#define GRX_PKTSTS_SETUP_DATA 3u
-#define GRX_PKTSTS_OUT_DATA   4u
+/* pktsts 编码对齐 joc-base ST 设备库（st_usb/usb_defines.h）：
+ * STS_DATA_UPDT=2 / STS_SETUP_COMP=4 / STS_SETUP_UPDT=6 */
+#define GRX_PKTSTS_SETUP_DATA 6u
+#define GRX_PKTSTS_OUT_DATA   2u
 #define GRX_EPNUM_MASK (0xFu)
 #define GRX_BCNT_MASK  (0x7FFu << 4)
 

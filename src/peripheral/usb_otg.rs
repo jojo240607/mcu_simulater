@@ -69,7 +69,9 @@ const OFF_DCFG: u32 = 0x800;
 const OFF_DSTS: u32 = 0x808;
 const OFF_DIEPMSK: u32 = 0x810;
 const OFF_DOEPMSK: u32 = 0x814;
+const OFF_DAINT: u32 = 0x818;
 const OFF_DAINTMSK: u32 = 0x81C;
+const OFF_DIEPEMPMSK: u32 = 0x834; // IN EP TX FIFO 空屏蔽（slave 模式 TXFE 门控）
 
 /// IN 端点寄存器基址（DIEPCTLx / DIEPINTx / DIEPTSIZx）
 const DIEP_BASE: u32 = 0x900;
@@ -81,6 +83,7 @@ const EP_STRIDE: u32 = 0x20;
 const EP_CTL: u32 = 0x00;
 const EP_INT: u32 = 0x08;
 const EP_TSIZ: u32 = 0x10;
+const EP_DTXFSTS: u32 = 0x18; // DIEPx 内 DTXFSTS（TX FIFO 空间，只读）
 
 // ---- 位定义 ----
 /// GCCFG：掉电位（复位后置 1，清 0 上电 PHY）
@@ -97,17 +100,23 @@ const GRSTCTL_AHBIDL: u32 = 1 << 31;
 const GINT_RXFLVL: u32 = 1 << 4; // 接收 FIFO 非空
 const GINT_USBRST: u32 = 1 << 12; // USB 复位
 const GINT_ENUMDNE: u32 = 1 << 13; // 枚举完成
+// ST 库位域（usb_regs.h USB_OTG_GINTSTS_TypeDef，含 curmode@0/modemismatch@1/otgintr@2）：
+// rxstsqlvl@4 / usbreset@12 / enumdone@13 / inepint@18 / outepintr@19 / wkupintr@31
+const GINT_OEPINT: u32 = 1 << 19; // OUT 端点中断（DAINT 汇总 → 固件 outepintr 分支）
+const GINT_IEPINT: u32 = 1 << 18; // IN 端点中断（DAINT 汇总 → 固件 inepint 分支）
 const GINT_WKUP: u32 = 1 << 31; // 唤醒（注入用）
 const GINT_RW_MASK: u32 =
-    GINT_RXFLVL | GINT_USBRST | GINT_ENUMDNE | GINT_WKUP;
+    GINT_RXFLVL | GINT_USBRST | GINT_ENUMDNE | GINT_OEPINT | GINT_WKUP;
 /// GRXSTSP 字段
 const RXS_EPNUM: u32 = 0xF; // [3:0] 端点号
 const RXS_BCNT_MASK: u32 = 0x7FF << 4; // [14:4] 字节数
 const RXS_PKTSTS_MASK: u32 = 0xF << 17; // [20:17] 包状态
 /// 包状态（PKTSTS；GOUT_NAK/IN_COMP 简化未使用）
-const PKTSTS_SETUP_COMP: u32 = 2; // SETUP 完成
-const PKTSTS_SETUP_DATA: u32 = 3; // SETUP 数据
-const PKTSTS_OUT_DATA: u32 = 4; // OUT 数据
+// pktsts 编码对齐 ST 设备库（joc-base st_usb/usb_defines.h）：
+//   STS_DATA_UPDT=2（OUT 数据） / STS_SETUP_COMP=4 / STS_SETUP_UPDT=6
+const PKTSTS_OUT_DATA: u32 = 2; // STS_DATA_UPDT（OUT 数据可用）
+const PKTSTS_SETUP_COMP: u32 = 4; // STS_SETUP_COMP（SETUP 完成）
+const PKTSTS_SETUP_DATA: u32 = 6; // STS_SETUP_UPDT（SETUP 数据可用）
 /// DCFG：设备地址
 const DCFG_DAD: u32 = 0x7F << 4;
 /// DSTS（只读）：枚举速度复位值=FS（0b10）
@@ -129,6 +138,7 @@ const EP_EPENA: u32 = 1 << 31; // 端点使能
 const TSIZ_XFRSIZ: u32 = 0x7_FFFF; // [18:0] 传输大小（字节）
 /// DIEPINTx / DOEPINTx（写 1 清除）
 const EPINT_XFRC: u32 = 1 << 0; // 传输完成
+const EPINT_TXFE: u32 = 1 << 7; // TX FIFO 空（slave 模式回发靠它触发）
 const EPINT_STUP: u32 = 1 << 3; // SETUP 完成（OUT EP0）
 
 /// USB OTG FS 外设（设备模式简化模型）
@@ -193,9 +203,9 @@ impl UsbOtg {
         self.rx_status.push_back(Self::rx_status(0, 8, PKTSTS_SETUP_DATA));
         // SETUP 完成状态字
         self.rx_status.push_back(Self::rx_status(0, 0, PKTSTS_SETUP_COMP));
-        // DOEPINT0.STUP
-        let int_off = Self::doep_int_off(0);
-        self.regs[(int_off >> 2) as usize] |= EPINT_STUP;
+        // 真机顺序：SETUP 先只触发 RXFLVL（rxstsqlvl 分支读 GRXSTSP + setup_packet）；
+        // 固件读走 SETUP 数据（弹 SETUP_COMP）后由 GRXSTSP 读路径置 DOEPINT0.STUP
+        // + GINTSTS.OEPINT（见 read GRXSTSP），保证 SetupStage 看到已就绪的 setup_packet。
         self.set_gint(GINT_RXFLVL);
         self.pulse();
     }
@@ -210,7 +220,12 @@ impl UsbOtg {
         }
         self.rx_status
             .push_back(Self::rx_status(ep as u32, data.len() as u32, PKTSTS_OUT_DATA));
-        self.regs[(Self::doep_int_off(ep) >> 2) as usize] |= EPINT_XFRC;
+        // 只触发 RXFLVL：真机顺序是数据先入 FIFO（RXFLVL）→ 固件 RXFLVL 处理
+        //（DCD_HandleRxStatusQueueLevel_ISR）把 DFIFO0 读进 xfer_buff 并累加
+        // xfer_count → 之后才 XFRC（outepintr → cdc_DataOut 按 xfer_count 推数据）。
+        // 若同时置 XFRC，固件 outepintr 分支先于 rxstsqlvl 执行，cdc_DataOut
+        // 看到 xfer_count=0 推 0 字节（slave 模式 XFRC 分支不计算 xfer_count）。
+        // XFRC/OEPINT 由 GRXSTSP 弹 OUT_DATA 状态字后置位（见 read GRXSTSP）。
         self.set_gint(GINT_RXFLVL);
         self.pulse();
     }
@@ -227,9 +242,54 @@ impl UsbOtg {
         std::mem::take(&mut self.tx[ep])
     }
 
-    /// 读 GINTSTS 的某些位（供测试断言）
+    /// IN 发送缓冲剩余字节（供测试观测）。
+    pub fn in_tx_len(&self, ep: usize) -> usize {
+        self.tx[ep.min(EP_COUNT - 1)].len()
+    }
+
+    /// 接收 FIFO 状态队列是否已空（固件弹完所有 GRXSTSP 状态字）。
+    pub fn rx_status_empty(&self) -> bool {
+        self.rx_status.is_empty()
+    }
+
+    /// DAINTMSK 当前值（固件 usbreset 处理完成后为 0x10001）。
+    pub fn daintmsk(&self) -> u32 {
+        self.regs[(OFF_DAINTMSK >> 2) as usize]
+    }
+
+    /// 读 GINTSTS 的某些位（供测试断言）。
+    /// OEPINT/IEPINT 由 DAINT 汇总派生（真机：DAINT.OEPx/IEPx 非空 → GINTSTS 置位）。
     pub fn gintsts(&self) -> u32 {
-        self.regs[(OFF_GINTSTS >> 2) as usize]
+        let mut v = self.regs[(OFF_GINTSTS >> 2) as usize];
+        let daint = self.daint_derived();
+        let dmsk = self.regs[(OFF_DAINTMSK >> 2) as usize];
+        if daint & 0xFFFF0000 & dmsk != 0 {
+            v |= GINT_OEPINT;
+        } else {
+            v &= !GINT_OEPINT;
+        }
+        if daint & 0x0000FFFF & dmsk != 0 {
+            v |= GINT_IEPINT;
+        } else {
+            v &= !GINT_IEPINT;
+        }
+        v
+    }
+
+    /// DAINT 派生：DOEPINTx/DIEPINTx 任一中断位非零 → 对应 DAINT.OEPx/IEPx。
+    fn daint_derived(&self) -> u32 {
+        let mut daint = 0u32;
+        for ep in 0..EP_COUNT {
+            let doep = self.regs[(Self::doep_int_off(ep) >> 2) as usize];
+            let diep = self.regs[(Self::diep_int_off(ep) >> 2) as usize];
+            if doep != 0 {
+                daint |= 1 << (16 + ep);
+            }
+            if diep != 0 {
+                daint |= 1 << ep;
+            }
+        }
+        daint
     }
 
     /// 置位 GINTSTS（内部；只写 1 由寄存器写路径清除）
@@ -348,20 +408,44 @@ impl Peripheral for UsbOtg {
             return Err(BusError::NotImplemented);
         }
         match offset {
+            OFF_DAINT => {
+                // DAINT 派生（真机：端点中断汇总寄存器）
+                let v = self.daint_derived();
+                Ok(v)
+            }
             OFF_GRXSTSR | OFF_GRXSTSP => {
                 // 读接收状态队列（GRXSTSP 弹出；GRXSTSR 是影子寄存器不弹出）
                 if offset == OFF_GRXSTSP {
                     let v = self.rx_status.pop_front().unwrap_or(0);
+                    let pktsts = (v >> 17) & 0xF;
                     if self.rx_status.is_empty() {
                         // 接收 FIFO 空 → 清 RXFLVL
                         self.regs[(OFF_GINTSTS >> 2) as usize] &= !GINT_RXFLVL;
+                    }
+                    if pktsts == PKTSTS_SETUP_COMP {
+                        // SETUP 数据已被固件完整读走 → 置 DOEPINT0.STUP + OEPINT
+                        //（真机：SETUP 完整接收后 STUP 置位，DAINT 汇总 → OEPINT）
+                        self.regs[(Self::doep_int_off(0) >> 2) as usize] |= EPINT_STUP;
+                        self.set_gint(GINT_OEPINT);
+                        self.pulse();
+                    }
+                    if pktsts == PKTSTS_OUT_DATA {
+                        // OUT 数据已被固件读走（DFIFO0 弹完）→ 置 DOEPINTx.XFRC +
+                        // OEPINT，让 outepintr 分支完成 DataOut（xfer_count 已正确）。
+                        let epnum = (v & RXS_EPNUM) as usize;
+                        self.regs[(Self::doep_int_off(epnum) >> 2) as usize] |= EPINT_XFRC;
+                        self.set_gint(GINT_OEPINT);
+                        self.pulse();
                     }
                     Ok(v)
                 } else {
                     Ok(self.rx_status.front().copied().unwrap_or(0))
                 }
             }
-            OFF_GINTSTS => Ok(self.gintsts()),
+            OFF_GINTSTS => {
+                let v = self.gintsts();
+                Ok(v)
+            }
             o if o >= OFF_DFIFO0 && o < OFF_DFIFO0 + FIFO_STRIDE * EP_COUNT as u32 => {
                 // 读 DFIFO0 = 从接收 FIFO 弹出 4 字节（SETUP/OUT 数据）
                 let mut v = 0u32;
@@ -372,6 +456,13 @@ impl Peripheral for UsbOtg {
                 Ok(v)
             }
             o if o < REG_COUNT as u32 * 4 => {
+                // DTXFSTS（IN EP 区 +0x18）：TX FIFO 剩余空间（words）——slave/FIFO
+                // 模式 WriteEmptyTxFifo 忙等 txfspcavail，返回足够空间避免饿死。
+                if o >= DIEP_BASE && o < DIEP_BASE + EP_STRIDE * EP_COUNT as u32 {
+                    if (o - DIEP_BASE) % EP_STRIDE == EP_DTXFSTS {
+                        return Ok(0x20);
+                    }
+                }
                 Ok(self.regs[(o >> 2) as usize])
             }
             _ => Err(BusError::OutOfRange),
@@ -386,6 +477,18 @@ impl Peripheral for UsbOtg {
             OFF_GINTSTS => {
                 // 写 1 清除（W1C）
                 self.regs[(OFF_GINTSTS >> 2) as usize] &= !(value & GINT_RW_MASK);
+                Ok(())
+            }
+            OFF_DAINT => {
+                // 写 1 清除汇总（DAINT 派生于端点中断；W1C 清对应 DOEPINTx/DIEPINTx）
+                for ep in 0..EP_COUNT {
+                    if value & (1 << (16 + ep)) != 0 {
+                        self.regs[(Self::doep_int_off(ep) >> 2) as usize] = 0;
+                    }
+                    if value & (1 << ep) != 0 {
+                        self.regs[(Self::diep_int_off(ep) >> 2) as usize] = 0;
+                    }
+                }
                 Ok(())
             }
             OFF_GRSTCTL => {
@@ -421,6 +524,15 @@ impl Peripheral for UsbOtg {
                     EP_INT => {
                         // 写 1 清除端点中断
                         self.regs[idx] &= !value;
+                        // TXFE 为电平（真机：TX FIFO 空持续置位）。固件清 DIEPINT0 后
+                        //（如 enumdone 初始化清 0xFF），只要 DIEPEMPMSK 使能且端点已 EPENA，
+                        // 立即重触发 TXFE，否则 slave 回发等 TXFE 中断饿死。
+                        if self.regs[(OFF_DIEPEMPMSK >> 2) as usize] & (1 << ep) != 0
+                            && self.regs[(Self::diep_ctl_off(ep) >> 2) as usize] & EP_EPENA != 0
+                        {
+                            self.regs[idx] |= EPINT_TXFE;
+                            self.nvic.lock().unwrap().set_pending(USB_OTG_FS_IRQ);
+                        }
                     }
                     _ => {
                         self.regs[idx] = value;
@@ -448,6 +560,32 @@ impl Peripheral for UsbOtg {
                     OFF_GUSBCFG => {
                         // 保留 FDMOD/PHYSEL 等可写位
                         self.regs[idx] = value & (GUSBCFG_FDMOD | GUSBCFG_PHYSEL | 0xFFFF);
+                    }
+                    OFF_DIEPEMPMSK => {
+                        // TX FIFO 空屏蔽写：使能位 + 端点已 EPENA → 立即触发 TXFE
+                        //（真机：TX FIFO 空是电平，DIEPEMPMSK 使能且 FIFO 空 → 中断重触发）
+                        self.regs[idx] = value;
+                        for ep in 0..EP_COUNT {
+                            if value & (1 << ep) != 0 {
+                                self.regs[(Self::diep_int_off(ep) >> 2) as usize] |= EPINT_TXFE;
+                                // TXFE 为电平（FIFO 空）：无条件投递，让固件进 usb_isr；
+                                // gintsts() 按 DAINTMSK 派生 IEPINT 决定固件是否处理。
+                                self.nvic.lock().unwrap().set_pending(USB_OTG_FS_IRQ);
+                            }
+                        }
+                    }
+                    OFF_GINTMSK => {
+                        // 电平中断语义：使能位与 GINTSTS 现状匹配时立即重新挂起
+                        //（真机：RXFLVL/USBRST/ENUMDNE 是电平线，GINTMSK 重新使能且
+                        // 对应 GINTSTS 位仍置位 → 中断线立即重触发，无需新沿）。
+                        // ST 栈 RXFLVL 处理依赖此：关 RXFLVL → 读 GRXSTSP（弹 1 状态字）
+                        // → 重新使能 RXFLVL；队列未弹空时 RXFLVL 保持置位 → 重挂起继续。
+                        self.regs[idx] = value;
+                        let gint = self.regs[(OFF_GINTSTS >> 2) as usize] & GINT_RW_MASK;
+                        let gint_en = self.regs[(OFF_GAHBCFG >> 2) as usize] & GAHBCFG_GINT != 0;
+                        if gint_en && (gint & value & (GINT_RXFLVL | GINT_USBRST | GINT_ENUMDNE | GINT_WKUP)) != 0 {
+                            self.pulse();
+                        }
                     }
                     OFF_GCCFG => {
                         // 掉电位：写 1 掉电、写 0 上电（其余位存储回读）

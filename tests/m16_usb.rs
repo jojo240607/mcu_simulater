@@ -131,10 +131,15 @@ fn m16_usb_event_interconnect() {
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
 
-    // 固件等价的门控：DOEPMSK.STUPM + DAINTMSK.OEP0（GINTMSK.RXFLVL 与总线复位无关）
+    // 固件等价的门控：GINTMSK.RXFLVL + GAHBCFG.GINT（inject_setup 的即时效果是
+    // RXFLVL 置位 + 数据入接收 FIFO；DOEPINT0.STUP 由固件 RXFLVL 处理弹 SETUP_COMP
+    // 状态字后置位——不经固件时无法走到，故事件接线断言 RXFLVL + GRXSTSP 队列）。
+    const GINT_RXFLVL_BIT: u32 = 1 << 4;
     const DOEPMSK_STUPM: u32 = 1 << 3;
     const DAINTMSK_OEP0: u32 = 1 << 16;
     let bus = m.bus.clone();
+    bus.lock().unwrap().write(USB_OTG_FS_BASE + 0x008, 4, 0x1).unwrap(); // GAHBCFG.GINT
+    bus.lock().unwrap().write(USB_OTG_FS_BASE + 0x018, 4, GINT_RXFLVL_BIT).unwrap();
     bus.lock()
         .unwrap()
         .write(USB_OTG_FS_BASE + 0x814, 4, DOEPMSK_STUPM)
@@ -151,16 +156,21 @@ fn m16_usb_event_interconnect() {
         .publish(&Event::UsbSetup {
             data: [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00],
         });
-    let stup = bus
+    let rxfl = bus
         .lock()
         .unwrap()
-        .read(USB_OTG_FS_BASE + OFF_DOEPINT0, 4)
+        .read(USB_OTG_FS_BASE + 0x014, 4)
         .unwrap()
-        & EPINT_STUP;
-    assert_ne!(stup, 0, "DOEPINT0.STUP 应置位（UsbSetup 事件路由）");
+        & GINT_RXFLVL_BIT;
+    assert_ne!(rxfl, 0, "GINTSTS.RXFLVL 应置位（UsbSetup 事件路由）");
+    let q = {
+        let u = m.usb_otg.lock().unwrap();
+        !u.rx_status_empty()
+    };
+    assert!(q, "GRXSTSP 状态队列应非空（SETUP_DATA/SETUP_COMP 待固件弹取）");
     assert!(
         m.nvic.lock().unwrap().is_pending(USB_OTG_FS_IRQ),
-        "OTG_FS IRQ 应挂起（STUPM + DAINTMSK.OEP0 门控）"
+        "OTG_FS IRQ 应挂起（RXFLVL & GINTMSK.RXFLVL 门控）"
     );
 }
 

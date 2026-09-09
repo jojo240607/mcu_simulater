@@ -108,6 +108,22 @@ fn main() {
 
     let mut out = std::io::BufWriter::new(std::io::stdout());
     let mut last_len = 0usize;
+    // 虚拟 USB 主机注入（C 类 usb 真实主机通信）：
+    //   阶段 1：检测 App 的 READY 标记 → 注入总线复位 + 标准枚举（GET_DESCRIPTOR×2
+    //     / SET_ADDRESS / SET_CONFIGURATION）；
+    //   阶段 2：检测 App 的 ENUM-OK 标记 → 经 OUT EP1 注入 64B 模式数据（0x55+i）。
+    let mut usb_stage1 = false;
+    let mut usb_stage2 = false;
+    // 分步注入状态：reset 注入后等 DAINTMSK 配置（usbreset 处理完），再逐个 SETUP
+    //（每个 SETUP 等固件弹完 GRXSTSP 状态字即处理完），最后 SET_CONFIGURATION 后
+    // 等 App 报 ENUM-OK 注入 OUT。
+    let mut usb_setup_idx: usize = 0;
+    const USB_SETUPS: [[u8; 8]; 4] = [
+        [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00], // GET_DESCRIPTOR(Device)
+        [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x20, 0x00], // GET_DESCRIPTOR(Config)
+        [0x00, 0x05, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00], // SET_ADDRESS 0x2A
+        [0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00], // SET_CONFIGURATION 1
+    ];
     for step in 0.. {
         if max_steps != 0 && step >= max_steps {
             break;
@@ -128,6 +144,42 @@ fn main() {
             }
             last_len = raw.len();
         }
+        // 虚拟 USB 主机注入（两阶段握手，见上）
+        if !usb_stage1 || !usb_stage2 {
+            let text = {
+                let c = m.console.lock().unwrap();
+                String::from_utf8_lossy(c.output()).into_owned()
+            };
+            if !usb_stage1 && text.contains("DRVTEST-USB-HOST-READY") {
+                m.usb_otg.lock().unwrap().inject_usb_reset();
+                usb_stage1 = true;
+                eprintln!("<< usb host: READY → 注入总线复位");
+            }
+            // reset 后分步注入 SETUP：先等 usbreset 处理完（DAINTMSK 已配置），
+            // 再逐 SETUP 注入，每步等固件弹完 GRXSTSP 状态字。
+            if usb_stage1 && usb_setup_idx < USB_SETUPS.len() {
+                let (rx_empty, dmsk) = {
+                    let u = m.usb_otg.lock().unwrap();
+                    (u.rx_status_empty(), u.daintmsk())
+                };
+                let ready = if usb_setup_idx == 0 { dmsk != 0 } else { rx_empty };
+                if ready {
+                    m.usb_otg
+                        .lock()
+                        .unwrap()
+                        .inject_setup(USB_SETUPS[usb_setup_idx]);
+                    eprintln!("<< usb host: 注入 SETUP #{}", usb_setup_idx);
+                    usb_setup_idx += 1;
+                }
+            }
+            if !usb_stage2 && text.contains("DRVTEST-USB-ENUM-OK") {
+                let pattern: Vec<u8> = (0..64).map(|i| 0x55u8 + i as u8).collect();
+                m.usb_otg.lock().unwrap().inject_out(1, &pattern);
+                usb_stage2 = true;
+                eprintln!("<< usb host: ENUM-OK → OUT EP1 注入 64B 模式数据");
+            }
+        }
+
         // 注入 stdin
         let mut stop = false;
         while let Ok(item) = rx.try_recv() {
