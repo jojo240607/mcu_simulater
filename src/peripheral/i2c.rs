@@ -120,6 +120,11 @@ impl I2c {
         &self.slaves
     }
 
+    /// 从设备可变表（故障注入：按地址改 NACK 等）。
+    pub fn slaves_mut(&mut self) -> &mut [Box<dyn VirtualI2cSlave>] {
+        &mut self.slaves
+    }
+
     /// 推进所有从设备（仿真时间推进 Math 数据源）。
     pub fn step_slaves(&mut self, dt: f32) {
         for s in &mut self.slaves {

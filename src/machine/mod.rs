@@ -259,6 +259,21 @@ impl Machine {
         }
     }
 
+    /// 故障注入：按 7bit 地址对 I2C 从设备设置 NACK（模拟断线/无响应）。
+    ///
+    /// 返回是否命中从设备。固件侧表现为事务 AF → 传感器 healthy=false → FDIR 降级/安全。
+    pub fn inject_i2c_nack(&self, port: u8, addr7: u8, nack: bool) -> bool {
+        let idx = (port as usize).saturating_sub(1);
+        if let Some(i) = self.i2c.lock().unwrap().get(idx) {
+            let mut i = i.lock().unwrap();
+            if let Some(sl) = i.slaves_mut().iter_mut().find(|s| s.addr7() == addr7) {
+                sl.set_nack(nack);
+                return true;
+            }
+        }
+        false
+    }
+
     /// 推进所有虚拟从设备（仿真时间 `dt` 秒；Math 数据源步进 / UART 推流节拍）。
     pub fn step_virtual_slaves(&self, dt: f32) {
         for i in self.i2c.lock().unwrap().iter() {

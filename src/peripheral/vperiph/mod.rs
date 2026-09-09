@@ -57,6 +57,10 @@ pub trait VirtualI2cSlave: Send + Sync {
     fn read_count(&self) -> u64 {
         0
     }
+
+    /// 故障注入：手动 NACK（模拟断线/无响应 → 固件 healthy=false → FDIR 降级）。
+    /// 默认无操作；`RegFileSlave` 实现按 `nack` 字段生效。
+    fn set_nack(&mut self, _nack: bool) {}
 }
 
 /// 通用寄存器文件 I2C 从设备：寄存器 map + 动态数据源刷新 + 寄存器指针语义。
@@ -164,6 +168,10 @@ impl RegFileSlave {
 }
 
 impl VirtualI2cSlave for RegFileSlave {
+    fn set_nack(&mut self, nack: bool) {
+        self.nack = nack;
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

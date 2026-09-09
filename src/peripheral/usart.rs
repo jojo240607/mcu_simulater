@@ -67,6 +67,8 @@ pub struct Usart {
     irq: u32,
     /// 寄存器文件（SR/DR/BRR/CR1/CR2/CR3/GTPR）
     regs: [u32; 7],
+    /// CPU 读 DR 计数（POLL 消费观测）
+    n_cpu_dr_reads: u64,
     /// 最近接收字节（读 DR 返回）
     rx_byte: u8,
     /// 事件总线（发布 UartByte）
@@ -97,6 +99,7 @@ impl Usart {
             nvic,
             slaves: Vec::new(),
             rx_fifo: VecDeque::new(),
+            n_cpu_dr_reads: 0,
         }
     }
 
@@ -197,6 +200,16 @@ impl Usart {
         self.rx_fifo.len()
     }
 
+    /// 诊断：SR/CR1/CR3（故障排查用；观测接口）。
+    pub fn dbg_state(&self) -> (u32, u32, u32) {
+        (self.regs[0], self.regs[3], self.regs[5])
+    }
+
+    /// CPU 读 DR 次数（观测：POLL 读取是否在消费 FIFO）。
+    pub fn n_cpu_dr_reads(&self) -> u64 {
+        self.n_cpu_dr_reads
+    }
+
     /// 是否有待 DMA 搬运的接收请求（CR3.DMAR 使能且 RXNE 置位）。
     ///
     /// 供 Machine 在 feed_rx 之后直接路由 RX DMA（避免在事件分发内二次 publish）。
@@ -284,6 +297,7 @@ impl Peripheral for Usart {
             }
             OFF_DR => {
                 // 读 DR 返回接收字节并清 RXNE；虚拟推流 FIFO 优先（固件逐字节消费）
+                self.n_cpu_dr_reads += 1;
                 if let Some(b) = self.rx_fifo.pop_front() {
                     self.rx_byte = b;
                     if self.rx_fifo.is_empty() {

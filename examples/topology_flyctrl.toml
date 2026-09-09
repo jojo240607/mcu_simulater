@@ -1,0 +1,57 @@
+# ============================================================================
+# 虚拟外设拓扑：flyctrl real-sensors 全链路（悬停场景）
+#
+# 装配：mcu_simulater 按本文件把虚拟从设备挂到对应总线/端口（总线协议级）。
+# 用法（代码侧）：
+#   let toml = include_str!("../examples/topology_flyctrl.toml");
+#   mcu_simulater::config::apply_topology(&m, toml)?;
+#
+# 字段：
+#   [[i2c_slave]]  port=I2C 端口(1..3)  name=观测名  addr=7bit 地址
+#                  model=从设备模型  source=物理模型（数据源）
+#   [[uart_slave]] port=USART 端口(1..6)  name=观测名
+#                  model=推流模型  source=物理模型
+# ============================================================================
+
+# ---- I2C（flyctrl real-sensors 的 i2c0 = I2C1, port=1）----
+[[i2c_slave]]
+port = 1
+name = "mpu6050"
+addr = 0x68
+model = "mpu6050"      # 寄存器级（WHO_AM_I + 0x3B 起 14B 动态 BE）
+source = "imu"         # StaticImu：悬停 accel=[0,0,9.81] gyro=0
+
+[[i2c_slave]]
+port = 1
+name = "bmp280"
+addr = 0x76
+model = "bmp280"       # 寄存器级（ID 0x58 + 0xF7 起 6B 20bit 压力）
+source = "baro"        # StaticBaro：101325 Pa（海平面）
+
+[[i2c_slave]]
+port = 1
+name = "qmc5883"
+addr = 0x0D
+model = "qmc5883"      # 寄存器级（0x00 起 6B LE 三轴磁力）
+source = "mag"         # StaticMag：[0.2, 0, 0.4] G（北向地磁）
+
+# ---- UART 推流（flyctrl：gps=uart1(USART2, port=2)、rc=uart2(USART3, port=3)）----
+[[uart_slave]]
+port = 2
+name = "gps"
+model = "nmea_gga"     # $GNGGA 推流（校验和正确，fix=3）
+source = "gps"         # StaticGps：31.2304N / 121.4737E / alt 4m
+
+[[uart_slave]]
+port = 3
+name = "sbus"
+model = "sbus"         # 25B 帧 16×11bit LSB-first（100Hz 语义）
+source = "sbus"        # StaticSbus：ch0..15=1500（ch2=1000 油门最小）
+
+# ---- 预留（后续）----
+# [[spi_slave]]
+# port = 1
+# name = "lis3mdl"
+# addr = 0x00            # SPI 无地址，片选位段
+# model = "lis3mdl"
+# source = "mag"
