@@ -291,14 +291,22 @@ impl Peripheral for Usart {
         }
         match offset {
             OFF_SR => {
-                // 读 SR 返回状态字；IDLE 位读后清（简化：避免 IDLEIE 反复触发）
-                self.regs[0] &= !SR_IDLE;
+                // 读 SR 返回状态字（含 IDLE）；IDLE 由真机序列"读 SR 再读 DR"清除
+                // （OFF_DR 分支清）。不能在读 SR 时先清——否则固件
+                // uart_hal_idle_pending() 永远读到 0，DMA+IDLE 的 IDLE 中断
+                // 永远不触发 uart_idle_flush（flush 从未执行，GPS/SBUS 无字节）。
                 Ok(self.regs[0])
             }
             OFF_DR => {
-                // 读 DR 返回接收字节并清 RXNE；虚拟推流 FIFO 优先（固件逐字节消费）
+                // 读 DR 清 IDLE（读 SR 后读 DR 的标准清位序列）；返回接收字节。
                 self.n_cpu_dr_reads += 1;
-                if let Some(b) = self.rx_fifo.pop_front() {
+                self.regs[0] &= !SR_IDLE;
+                if self.regs[5] & CR3_DMAR != 0 {
+                    // DMA 模式：RX 数据由 DMA 搬走（dma_read_dr 弹 fifo），CPU 读 DR
+                    // 仅用于清 IDLE/ORE 标志，不消费字节——否则固件 clear_idle/
+                    // clear_errors 每次读 DR 都从 fifo 偷走一个 DMA 待搬字节，
+                    // 每帧丢 1B → NMEA 帧永无完整。
+                } else if let Some(b) = self.rx_fifo.pop_front() {
                     self.rx_byte = b;
                     if self.rx_fifo.is_empty() {
                         self.regs[0] &= !SR_RXNE;

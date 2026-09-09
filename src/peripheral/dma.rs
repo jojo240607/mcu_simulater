@@ -134,6 +134,7 @@ const CR_TCIE: u32 = 1 << 4; // 传输完成中断使能（F4 DMA_SxCR bit4；bi
 // 旧值 1<<5 与固件写入的 bit4 永不匹配，TC 中断从不触发 → wait_done 超时）
 const CR_PINC: u32 = 1 << 9; // 外设地址递增
 const CR_MINC: u32 = 1 << 10; // 内存地址递增
+const CR_CIRC: u32 = 1 << 8; // 环形模式（F4 DMA_SxCR bit8）：NDTR 到 0 重载、M0AR 回卷
 // DIR bit7:6：00=外设→内存, 01=内存→外设, 10=内存→内存
 const CR_DIR_MM: u32 = 2 << 6;
 /// 通道选择（CHSEL bit28:25）
@@ -173,6 +174,10 @@ pub struct Dma {
     pending_items: [u32; 8],
     /// 各流待搬运的外设目标（None = 内存方向/未登记）
     pending_target: [Option<DmaTarget>; 8],
+    /// 各流环形模式初始 M0AR（CR.EN 置位时快照；CIRC 回卷用）
+    circ_base: [u32; 8],
+    /// 各流环形模式初始 NDTR（CR.EN 置位时快照；CIRC 重载用）
+    circ_ndtr: [u32; 8],
     /// 各流待搬运方向（service 发布时登记；外设侧以发布方向为准，
     /// 不读 CR.DIR——joc-base SDIO acquire 恒 M2P，读路径发布 P2M 时
     /// CR.DIR 仍为 M2P，若按 CR.DIR 搬运会走错分支导致读卡不排空）
@@ -220,6 +225,8 @@ impl Dma {
             pending_items: [0; 8],
             pending_dir: [0; 8],
             pending_target: [None; 8],
+            circ_base: [0; 8],
+            circ_ndtr: [0; 8],
             usart_handles: Default::default(),
             i2c_handles: Default::default(),
             spi_handles: Default::default(),
@@ -366,7 +373,14 @@ impl Dma {
             return false;
         }
         self.pending_transfer |= 1 << stream;
-        self.pending_items[stream] = items;
+        // P2M（每收 1 字节 1 次请求）：累加——一次推流突发内逐字节请求会在
+        // process 前相互覆盖，若覆盖则每 run() 只搬 1 字节、FIFO 越积越深、
+        // IDLE flush 迟到 → GPS 永远拼不出帧。M2P 为一次性整 NDTR 搬运，覆盖。
+        if dir == DmaDir::PeriphToMem {
+            self.pending_items[stream] = self.pending_items[stream].saturating_add(items);
+        } else {
+            self.pending_items[stream] = items;
+        }
         self.pending_dir[stream] = dir.bits();
         self.pending_target[stream] = Some(target);
         true
@@ -522,44 +536,70 @@ impl Dma {
                 continue;
             };
             let ndtr = self.stream_reg(s, 1);
-            let new_ndtr = ndtr.saturating_sub(items);
+            let circ = cr & CR_CIRC != 0;
             let mut dev = dev.lock().unwrap();
             if dir == 1 {
-                // 内存 → 外设（TX）：M0AR → 外设 DR（按 MSIZE 取宽拼 u32）
-                for _ in 0..items {
+                // 内存 → 外设（TX）：M0AR → 外设 DR（按 MSIZE 取宽拼 u32）。
+                // 非环形一次性传输：写 DR 不超过 NDTR（越界字节丢弃——真机 NDTR 到 0
+                // 即停止）；环形不做限制（M0AR 由下方回卷处理）。
+                let write_n = if circ { items } else { items.min(ndtr) };
+                for _ in 0..write_n {
                     if let Ok(data) = mem.dma_read(dst as u64, mw) {
                         let mut value = 0u32;
                         for (i, b) in data[..mw].iter().enumerate() {
                             value |= (*b as u32) << (8 * i);
                         }
                         dev.dma_write_dr(value);
-                    } else {
                     }
                     if minc {
                         dst += mw as u32;
                     }
                 }
             } else {
-                // 外设 → 内存（RX）：外设 DR → M0AR（按 MSIZE 取宽写内存）
-                for _ in 0..items {
+                // 外设 → 内存（RX）：外设 DR → M0AR（按 MSIZE 取宽写内存）。
+                // 环形：M0AR 在批内跨越缓冲区末尾时立即回卷到 base（不越界写）；
+                // 非环形：最多写 NDTR 字节（真机 NDTR 到 0 停止，多余字节留外设）。
+                let base = if circ { self.circ_base[s] as u64 } else { 0 };
+                let buflen = if circ { self.circ_ndtr[s] as u64 } else { 0 };
+                let mut pos = dst as u64;
+                let write_n = if circ { items } else { items.min(ndtr) };
+                for _ in 0..write_n {
                     let value = dev.dma_read_dr().to_le_bytes();
-                    let _ = mem.dma_write(dst as u64, &value[..mw]);
+                    let _ = mem.dma_write(pos, &value[..mw]);
                     if minc {
-                        dst += mw as u32;
+                        pos += mw as u64;
+                        if circ && buflen > 0 && pos >= base + buflen {
+                            pos = base; // 批内回卷：禁止越界写 idle_buf
+                        }
                     }
                 }
+                dst = pos as u32;
             }
             drop(dev);
             // MINC 地址回写：下次搬运从续接地址开始（外设方向 PAR 固定，仅回写 M0AR）
             self.set_stream_reg(s, 3, dst);
+            // NDTR 扣减：环形取模（批内回卷后的真实剩余）；非环形饱和到 0
+            let new_ndtr = if circ {
+                (ndtr.wrapping_sub(items)) % self.circ_ndtr[s].max(1)
+            } else {
+                ndtr.saturating_sub(items)
+            };
             self.set_stream_reg(s, 1, new_ndtr);
             self.pending_transfer &= !(1 << s);
             if new_ndtr == 0 {
-                // 传输完成：EN 自动清零 + TCIF + 中断
-                self.set_stream_reg(s, 0, cr & !CR_EN);
-                self.set_stream_flag(s, FLAG_TCIF);
-                if cr & CR_TCIE != 0 {
-                    self.nvic.lock().unwrap().set_pending(self.stream_irq[s]);
+                if circ {
+                    // 环形：NDTR 重载、M0AR 回卷、EN 保持（持续搬运）。固件环形路径
+                    // （start_circular）已禁用流 IRQ，故不挂中断；TCIF 置位仅供状态观察。
+                    self.set_stream_reg(s, 1, self.circ_ndtr[s]);
+                    self.set_stream_reg(s, 3, self.circ_base[s]);
+                    self.set_stream_flag(s, FLAG_TCIF);
+                } else {
+                    // 一次性传输完成：EN 自动清零 + TCIF + 中断
+                    self.set_stream_reg(s, 0, cr & !CR_EN);
+                    self.set_stream_flag(s, FLAG_TCIF);
+                    if cr & CR_TCIE != 0 {
+                        self.nvic.lock().unwrap().set_pending(self.stream_irq[s]);
+                    }
                 }
             }
         }
@@ -611,6 +651,10 @@ impl Peripheral for Dma {
                 if i >= (OFF_CR as usize / 4) && (i - OFF_CR as usize / 4) % 6 == 0 {
                     if value & CR_EN != 0 {
                         self.active.store(true, Ordering::Relaxed);
+                        // 快照环形回卷基准（M0AR/NDTR 在 EN 写前已由驱动配置好）
+                        let s = (i - OFF_CR as usize / 4) / 6;
+                        self.circ_base[s] = self.stream_reg(s, 3);
+                        self.circ_ndtr[s] = self.stream_reg(s, 1);
                     } else {
                         self.sync_active();
                     }
@@ -651,7 +695,27 @@ impl Peripheral for Dma {
 mod tests {
     use super::*;
     use crate::core::Cpu;
+    use crate::peripheral::usart::{Usart, USART1_IRQ};
     use unicorn_engine::Prot;
+
+    /// 最小 DmaMem：全内存可读写（环形回卷测试用）
+    struct DmaMemFake;
+    impl DmaMem for DmaMemFake {
+        fn dma_read(
+            &mut self,
+            _addr: u64,
+            size: usize,
+        ) -> std::result::Result<Vec<u8>, crate::core::CoreError> {
+            Ok(vec![0u8; size])
+        }
+        fn dma_write(
+            &mut self,
+            _addr: u64,
+            _buf: &[u8],
+        ) -> std::result::Result<(), crate::core::CoreError> {
+            Ok(())
+        }
+    }
 
     fn dma() -> Dma {
         let nvic = Arc::new(Mutex::new(Nvic::new()));
@@ -754,6 +818,156 @@ mod tests {
         // 三次都写到固定目标 0x20000200，最后一次 0xCC
         let got = cpu.mem_read(0x2000_0200, 1).unwrap();
         assert_eq!(got[0], 0xCC, "MINC=0 时目标固定，最后写入 0xCC");
+    }
+
+
+    /// 环形（CIRC）P2M：NDTR 到 0 重载、M0AR 回卷、EN 保持、持续搬运不触发完成中断。
+    #[test]
+    fn circular_periph_to_mem_wraps_and_reloads() {
+        use crate::peripheral::usart::Usart;
+        use crate::events::EventBus;
+        let nvic = Arc::new(Mutex::new(Nvic::new()));
+        let bus = Arc::new(Mutex::new(EventBus::new()));
+        let d = Arc::new(Mutex::new(Dma::new(nvic.clone(), "DMA1", DMA1_STREAM_IRQ)));
+        let u = Arc::new(Mutex::new(Usart::new(1, bus, nvic, USART1_IRQ)));
+        d.lock().unwrap().register_usart(1, u.clone());
+
+        // 配置流 0：P2M(00)、MINC、CIRC，NDTR=8，M0AR=base（先写寄存器后置 EN）
+        let base: u32 = 0x2000_1000;
+        {
+            let mut dd = d.lock().unwrap();
+            dd.write(OFF_CR + 4, 4, 8).unwrap(); // NDTR
+            dd.write(OFF_CR + 8, 4, 0x4001_1004).unwrap(); // PAR=USART1_DR
+            dd.write(OFF_CR + 0x0C, 4, base).unwrap(); // M0AR
+            let cr = CR_EN | CR_CIRC | CR_MINC | (4 << 25) | (0 << 6); // CHSEL=4, DIR=00
+            dd.write(OFF_CR, 4, cr).unwrap();
+        }
+
+        // 使能 USART 接收 + DMAR（feed_rx_queued 门槛 + dma_rx_pending 条件）
+        {
+            let mut uu = u.lock().unwrap();
+            uu.write(0x0C, 4, 0x2000 | 0x4).unwrap(); // CR1: UE|RE
+            uu.write(0x14, 4, 0x40).unwrap();         // CR3: DMAR
+        }
+
+        // 注入 24 字节（3 圈）：每字节 feed → service_stream → process 搬 1 字节
+        for i in 0u8..24 {
+            {
+                let mut uu = u.lock().unwrap();
+                uu.feed_rx_queued(i);
+                assert!(uu.dma_rx_pending(), "第 {i} 字节应登记 DMA");
+            }
+            d.lock().unwrap().service_stream(0, 4, DmaDir::PeriphToMem, DmaTarget::Usart(1));
+            d.lock().unwrap().process(&mut DmaMemFake);
+            // NDTR 回卷点 + M0AR 回卷点验证
+            let ndtr = d.lock().unwrap().stream_reg(0, 1);
+            let m0ar = d.lock().unwrap().stream_reg(0, 3);
+            let en = d.lock().unwrap().stream_reg(0, 0) & CR_EN;
+            assert_ne!(en, 0, "CIRC 不得清 EN（第 {i} 字节）");
+            if i == 6 {
+                assert_eq!(ndtr, 1, "第 7 字节后 NDTR 应为 1");
+            }
+            if i == 7 {
+                // 第 8 字节处理完 NDTR 1→0 → 环形重载 + 回卷
+                assert_eq!(ndtr, 8, "NDTR 到 0 后应重载回 8");
+                assert_eq!(m0ar, base, "M0AR 应回卷到基址");
+            }
+            if i == 15 {
+                assert_eq!(ndtr, 8, "第二圈完成仍重载");
+                assert_eq!(m0ar, base, "第二圈 M0AR 回卷");
+            }
+        }
+        // 三圈后仍使能
+        assert_ne!(d.lock().unwrap().stream_reg(0, 0) & CR_EN, 0);
+    }
+
+    /// 环形批内回卷：单次 process 搬运 items > 剩余 NDTR 时，M0AR 在批内越过
+    /// 缓冲区末尾即回卷（不越界写），NDTR 按模计算。回归保护：修复前该场景
+    /// 会把 idle_buf 之后的引擎/ring 结构写坏（GPS/SBUS flush 读到垃圾）。
+    #[test]
+    fn circular_mid_batch_wrap_never_writes_past_buffer() {
+        use crate::peripheral::usart::Usart;
+        use crate::events::EventBus;
+        let nvic = Arc::new(Mutex::new(Nvic::new()));
+        let bus = Arc::new(Mutex::new(EventBus::new()));
+        let d = Arc::new(Mutex::new(Dma::new(nvic.clone(), "DMA1", DMA1_STREAM_IRQ)));
+        let u = Arc::new(Mutex::new(Usart::new(1, bus, nvic, USART1_IRQ)));
+        d.lock().unwrap().register_usart(1, u.clone());
+
+        // 缓冲区：idle_buf 之后 16 字节放哨兵，验证批内回卷不越界写
+        let base: u32 = 0x2000_1000;
+        const BUF: usize = 8;
+        const SENT: usize = 16;
+        let mut ram = [0u8; BUF + SENT];
+        let sentinel_begin = BUF;
+        struct TrackingMem(*mut u8, usize);
+        unsafe impl Send for TrackingMem {}
+        unsafe impl Sync for TrackingMem {}
+        impl DmaMem for TrackingMem {
+            fn dma_read(&mut self, _addr: u64, size: usize) -> Result<Vec<u8>, crate::core::CoreError> {
+                Ok(vec![0u8; size])
+            }
+            fn dma_write(&mut self, addr: u64, data: &[u8]) -> Result<(), crate::core::CoreError> {
+                let off = addr as usize - 0x2000_1000;
+                unsafe {
+                    for (i, b) in data.iter().enumerate() {
+                        if off + i < BUF + SENT {
+                            *self.0.add(off + i) = *b;
+                        } else {
+                            panic!("DMA 写出缓冲区（越界写 off={}）", off + i);
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+        let mut mem = TrackingMem(ram.as_mut_ptr(), 0);
+
+        {
+            let mut dd = d.lock().unwrap();
+            dd.write(OFF_CR + 4, 4, BUF as u32).unwrap(); // NDTR=8
+            dd.write(OFF_CR + 8, 4, 0x4001_1004).unwrap(); // PAR
+            dd.write(OFF_CR + 0x0C, 4, base).unwrap();      // M0AR
+            let cr = CR_EN | CR_CIRC | CR_MINC | (4 << 25) | (0 << 6);
+            dd.write(OFF_CR, 4, cr).unwrap();
+        }
+        {
+            let mut uu = u.lock().unwrap();
+            uu.write(0x0C, 4, 0x2000 | 0x4).unwrap(); // UE|RE
+            uu.write(0x14, 4, 0x40).unwrap();         // DMAR
+        }
+
+        // 先搬 6 字节（NDTR 8→2，M0AR=base+6）
+        for i in 0u8..6 {
+            u.lock().unwrap().feed_rx_queued(i);
+            d.lock().unwrap().service_stream(0, 4, DmaDir::PeriphToMem, DmaTarget::Usart(1));
+            d.lock().unwrap().process(&mut mem);
+        }
+        // 一次 feed 5 字节（items=5 > NDTR=2）：批内越过 base+8 → 回卷，再写 base+0..3。
+        // 每字节 feed 后各 service 一次（与机器逐字节推流一致），再单次 process 整批搬。
+        for i in 0u8..5 {
+            u.lock().unwrap().feed_rx_queued(0xA0 + i);
+            d.lock().unwrap().service_stream(0, 4, DmaDir::PeriphToMem, DmaTarget::Usart(1));
+        }
+        d.lock().unwrap().process(&mut mem);
+        // 批内回卷：位置 base+6..base+8 写 2 字节后回卷 base+0..base+3（共 5 字节）
+        {
+            let dd = d.lock().unwrap();
+            let m0ar = dd.stream_reg(0, 3);
+            assert_eq!(m0ar, base + 3, "M0AR 应停在 base+3（5 字节含一次回卷）");
+            let ndtr = dd.stream_reg(0, 1);
+            // (2-5) mod 8 = 5 → NDTR=5（还剩 5 空位）
+            assert_eq!(ndtr, 5, "NDTR 应为 (2-5) mod 8 = 5");
+            assert_ne!(dd.stream_reg(0, 0) & CR_EN, 0, "CIRC 保持 EN");
+        }
+        // 哨兵区未被写
+        assert!(ram[sentinel_begin..].iter().all(|&b| b == 0), "哨兵区被越界写");
+        // 批内回卷后的数据落点正确：base+6→A0, base+7→A1, base+0→A2, base+1→A3, base+2→A4
+        assert_eq!(ram[6], 0xA0);
+        assert_eq!(ram[7], 0xA1);
+        assert_eq!(ram[0], 0xA2);
+        assert_eq!(ram[1], 0xA3);
+        assert_eq!(ram[2], 0xA4);
     }
 
     #[test]
