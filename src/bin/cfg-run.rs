@@ -2,7 +2,7 @@
 //!
 //! 格式（极简、无第三方依赖；`#` 注释，`key = value`，可带引号）例 `run.cfg`：
 //!   elf       = D:\project\mcu\oop\joc-base\build_rel\stm32f407_minimal.elf
-//!   app       = D:\project\mcu\oop\drv-bringup-app-rust\app.bin   ; 可选
+//!   app       = /home/ubuntu/work/joc-drvtest-app/app.bin   ; 可选
 //!   n         = 400000      ; 每步预算
 //!   max_steps = 0           ; 0=直到 quit/EOF
 //!   rx_port   = 1           ; stdin 注入用的 USART 口（尽力）

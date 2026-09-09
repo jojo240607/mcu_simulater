@@ -1,4 +1,4 @@
-//! 校准判据：量"正常启动段（bringup done 之前，非风暴）里每 SysTick 平均退休指令数”。
+//! 校准判据：量"正常启动段（DRVTEST REPORT 之前，非风暴）里每 SysTick 平均退休指令数”。
 //! 供对齐 QEMU 周期口径（真机 vs 每块×3 幻数）。(只读诊断探针)
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,7 +6,7 @@ use std::sync::Arc;
 use mcu_simulater::machine::Machine;
 
 const SYS: &str = r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
-const APP: &str = r"/home/ubuntu/work/drv-bringup-app-rust/app.bin";
+const APP: &str = r"/home/ubuntu/work/joc-drvtest-app/app.bin";
 
 #[test]
 fn sys_retire_calib() {
@@ -61,9 +61,9 @@ fn sys_retire_calib() {
             let outv = m.console.lock().unwrap().output().to_vec();
             String::from_utf8_lossy(&outv).into_owned()
         };
-        if out.contains("bringup done") && (sy1 - sy0) > 0 && (ret1 - ret0) > 1000 {
+        if out.contains("DRVTEST REPORT") && (sy1 - sy0) > 0 && (ret1 - ret0) > 1000 {
             eprintln!(
-                ">>> 校准窗口(upto bringup done): per-SysTick ≈ {} 退休指令",
+                ">>> 校准窗口(upto REPORT): per-SysTick ≈ {} 退休指令",
                 (ret1 - ret0) / (sy1 - sy0)
             );
             break;

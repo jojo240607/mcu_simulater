@@ -1,7 +1,7 @@
 # mcu_simulater 运行指南 + 当前进度手账
 
 > 目标是给"怎么跑 / 已修到哪 / 下一步"一个可续的底稿，尤其面向 RTOS(joc-base) + App 分区
-> (drv-bringup-app-rust / joc-app-rust) 的验收。仓库当前**无交互 CLI**（`src/main.rs` 是 M0 骨架，
+> (joc-drvtest-app / joc-app-rust) 的验收。仓库当前**无交互 CLI**（`src/main.rs` 是 M0 骨架，
 > `config.parse`/Monitor/GDB 占位）——固件上线靠 `#[test]` 集成测试驱动。
 
 ## 一、怎么跑（最快可达）
@@ -16,7 +16,7 @@ $env:LIBCLANG_PATH = "D:\soft\llvm\bin"
 # 全量 / 单个
 cargo test --offline
 cargo test --release --offline --test x_jos_plain    # 系统固件跑到 READY 横幅
-cargo test --release --offline --test x_drv_bringup  # 系统 + drv-bringup app 分区 → BK 各驱动行
+cargo test --release --offline --test x_drvtest      # 系统 + drvtest app 分区 → DRVTEST REPORT 全绿（37/37）
 cargo test --release --offline --test x_jos_app      # 系统 + joc-app(flyctrl) → 任务拉起（当前到首轮）
 ```
 
@@ -35,7 +35,7 @@ cargo test --release --offline --test x_jos_app      # 系统 + joc-app(flyctrl)
     使 SysTick.LOAD=168000 差不多对应真机 ~6 万条退休指令/ms 口径）。
   - 数据访问 MEM hook 改为 MPU 使能后懒安装（规避本仓库早前 Unicorn“带 hook 新译 TB 首条
     32 位副作用丢失”缺陷对启动链的影响）。早先多处外围/SCB/ADC/USB 修复见 git diff。
-- 这些构建 `--offline`，`x_drv_bringup` 绿，`m_unicorn_bn_bug` 9/9。
+- 这些构建 `--offline`，`x_drvtest` 绿，`m_unicorn_bn_bug` 9/9。
 
 ### 本会话核心判定（带可复核数据）
 1. **① INSN_INVALID 已修**（Unicorn `translate.c` `gen_set_condexec`：IT 结束后把
@@ -64,8 +64,8 @@ cargo test --release --offline --test x_jos_app      # 系统 + joc-app(flyctrl)
    自我空切，见 §二.4 修复记录）。
 2. ~~若 idle 自我空切 → 给 PendSV 上 QEMU 语义门控~~（未走该路线：直接在 RTOS 侧
    rtos_yield 做空切防护更干净，见 §二.4）。
-3. 判据：`x_jos_hb` / `x_jos_app` 出 `hb seq=` / `alive seq=`（已通过）；`x_drv_bringup`
-   保持绿且无 `[SCHED_ASSERT]`；校准探针保持每 SysTick≈60k。
+3. 判据：`x_jos_hb` / `x_jos_app` 出 `hb seq=` / `alive seq=`（已通过）；`x_drvtest`
+   保持绿（DRVTEST REPORT total=37 pass=37 fail=0）且无 `[SCHED_ASSERT]`；校准探针保持每 SysTick≈60k。
 
 ## 三、配置化一键运行（推荐）
 
@@ -74,7 +74,7 @@ cargo test --release --offline --test x_jos_app      # 系统 + joc-app(flyctrl)
 ```powershell
 # 1) 编辑 run.cfg（仓库根示例；键见文件内注释）
 #    elf = D:\...\joc-base\build_rel\stm32f407_minimal.elf
-#    app = D:\...\drv-bringup-app-rust\app.bin    # 可选(轨道B应用分区)
+#    app = D:\...\joc-drvtest-app\app.bin        # 可选(应用分区)
 #    n=400000  max_steps=0  rx_port=1
 
 # 2) 一键跑（cmd，无 ExecutionPolicy 限制）

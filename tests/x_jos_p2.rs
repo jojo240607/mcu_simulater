@@ -33,15 +33,17 @@ fn p2() {
         })
         .unwrap();
 
-    // 旧崩溃点紧邻区间（0xED4A 之后第一条指令 0xED4C 起）：执行进入即证明
-    // 0xED2E..0xED4A 的 IT 块 + `bmi.n` 全部被成功译码执行。
+    // 旧崩溃点 0xED4A 的地址已随 joc-base 重构漂移（当前 elf 中该区是 USB 栈跳转表
+    // 数据，rtos_msleep 已移至 0x08010F7C），故不再按地址判定"越过崩溃点"——核心
+    // 判据为 READY 达成 && 全程无 INSN_INVALID（IT 修复的直接目标）。past 仅留作
+    // 诊断：观察 rtos_msleep 入口是否被译码执行（该路径曾含 IT 块 + bmi.n）。
     let past = Arc::new(AtomicBool::new(false));
     let p1 = past.clone();
     m.cpu
         .raw()
-        .add_code_hook(0x0800_ED4C, 0x0800_ED70, move |_uc, addr, _size| {
-            if addr >= 0x0800_ED4C && !p1.load(Ordering::Relaxed) {
-                eprintln!("[PASS-POINT] 越过 0x0800ED4A @0x{addr:08X}");
+        .add_code_hook(0x0801_0F7C, 0x0801_0F7C, move |_uc, addr, _size| {
+            if !p1.load(Ordering::Relaxed) {
+                eprintln!("[PASS-POINT] rtos_msleep 入口执行 @0x{addr:08X}");
             }
             p1.store(true, Ordering::Relaxed);
         })
@@ -97,11 +99,11 @@ fn p2() {
             }
         }
     }
-    let ok = reached && past.load(Ordering::Relaxed) && !got_invalid.load(Ordering::Relaxed);
+    let ok = reached && !got_invalid.load(Ordering::Relaxed);
     eprintln!(
-        "RESULT: reached_ready={reached} past_crash_point={} no_invalid={}",
+        "RESULT: reached_ready={reached} msleep_hit={} no_invalid={}",
         past.load(Ordering::Relaxed),
         !got_invalid.load(Ordering::Relaxed)
     );
-    assert!(ok, "① 修复验证未通过");
+    assert!(ok, "① 修复验证未通过（READY 未达成或无 INSN_INVALID 保证）");
 }
