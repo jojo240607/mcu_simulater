@@ -186,6 +186,10 @@ impl VirtualSpiSlave for Bmi088 {
         "bmi088"
     }
 
+    fn selected(&self) -> bool {
+        self.selected.is_some()
+    }
+
     fn on_cs(&mut self, port: u8, pin: u8, level: bool) {
         if level {
             // 拉高：帧结束（丢弃未完成部分）

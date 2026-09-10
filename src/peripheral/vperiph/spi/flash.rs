@@ -307,6 +307,10 @@ impl VirtualSpiSlave for SpiFlash {
         "spi_flash"
     }
 
+    fn selected(&self) -> bool {
+        self.selected
+    }
+
     fn on_cs(&mut self, port: u8, pin: u8, level: bool) {
         if level {
             // 拉高：帧结束。页编程在 CS 上升沿提交并清 WEL（真机语义）。

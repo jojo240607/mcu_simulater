@@ -69,8 +69,9 @@ pub struct Spi {
     bus: Arc<Mutex<EventBus>>,
     /// NVIC（RXNE/TXE → 挂起 SPI IRQ）
     nvic: Arc<Mutex<Nvic>>,
-    /// 虚拟从设备（挂载后：主机发字节 → on_byte 直路由，回送字节锁存为 RX）
-    slave: Option<Box<dyn VirtualSpiSlave>>,
+    /// 虚拟从设备表（同总线多从机：片选经 GPIO 事件按 CS 路由，主机发字节 →
+    /// 选中从机 on_byte 直路由，回送字节锁存为 RX；未选中回 0xFF）
+    slaves: Vec<Box<dyn VirtualSpiSlave>>,
 }
 
 impl Spi {
@@ -82,42 +83,42 @@ impl Spi {
             rx_byte: 0,
             bus,
             nvic,
-            slave: None,
+            slaves: Vec::new(),
         }
     }
 
     /// 挂载虚拟从设备（总线协议级直路由，仿 I2C `register_slave`）。
     pub fn register_slave(&mut self, slave: Box<dyn VirtualSpiSlave>) {
-        self.slave = Some(slave);
+        self.slaves.push(slave);
     }
 
     /// 从设备数（观测）
     pub fn slave_count(&self) -> usize {
-        self.slave.as_ref().map(|_| 1).unwrap_or(0)
+        self.slaves.len()
     }
 
-    /// 片选引脚变化转发给虚拟从设备（GPIO 事件；从机自行过滤关注的引脚）。
+    /// 片选引脚变化转发给全部虚拟从设备（GPIO 事件；从机自行过滤关注的引脚）。
     pub fn route_cs(&mut self, port: u8, pin: u8, level: bool) {
-        if let Some(sl) = &mut self.slave {
+        for sl in &mut self.slaves {
             sl.on_cs(port, pin, level);
         }
     }
 
     /// 推进虚拟从设备（仿真时间；Math 数据源步进）。
     pub fn step_slave(&mut self, dt: f32) {
-        if let Some(sl) = &mut self.slave {
+        for sl in &mut self.slaves {
             sl.step(dt);
         }
     }
 
-    /// 虚拟从设备访问计数（观测/断言）。
+    /// 虚拟从设备访问计数（观测/断言；多从机求和）。
     pub fn slave_access(&self) -> u64 {
-        self.slave.as_ref().map(|s| s.access_count()).unwrap_or(0)
+        self.slaves.iter().map(|s| s.access_count()).sum()
     }
 
     /// 触发虚拟从设备持久化（SPI NOR Flash 等保存用途器件写回文件）。
     pub fn persist_slave(&mut self) {
-        if let Some(sl) = &mut self.slave {
+        for sl in &mut self.slaves {
             sl.persist();
         }
     }
@@ -130,11 +131,13 @@ impl Spi {
     /// 死锁；RX DMA 请求由 Machine 装配的 SpiRx 订阅在 feed_rx 之后直接路由
     /// （见 [`Spi::dma_rx_pending`] 与 machine 装配注释）。
     fn exchange(&mut self, byte: u8) {
-        let reply = if let Some(sl) = &mut self.slave {
-            sl.on_byte(byte)
-        } else {
-            0xFF // 无从机：MISO 默认高
-        };
+        // 同总线多从机：仅 CS 选中的从机响应（未选中回 0xFF，MISO 默认高）
+        let reply = self
+            .slaves
+            .iter_mut()
+            .find(|sl| sl.selected())
+            .map(|sl| sl.on_byte(byte))
+            .unwrap_or(0xFF);
         // 全双工真机语义：CPU 写 DR 后 RXNE 必置位（收 MISO；无虚拟从机时
         // 回送 0xFF）。这样固件 POLL 读（如 bmi088 WHO 校验）在无物理从机的
         // 环境也不会死等——真机 SPI 8 个 SCK 后 RXNE 照常置位（MISO 悬空读

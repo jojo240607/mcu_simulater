@@ -27,9 +27,11 @@ use std::sync::{Arc, Mutex};
 
 pub mod bmi088;
 pub mod flash;
+pub mod pmw3901;
 
 pub use bmi088::Bmi088;
 pub use flash::SpiFlash;
+pub use pmw3901::{FlowModel, Pwm3901, StaticFlow};
 
 /// SPI 总线从设备接口。
 ///
@@ -48,6 +50,12 @@ pub trait VirtualSpiSlave: Send + Sync {
     ///
     /// 未选中（CS 高）或帧未开始时不解析，回 `0xFF`（MISO 默认高）。
     fn on_byte(&mut self, byte: u8) -> u8;
+
+    /// 是否被片选选中（CS 拉低 = 选中；同总线多从机按此路由字节流）。
+    /// 默认 false（未选中）；实现类按自己的 CS 引脚状态返回。
+    fn selected(&self) -> bool {
+        false
+    }
 
     /// 被访问次数（观测/断言：虚拟外设是否被固件访问）。
     fn access_count(&self) -> u64 {

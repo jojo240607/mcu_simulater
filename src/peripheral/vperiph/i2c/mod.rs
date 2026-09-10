@@ -12,10 +12,12 @@
 
 pub mod bmp280;
 pub mod mpu6050;
+pub mod vl53l1x;
 pub mod qmc5883;
 
 pub use bmp280::bmp280;
 pub use mpu6050::mpu6050;
+pub use vl53l1x::{StaticToF, ToFModel, Vl53l1x, VL53L1X_ADDR7, VL53L1X_WHO_AM_I};
 pub use qmc5883::qmc5883;
 
 /// 默认静态模型装配（悬停：IMU 抵消重力、气压海平面、地磁北向）。

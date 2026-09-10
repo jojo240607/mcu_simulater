@@ -17,7 +17,8 @@ use unicorn_engine::RegisterARM;
 use mcu_simulater::machine::Machine;
 use mcu_simulater::peripheral::vperiph::data_source::StaticImu;
 use mcu_simulater::peripheral::vperiph::esc::{Esc, EscConfig, EscMotor};
-use mcu_simulater::peripheral::vperiph::spi::{Bmi088, SpiFlash};
+use mcu_simulater::peripheral::vperiph::i2c::{StaticToF, Vl53l1x};
+use mcu_simulater::peripheral::vperiph::spi::{Bmi088, Pwm3901, SpiFlash, StaticFlow};
 
 #[test]
 fn drvtest_all_drivers_pass() {
@@ -61,6 +62,14 @@ fn drvtest_all_drivers_pass() {
     })) as Box<dyn EscMotor>));
     m.register_esc(esc_pwm.clone());
     m.register_esc(esc_dshot.clone());
+
+    // PMW3901 光流：与 BMI088 共享 SPI3 总线（port 3），CS=GPIOE_11（port4/pin11）。
+    // 验证同总线多从机按 CS 路由（bmi088 用 PE7/8，pmw3901 用 PE11）。
+    // 默认模型：dx=1.0px（256）、dy=0.5px（128）、squal=120。
+    m.register_spi_slave(3, Box::new(Pwm3901::new((4, 11), StaticFlow::default())));
+    // VL53L1X ToF：I2C 0x29 挂 i2c0（port 1，与 mpu6050/bmp280/qmc5883 同总线）。
+    // 默认模型：距离 500mm。
+    m.register_i2c_slave(1, Box::new(Vl53l1x::new(StaticToF::new(500))));
 
     // INSN_INVALID 兜底：任何非法指令直接判失败（回归守卫）。
     let bad_pc = Arc::new(AtomicU32::new(0));
@@ -279,6 +288,27 @@ fn drvtest_all_drivers_pass() {
         assert!(dshot.dshot_frames() >= 1, "DShot 应至少解码 1 帧（frames={}）", dshot.dshot_frames());
         assert_eq!(dshot.crc_errors(), 0, "DShot CRC 不应出错（errors={}）", dshot.crc_errors());
         eprintln!(">>> ESC 全链路：PWM 60%→电调量1000/转速6000 ✓ DShot 油门1000/CRC0 错 ✓");
+    }
+    // d_pmw3901 / d_vl53l1x 全链路验收（模拟器虚拟从机回送真实数据）：
+    //   PMW3901：Product_ID=0x49、Delta_X=256（1.0px 8.8 定点）、Delta_Y=128、
+    //   SQUAL=120、Motion 就绪位；与 bmi088 共享 SPI3 且按 CS 区分（多从机路由）
+    //   VL53L1X：WHO_AM_I=0xEA、测距 500mm、清中断；I2C 0x29 挂 i2c0
+    {
+        let out_str = String::from_utf8_lossy(&out);
+        let has_pid = out_str.contains("Product_ID=0x49 正确");
+        let has_delta = out_str.contains("dx=256 dy=128");
+        let has_who = out_str.contains("WHO_AM_I=0xEA 正确");
+        let has_mm = out_str.contains("distance=500mm 正确");
+        eprintln!(">>> [SENSOR-DIAG] pid={has_pid} delta={has_delta} who={has_who} mm={has_mm}");
+        assert!(has_pid && has_delta, "PMW3901 用例断言未命中（pid={has_pid} delta={has_delta}）");
+        assert!(has_who && has_mm, "VL53L1X 用例断言未命中（who={has_who} mm={has_mm}）");
+        // 模拟器从机真实被访问：SPI3（port 3）总访问 = bmi088 + pmw3901；I2C1 读计数 > 0
+        let spi3_access = m.spi.lock().unwrap()[2].lock().unwrap().slave_access();
+        assert!(spi3_access > 0, "SPI3 总线未被固件访问（access={spi3_access}）");
+        let i2c1_reads: u64 = m.i2c.lock().unwrap()[0].lock().unwrap().slaves().iter()
+            .map(|s| s.read_count()).sum();
+        assert!(i2c1_reads > 0, "I2C1 总线读计数为 0（VL53L1X 链路未打通）");
+        eprintln!(">>> PMW3901（SPI3 共享总线多从机）+ VL53L1X（I2C 0x29）全链路 ✓（SPI3 访问 {spi3_access}B，I2C1 读 {i2c1_reads} 次）");
     }
     eprintln!(">>> 验收通过：{pass}/{total} 通过，{skip} 跳过，0 失败");
 }
