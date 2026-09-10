@@ -1940,6 +1940,11 @@ impl Machine {
     }
 
     /// 是否有挂起中断（探测/调试用）。
+    /// 退役指令数（Thumb 字节计数；≈2 字节/指令）。性能观测：Δretired/墙钟 = 吞吐。
+    pub fn retired_count(&self) -> u64 {
+        self.retired_insts.load(Ordering::Relaxed)
+    }
+
     pub fn nvic_pending(&self) -> bool {
         self.status.has(BIT_NVIC_PENDING)
     }
