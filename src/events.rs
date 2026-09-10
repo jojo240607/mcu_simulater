@@ -38,10 +38,12 @@ pub enum Event {
     /// TIM 更新事件（TIM 计数溢出/软件更新 → Machine 路由 DMA 请求。
     /// 仅 DIER.UDE 使能时发布，等价硬件"更新事件 → DMA 请求"）
     TimUpdate { port: u8 },
-    /// TIM PWM/输出比较电平变化（OCxREF 变化 → 虚拟示波器/GPIO 接线订阅）
-    TimPwm { port: u8, channel: u8, level: bool },
-    /// GPIO 电平变化
-    GpioLevel { port: u8, pin: u8, level: bool },
+    /// TIM PWM/输出比较电平变化（OCxREF 变化 → 虚拟示波器/GPIO 接线订阅）。
+    /// `tick` = 事件时刻的退役字节计数（虚拟时钟基准，ESC/示波器据此测脉宽/占空比）
+    TimPwm { port: u8, channel: u8, level: bool, tick: u64 },
+    /// GPIO 电平变化。`tick` = 事件时刻的退役字节计数（虚拟时钟基准，
+    /// DShot 位时序解码按相邻事件 tick 差测脉宽）
+    GpioLevel { port: u8, pin: u8, level: bool, tick: u64 },
     /// DCMI 帧数据（测试/虚拟摄像头 → DCMI，注入一帧图像数据；驱动 SR.FNE + RIS.FRAME）
     DcmiFrame { port: u8, data: Vec<u8> },
     /// SDIO DMA 请求（SDIO → DMA2；读=外设→内存、写=内存→外设。

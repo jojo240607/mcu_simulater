@@ -121,6 +121,8 @@ pub struct Machine {
     pub usart: Arc<Mutex<Vec<Arc<Mutex<Usart>>>>>,
     /// SPI1-3 外设句柄（index = port-1；SPI 虚拟从设备挂载点，全双工直路由）
     pub spi: Arc<Mutex<Vec<Arc<Mutex<Spi>>>>>,
+    /// ESC 电调 + 无刷电机虚拟外设（信号观测：订阅 TimPwm/GpioLevel）
+    pub escs: Arc<Mutex<Vec<Arc<Mutex<Box<dyn crate::peripheral::vperiph::esc::EscMotor>>>>>>,
     /// CAN1 控制器局域网（@0x40006400，APB1；邮箱/接收 FIFO/过滤 + CanFrame 总线互联）
     pub can1: Arc<Mutex<Can>>,
     /// CAN2 控制器局域网（@0x40006800，APB1；同上，与 CAN1 互联）
@@ -223,6 +225,7 @@ impl Machine {
             i2c: Arc::new(Mutex::new(Vec::new())),
             usart: Arc::new(Mutex::new(Vec::new())),
             spi: Arc::new(Mutex::new(Vec::new())),
+            escs: Arc::new(Mutex::new(Vec::new())),
             can1: Arc::new(Mutex::new(Can::new(1, Some(events.clone()), nvic.clone()))),
             can2: Arc::new(Mutex::new(Can::new(2, Some(events.clone()), nvic.clone()))),
             flash: Arc::new(Mutex::new(Flash::new())),
@@ -290,6 +293,29 @@ impl Machine {
         }
     }
 
+    /// 注册 ESC 电调 + 无刷电机虚拟外设。
+    ///
+    /// ESC 是信号观测者（非总线从设备）：订阅 `TimPwm`（PWM 电调输入）与
+    /// `GpioLevel`（DShot bit-bang 输入），内部按配置过滤端口/通道/引脚。
+    /// 回调内只更新 ESC 状态、不发布事件（避免事件分发回调内二次 publish 死锁）。
+    pub fn register_esc(&self, esc: Arc<Mutex<Box<dyn crate::peripheral::vperiph::esc::EscMotor>>>) {
+        let esc2 = esc.clone();
+        let esc3 = esc.clone();
+        self.events.lock().unwrap().subscribe(Arc::new(Mutex::new(move |ev: &Event| {
+            match ev {
+                Event::TimPwm { port, channel, level, tick } => {
+                    esc2.lock().unwrap().on_pwm(*port, *channel, *level, *tick);
+                }
+                Event::GpioLevel { port, pin, level, tick } => {
+                    esc2.lock().unwrap().on_gpio(*port, *pin, *level, *tick);
+                }
+                _ => {}
+            }
+        })));
+        let _ = esc3;
+        self.escs.lock().unwrap().push(esc);
+    }
+
     /// 注册 SPI 虚拟从设备（全双工直路由挂载；片选经 GPIO 事件转发）。
     ///
     /// `port` = SPI 端口（1/2/3）。固件用 GPIO 输出拉低 CS 选中从机（无硬件 NSS），
@@ -308,6 +334,9 @@ impl Machine {
         }
         for s in self.spi.lock().unwrap().iter() {
             s.lock().unwrap().step_slave(dt);
+        }
+        for e in self.escs.lock().unwrap().iter() {
+            e.lock().unwrap().step(dt);
         }
     }
 
@@ -599,7 +628,11 @@ impl Machine {
 
         // GPIOA-I（port 0..8；F407 共 9 个端口，基址 0x40020000 起每 0x400 一个）
         for port in 0..9u8 {
-            let gpio = Arc::new(Mutex::new(Gpio::new(port, events.clone())));
+            let gpio = Arc::new(Mutex::new(Gpio::with_retired(
+                port,
+                events.clone(),
+                self.retired_insts.clone(),
+            )));
             let base = 0x4002_0000 + (port as u32) * 0x400;
             self.bus.lock().unwrap().attach(base, 0x400, format!("GPIO{}", (b'A' + port) as char), gpio)?;
         }
@@ -748,7 +781,7 @@ impl Machine {
             let spi_vec = self.spi.clone();
             events.lock().unwrap().subscribe(Arc::new(Mutex::new(
                 move |ev: &Event| {
-                    if let Event::GpioLevel { port, pin, level } = ev {
+                    if let Event::GpioLevel { port, pin, level, .. } = ev {
                         for s in spi_vec.lock().unwrap().iter() {
                             s.lock().unwrap().route_cs(*port, *pin, *level);
                         }
@@ -1265,6 +1298,7 @@ impl Machine {
                 events.clone(),
                 self.nvic.clone(),
                 tim_active.clone(),
+                self.retired_insts.clone(),
             )));
             self.bus
                 .lock()
@@ -1451,7 +1485,7 @@ impl Machine {
             let exti2 = exti.clone();
             events.lock().unwrap().subscribe(Arc::new(Mutex::new(
                 move |ev: &Event| {
-                    if let Event::GpioLevel { port, pin, level } = ev {
+                    if let Event::GpioLevel { port, pin, level, .. } = ev {
                         exti2.lock().unwrap().feed_gpio(*port, *pin, *level);
                     }
                 },

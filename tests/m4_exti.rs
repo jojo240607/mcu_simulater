@@ -46,7 +46,7 @@ fn drive_pa0(m: &mut Machine, level: bool) {
     m.events
         .lock()
         .unwrap()
-        .publish(&Event::GpioLevel { port: 0, pin: 0, level });
+        .publish(&Event::GpioLevel { port: 0, pin: 0, level, tick: 0 });
 }
 
 #[test]

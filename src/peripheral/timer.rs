@@ -49,7 +49,7 @@
 //! - BDTR 0x44（高级：DTG=bit7:0, BKE=bit12, BKP=bit13, AOE=bit14, MOE=bit15）
 //! - DCR 0x48（DBL=bit4:0, DBA=bit12:8）/ DMAR 0x4C
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::events::{Event, EventBus};
@@ -208,6 +208,8 @@ pub struct Timer {
     moe_state: bool,
     /// 事件总线（更新事件 + UDE → 发布 TimUpdate；OCx/OCxN 电平变化 → TimPwm）
     bus: Arc<Mutex<EventBus>>,
+    /// 退役指令计数器（TimPwm 事件时间戳 tick；测试用一次性占位）
+    retired: Arc<AtomicU64>,
     /// 共享 NVIC（更新事件 → 更新中断；CC 匹配/捕获 → CC 中断；刹车 → 刹车中断）
     nvic: Arc<Mutex<Nvic>>,
     /// 活动标记（CR1.CEN）：Machine block hook 据此跳过未使能定时器的加锁 tick
@@ -217,7 +219,14 @@ pub struct Timer {
 impl Timer {
     /// 便捷构造（单元测试用）：活动标记为一次性占位，不与 Machine 联动
     pub fn new(port: u8, cfg: TimerConfig, bus: Arc<Mutex<EventBus>>, nvic: Arc<Mutex<Nvic>>) -> Self {
-        Self::with_active(port, cfg, bus, nvic, Arc::new(AtomicBool::new(false)))
+        Self::with_active(
+            port,
+            cfg,
+            bus,
+            nvic,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        )
     }
 
     /// 正式构造：`active` 由 Machine 持有（与 timers 列表并行），CR1.CEN 变化时同步
@@ -227,6 +236,7 @@ impl Timer {
         bus: Arc<Mutex<EventBus>>,
         nvic: Arc<Mutex<Nvic>>,
         active: Arc<AtomicBool>,
+        retired: Arc<AtomicU64>,
     ) -> Self {
         let mut t = Self {
             port,
@@ -249,6 +259,7 @@ impl Timer {
             bus,
             nvic,
             active,
+            retired,
         };
         t.reset();
         t
@@ -389,10 +400,12 @@ impl Timer {
     /// 发布通道电平变化事件（主通道 0-3，互补通道 4-7）。
     /// 调用方须先更新输出电平再发布（电平未变时不发布，避免事件噪声）。
     fn publish_pwm(&self, channel: u8, level: bool) {
-        self.bus
-            .lock()
-            .unwrap()
-            .publish(&Event::TimPwm { port: self.port, channel, level });
+        self.bus.lock().unwrap().publish(&Event::TimPwm {
+            port: self.port,
+            channel,
+            level,
+            tick: self.retired.load(Ordering::Relaxed),
+        });
     }
 
     /// 设置主输出 OCx 电平并发布（MOE=0 时强制无效电平）。
@@ -1007,7 +1020,7 @@ mod tests {
         bus.lock()
             .unwrap()
             .subscribe(Arc::new(Mutex::new(move |ev: &Event| {
-                if let Event::TimPwm { port, channel, level } = ev {
+                if let Event::TimPwm { port, channel, level, .. } = ev {
                     g.lock().unwrap().push((*port, *channel, *level));
                 }
             })));
@@ -1133,7 +1146,7 @@ mod tests {
         bus.lock()
             .unwrap()
             .subscribe(Arc::new(Mutex::new(move |ev: &Event| {
-                if let Event::TimPwm { port: 1, channel, level } = ev {
+                if let Event::TimPwm { port: 1, channel, level, .. } = ev {
                     g.lock().unwrap().push((*channel, *level));
                 }
             })));

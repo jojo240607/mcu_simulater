@@ -73,11 +73,13 @@ fn m17_gpio_fghi_exti_route() {
             port,
             pin: 0,
             level: false, // 复位沿检测状态
+            tick: 0,
         });
         m.events.lock().unwrap().publish(&Event::GpioLevel {
             port,
             pin: 0,
             level: true, // 上升沿 → EXTI0 PR + IRQ6 挂起
+            tick: 0,
         });
         assert_eq!(
             bus.lock().unwrap().read(EXTI_BASE + OFF_PR, 4).unwrap(),
@@ -98,6 +100,7 @@ fn m17_gpio_fghi_exti_route() {
         port: 0,
         pin: 0,
         level: true,
+        tick: 0,
     });
     assert_eq!(
         bus.lock().unwrap().read(EXTI_BASE + OFF_PR, 4).unwrap(),

@@ -69,7 +69,7 @@ fn m6_tim_advanced_end_to_end() {
     let trace = Arc::new(Mutex::new(Vec::new()));
     let tr = trace.clone();
     m.events.lock().unwrap().subscribe(Arc::new(Mutex::new(move |ev: &Event| {
-        if let Event::TimPwm { port: 1, channel, level } = ev {
+        if let Event::TimPwm { port: 1, channel, level, .. } = ev {
             if *channel == 0 || *channel == 4 {
                 tr.lock().unwrap().push((*channel, *level));
             }

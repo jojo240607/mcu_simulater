@@ -12,10 +12,11 @@
 //! 断言：fail == 0（任何驱动用例失败即验收失败）；INSN_INVALID 兜底判失败。
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use unicorn_engine::RegisterARM;
 use mcu_simulater::machine::Machine;
 use mcu_simulater::peripheral::vperiph::data_source::StaticImu;
+use mcu_simulater::peripheral::vperiph::esc::{Esc, EscConfig, EscMotor};
 use mcu_simulater::peripheral::vperiph::spi::{Bmi088, SpiFlash};
 
 #[test]
@@ -40,6 +41,26 @@ fn drvtest_all_drivers_pass() {
     let flash_path = std::env::temp_dir().join(format!("drvtest_spiflash_{}.bin", std::process::id()));
     let _ = std::fs::remove_file(&flash_path);
     m.register_spi_slave(2, Box::new(SpiFlash::with_file(64 * 1024, (4, 9), flash_path.clone())));
+
+    // ESC 电调 + 无刷电机虚拟外设（信号观测，非总线从设备）：
+    //   - PWM 电调输入：pwm0 = TIM3_CH1（port 3/ch 0，400Hz/2500μs 周期）
+    //     60% 占空比 → 脉宽 1500μs → 电调量 1000 → 转速 6000 RPM（max 12000）
+    //   - DShot 电调输入：dshot0 = GPIOE_10（port 4/pin 10）bit-bang 油门 1000
+    let esc_pwm = Arc::new(Mutex::new(Box::new(Esc::new(EscConfig {
+        name: "esc_pwm",
+        pwm_port: Some(3),
+        pwm_channel: Some(0),
+        pwm_period_us: 2500,
+        ..Default::default()
+    })) as Box<dyn EscMotor>));
+    let esc_dshot = Arc::new(Mutex::new(Box::new(Esc::new(EscConfig {
+        name: "esc_dshot",
+        dshot_port: Some(4),
+        dshot_pin: Some(10),
+        ..Default::default()
+    })) as Box<dyn EscMotor>));
+    m.register_esc(esc_pwm.clone());
+    m.register_esc(esc_dshot.clone());
 
     // INSN_INVALID 兜底：任何非法指令直接判失败（回归守卫）。
     let bad_pc = Arc::new(AtomicU32::new(0));
@@ -233,6 +254,31 @@ fn drvtest_all_drivers_pass() {
         assert_eq!(&img[0x0200..0x0204], &[0xFF; 4], "0x0200 所在扇区擦除后应为 0xFF");
         assert!(text.contains("SPIFLASH-SAVE"), "持久化文件标记仍在（擦除后写入存活）");
         eprintln!(">>> SPI NOR Flash 全链路：JEDEC=EF4018 ✓ 写读回 ✓ 擦除 ✓ 持久化文件含标记 ✓（{}B 映像）", img.len());
+    }
+    // d_esc 全链路验收（模拟器 ESC 虚拟外设按事件解码）：
+    //   PWM 电调输入：pwm0 60% 占空比（脉宽 1500μs）→ 电调量 1000 → 转速 6000 RPM；
+    //   DShot 电调输入：dshot0 发送油门 1000 → 电调量 1000，CRC 0 错、帧 ≥1。
+    {
+        let pwm = esc_pwm.lock().unwrap();
+        let dshot = esc_dshot.lock().unwrap();
+        let out_str = String::from_utf8_lossy(&out);
+        let has_pwm_str = out_str.contains("pwm0 60% duty 已输出");
+        let has_dshot_str = out_str.contains("dshot0 油门 1000 已发送");
+        eprintln!(
+            ">>> [ESC-DIAG] pwm_throttle={} rpm={:.0} dshot_throttle={} frames={} crc_err={} pwms={}",
+            pwm.throttle(), pwm.rpm(), dshot.throttle(), dshot.dshot_frames(), dshot.crc_errors(), has_pwm_str
+        );
+        assert!(has_pwm_str, "d_esc pwm_throttle 用例未命中（PWM 链路未跑通）");
+        assert!(has_dshot_str, "d_esc dshot_throttle 用例未命中（DShot 链路未跑通）");
+        // 模拟器虚拟时钟按基本块量化（事件 tick = 块起点退役字节），PWM 脉宽测量
+        // 存在 ≤1% 的块对齐误差（如 995/1000）；DShot 为比例解码不受影响（精确 1000）。
+        let t_err = (pwm.throttle() as i32 - 1000).abs();
+        assert!(t_err <= 20, "PWM 电调量应≈1000（实测 {}，块量化误差 ≤1%）", pwm.throttle());
+        assert!((pwm.rpm() - 6000.0).abs() < 120.0, "PWM 电机转速应≈6000 RPM（实测 {:.0}）", pwm.rpm());
+        assert_eq!(dshot.throttle(), 1000, "DShot 电调量应为 1000（固件发送油门 1000）");
+        assert!(dshot.dshot_frames() >= 1, "DShot 应至少解码 1 帧（frames={}）", dshot.dshot_frames());
+        assert_eq!(dshot.crc_errors(), 0, "DShot CRC 不应出错（errors={}）", dshot.crc_errors());
+        eprintln!(">>> ESC 全链路：PWM 60%→电调量1000/转速6000 ✓ DShot 油门1000/CRC0 错 ✓");
     }
     eprintln!(">>> 验收通过：{pass}/{total} 通过，{skip} 跳过，0 失败");
 }

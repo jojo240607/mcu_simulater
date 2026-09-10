@@ -16,6 +16,7 @@
 //! 复用模式(10)/模拟模式(11) 可配置存储，且该模式下引脚不发布 GPIO 输出事件
 //! （外设信号→引脚的真实路由仍由事件总线承担，未在引脚层实现）。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::events::{Event, EventBus};
@@ -42,15 +43,23 @@ pub struct Gpio {
     odr: u32,
     /// 事件总线（发布 GpioLevel）
     bus: Arc<Mutex<EventBus>>,
+    /// 退役字节计数器（事件时间戳 tick；测试用一次性占位）
+    retired: Arc<AtomicU64>,
 }
 
 impl Gpio {
     pub fn new(port: u8, bus: Arc<Mutex<EventBus>>) -> Self {
+        Self::with_retired(port, bus, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// 正式构造：`retired` 由 Machine 持有（退役字节计数，GpioLevel 事件时间戳）
+    pub fn with_retired(port: u8, bus: Arc<Mutex<EventBus>>, retired: Arc<AtomicU64>) -> Self {
         Self {
             port,
             regs: [0; 10],
             odr: 0,
             bus,
+            retired,
         }
     }
 
@@ -71,6 +80,7 @@ impl Gpio {
                 port: self.port,
                 pin: pin as u8,
                 level,
+                tick: self.retired.load(Ordering::Relaxed),
             };
             self.bus.lock().unwrap().publish(&ev);
         }
@@ -177,8 +187,8 @@ mod tests {
 
         let evs = events.lock().unwrap();
         assert_eq!(evs.len(), 2, "置位+复位应各发布一次事件");
-        assert_eq!(evs[0], Event::GpioLevel { port: 0, pin: 5, level: true });
-        assert_eq!(evs[1], Event::GpioLevel { port: 0, pin: 5, level: false });
+        assert_eq!(evs[0], Event::GpioLevel { port: 0, pin: 5, level: true, tick: 0 });
+        assert_eq!(evs[1], Event::GpioLevel { port: 0, pin: 5, level: false, tick: 0 });
     }
 
     #[test]
