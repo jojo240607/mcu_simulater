@@ -9,6 +9,8 @@
 //!   Bank1 @0x60000000、Bank2 @0x64000000、Bank3 @0x68000000、Bank4 @0x6C000000，
 //!   各 64KB（真实片选区间 64MB 的简化；按字节后备，支持 8/16/32 位访问宽度）。
 
+use std::sync::{Arc, Mutex};
+
 use crate::peripheral::{BusError, Peripheral};
 
 /// FSMC 寄存器基址
@@ -51,6 +53,19 @@ const OFF_BWTR1: u32 = 0x104;
 const OFF_BWTR2: u32 = 0x108;
 const OFF_BWTR3: u32 = 0x10C;
 const OFF_BWTR4: u32 = 0x110;
+
+/// FSMC Bank1 挂载的窗口器件（LCD 等）：窗口读写转发给器件而非后备缓冲。
+/// ST7789 经 NE1 8080 并行接口接入（A16 区分命令/数据，见 vperiph/fsmc）。
+pub trait LcdWindowDevice: Send + Sync {
+    /// 器件名（观测/日志）
+    fn name(&self) -> &str;
+
+    /// 窗口读（off = Bank1 内偏移）
+    fn window_read(&mut self, off: u32, size: u32) -> u32;
+
+    /// 窗口写
+    fn window_write(&mut self, off: u32, size: u32, value: u32);
+}
 
 /// 寄存器文件索引（BCR1-4 = 0..4，BTR1-4 = 4..8，BWTR1-4 = 8..12）
 fn bcr_idx(offset: u32) -> usize {
@@ -108,6 +123,8 @@ pub struct Fsmc {
     regs: [u32; 12],
     /// Bank1-4 片选窗口后备缓冲（各 64KB；MBKEN=1 时 R/W 命中）
     banks: [Box<[u8]>; 4],
+    /// Bank1 挂载的窗口器件（ST7789 LCD 等）；Some 时 Bank1 读写转发给器件
+    pub lcd: Option<Arc<Mutex<dyn LcdWindowDevice>>>,
 }
 
 impl Fsmc {
@@ -116,7 +133,13 @@ impl Fsmc {
         Self {
             regs: [0; 12],
             banks,
+            lcd: None,
         }
+    }
+
+    /// 挂载 Bank1 窗口器件（如 ST7789 LCD）。
+    pub fn set_lcd(&mut self, lcd: Option<Arc<Mutex<dyn LcdWindowDevice>>>) {
+        self.lcd = lcd;
     }
 
     /// Bank（0..4）片选是否使能（BCRn.MBKEN）
@@ -131,6 +154,12 @@ impl Fsmc {
         };
         if !self.bank_enabled(bank) {
             return 0;
+        }
+        // Bank1 挂载了窗口器件（LCD）→ 转发
+        if bank == 0 {
+            if let Some(lcd) = &self.lcd {
+                return lcd.lock().unwrap().window_read(off, size);
+            }
         }
         let base = off as usize;
         let end = base + size as usize;
@@ -152,6 +181,13 @@ impl Fsmc {
         };
         if !self.bank_enabled(bank) {
             return;
+        }
+        // Bank1 挂载了窗口器件（LCD）→ 转发
+        if bank == 0 {
+            if let Some(lcd) = &self.lcd {
+                lcd.lock().unwrap().window_write(off, size, value);
+                return;
+            }
         }
         let base = off as usize;
         let end = base + size as usize;

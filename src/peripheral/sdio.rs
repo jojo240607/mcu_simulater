@@ -133,6 +133,10 @@ pub struct Sdio {
     rca: u32,
     /// 虚拟 SD 卡后备缓冲
     card: Vec<u8>,
+    /// 持久化文件（None = 仅内存；[`persist`] 写回）
+    file: Option<std::path::PathBuf>,
+    /// 脏标记（有写未持久化）
+    dirty: bool,
     /// 共享事件总线（发布 SdioDma 请求）
     events: Arc<Mutex<EventBus>>,
     /// 共享 NVIC（MASK 使能时挂起 SDIO_IRQ）
@@ -153,9 +157,43 @@ impl Sdio {
             app_cmd_pending: false,
             rca: 0xABCD,
             card: vec![0xA5; CARD_SIZE],
+            file: None,
+            dirty: false,
             events,
             nvic,
         }
+    }
+
+    /// 以文件为后备的虚拟卡：加载映像（不存在则 0xA5 填充），[`persist`] 写回。
+    pub fn with_file<P: AsRef<std::path::Path>>(path: P) -> Self {
+        let mut s = Self::new(Arc::new(Mutex::new(EventBus::new())), Arc::new(Mutex::new(crate::peripheral::nvic::Nvic::new())));
+        if let Ok(data) = std::fs::read(path.as_ref()) {
+            let n = data.len().min(CARD_SIZE);
+            s.card[..n].copy_from_slice(&data[..n]);
+            s.file = Some(path.as_ref().to_path_buf());
+        } else {
+            s.file = Some(path.as_ref().to_path_buf());
+        }
+        s
+    }
+
+    /// 写卡映像到指定文件（保存用途：掉电不丢失；供测试/上层检查点调用）。
+    pub fn persist_to(&mut self, path: &std::path::Path) {
+        let _ = std::fs::write(path, &self.card);
+        self.dirty = false;
+    }
+
+    /// 写回持久化文件（保存用途：SD 卡掉电不丢失）。
+    pub fn persist(&mut self) {
+        if let Some(p) = &self.file {
+            let _ = std::fs::write(p, &self.card);
+        }
+        self.dirty = false;
+    }
+
+    /// 是否脏（有未持久化的写）
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     /// 虚拟卡字节区间（供测试校验写回数据）
@@ -339,6 +377,7 @@ impl Sdio {
             let addr = base + b;
             if addr < self.card.len() {
                 self.card[addr] = (value >> (8 * b)) as u8;
+                self.dirty = true;
             }
         }
     }
@@ -557,6 +596,29 @@ mod tests {
         s.write(OFF_ARG, 4, arg).unwrap();
         s.write(OFF_CMD, 4, index | (waitresp << 6) | CMD_CPSMEN)
             .unwrap();
+    }
+
+    #[test]
+    fn with_file_persist_roundtrip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("dsh_sdio_card_test.img");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut s = Sdio::with_file(&path);
+            assert_eq!(s.card_bytes(0, 1), &[0xA5], "新卡默认 0xA5");
+            for b in 0..512 {
+                s.card[b] = (b % 256) as u8;
+            }
+            s.dirty = true;
+            s.persist();
+            assert!(!s.is_dirty());
+            assert_eq!(s.card_bytes(0, 3), &[0x00, 0x01, 0x02]);
+        }
+        {
+            let s = Sdio::with_file(&path);
+            assert_eq!(s.card_bytes(0, 3), &[0x00, 0x01, 0x02], "重载映像");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

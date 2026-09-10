@@ -40,7 +40,9 @@
 
 pub mod data_source;
 pub mod i2c;
+pub mod can;
 pub mod esc;
+pub mod fsmc;
 pub mod spi;
 pub mod uart;
 

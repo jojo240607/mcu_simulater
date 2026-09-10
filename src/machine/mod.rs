@@ -123,6 +123,13 @@ pub struct Machine {
     pub spi: Arc<Mutex<Vec<Arc<Mutex<Spi>>>>>,
     /// ESC 电调 + 无刷电机虚拟外设（信号观测：订阅 TimPwm/GpioLevel）
     pub escs: Arc<Mutex<Vec<Arc<Mutex<Box<dyn crate::peripheral::vperiph::esc::EscMotor>>>>>>,
+    /// CAN 总线虚拟节点（订阅 CanFrame 按 ID 响应，回帧 feed_rx 到本端口 CAN）
+    pub can_nodes: Arc<Mutex<Vec<Arc<Mutex<Box<dyn crate::peripheral::vperiph::can::CanNode>>>>>>,
+    /// FSMC Bank1 挂载的 ST7789 LCD 虚拟器件（观测/断言：显存、命令计数）
+    pub st7789: Arc<Mutex<crate::peripheral::vperiph::fsmc::St7789>>,
+    /// CAN 虚拟节点待回帧（事件回调只入队，run 主循环 flush——避免事件分发
+    /// 时本端口 CAN 锁重入死锁）
+    can_pending: Arc<Mutex<Vec<crate::peripheral::can::CanFrame>>>,
     /// CAN1 控制器局域网（@0x40006400，APB1；邮箱/接收 FIFO/过滤 + CanFrame 总线互联）
     pub can1: Arc<Mutex<Can>>,
     /// CAN2 控制器局域网（@0x40006800，APB1；同上，与 CAN1 互联）
@@ -228,6 +235,9 @@ impl Machine {
             escs: Arc::new(Mutex::new(Vec::new())),
             can1: Arc::new(Mutex::new(Can::new(1, Some(events.clone()), nvic.clone()))),
             can2: Arc::new(Mutex::new(Can::new(2, Some(events.clone()), nvic.clone()))),
+            can_nodes: Arc::new(Mutex::new(Vec::new())),
+            st7789: Arc::new(Mutex::new(crate::peripheral::vperiph::fsmc::St7789::new())),
+            can_pending: Arc::new(Mutex::new(Vec::new())),
             flash: Arc::new(Mutex::new(Flash::new())),
             usb_otg: Arc::new(Mutex::new(UsbOtg::new(
                 Some(events.clone()),
@@ -284,6 +294,11 @@ impl Machine {
         false
     }
 
+    /// SD 卡映像写回指定文件（保存用途检查点：固件写块后落盘可跨 run 存活）。
+    pub fn persist_sd_card(&self, path: &std::path::Path) {
+        self.sdio.lock().unwrap().persist_to(path);
+    }
+
     /// 触发全部 SPI 虚拟从设备持久化（保存用途器件把映像写回绑定文件）。
     ///
     /// 供测试/上层在关键检查点（如固件写入 flash 后）调用，证明数据可跨 run 存活。
@@ -338,6 +353,63 @@ impl Machine {
         for e in self.escs.lock().unwrap().iter() {
             e.lock().unwrap().step(dt);
         }
+        for n in self.can_nodes.lock().unwrap().iter() {
+            n.lock().unwrap().step(dt);
+        }
+        // flush CAN 虚拟节点响应帧（此处无 can 锁；feed_rx 只挂 IRQ 不发布）
+        let frames: Vec<crate::peripheral::can::CanFrame> =
+            std::mem::take(&mut *self.can_pending.lock().unwrap());
+        for f in frames {
+            match f.port {
+                1 => self.can1.lock().unwrap().feed_rx(f),
+                2 => self.can2.lock().unwrap().feed_rx(f),
+                _ => {}
+            }
+        }
+    }
+
+    /// 显式挂载 ST7789 LCD 到 FSMC Bank1（窗口读写转发给 LCD 器件）。
+    /// 默认不挂载：m13 FSMC 固件测试用 Bank1 后备缓冲；验收测试需 LCD 时调用。
+    pub fn enable_st7789(&self) {
+        self.fsmc
+            .lock()
+            .unwrap()
+            .set_lcd(Some(self.st7789.clone()));
+    }
+
+    /// 注册 CAN 总线虚拟节点（按 ID 响应，回帧路由到本端口 CAN 接收 FIFO）。
+    ///
+    /// CAN 是广播总线：节点订阅 `CanFrame`（port 匹配），`on_frame` 匹配则
+    /// 返回响应帧；回调内只 feed_rx（挂 IRQ 不发布事件，无重入死锁）。
+    pub fn register_can_node(&self, port: u8, node: Box<dyn crate::peripheral::vperiph::can::CanNode>) {
+        let node = Arc::new(Mutex::new(node));
+        let nodes = self.can_nodes.clone();
+        let pending = self.can_pending.clone();
+        self.events.lock().unwrap().subscribe(Arc::new(Mutex::new(move |ev: &Event| {
+            if let Event::CanFrame { frame } = ev {
+                if frame.port != port {
+                    return;
+                }
+                let reply = {
+                    let guard = nodes.lock().unwrap();
+                    let mut out: Option<crate::peripheral::can::CanFrame> = None;
+                    for n in guard.iter() {
+                        if let Some(mut r) = n.lock().unwrap().on_frame(frame) {
+                            r.port = port; // 兜底：响应发到当前端口
+                            out = Some(r);
+                            break;
+                        }
+                    }
+                    out
+                };
+                if let Some(r) = reply {
+                    // 只入队：事件分发时本端口 CAN 已被 publish 方持锁，直接
+                    // feed_rx 会锁重入死锁；run 主循环 flush 时再喂（无 can 锁）
+                    pending.lock().unwrap().push(r);
+                }
+            }
+        })));
+        self.can_nodes.lock().unwrap().push(node);
     }
 
     /// 注册 UART 虚拟从设备（推流：GPS NMEA / SBUS）。
@@ -1026,6 +1098,9 @@ impl Machine {
             .lock()
             .unwrap()
             .attach(FSMC_BASE, 0x200, "FSMC", fsmc.clone())?;
+        // Bank1 默认不挂载 LCD（保持后备缓冲语义，m13 FSMC 固件测试依赖）；
+        // 需 LCD 时由上层显式调用 [`Machine::enable_st7789`]（如 x_drvtest）。
+        let _ = fsmc;
         {
             // 寄存器块：映射 1 页，hook 精确到寄存器窗口
             self.cpu.mem_map(FSMC_BASE as u64, 0x1000, Prot::ALL)?;

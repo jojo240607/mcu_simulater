@@ -17,7 +17,8 @@ use unicorn_engine::RegisterARM;
 use mcu_simulater::machine::Machine;
 use mcu_simulater::peripheral::vperiph::data_source::StaticImu;
 use mcu_simulater::peripheral::vperiph::esc::{Esc, EscConfig, EscMotor};
-use mcu_simulater::peripheral::vperiph::i2c::{StaticToF, Vl53l1x};
+use mcu_simulater::peripheral::vperiph::can::MotorCtrlNode;
+use mcu_simulater::peripheral::vperiph::i2c::{At24cxx, Sht30, StaticToF, Vl53l1x};
 use mcu_simulater::peripheral::vperiph::spi::{Bmi088, Pwm3901, SpiFlash, StaticFlow};
 
 #[test]
@@ -70,6 +71,14 @@ fn drvtest_all_drivers_pass() {
     // VL53L1X ToF：I2C 0x29 挂 i2c0（port 1，与 mpu6050/bmp280/qmc5883 同总线）。
     // 默认模型：距离 500mm。
     m.register_i2c_slave(1, Box::new(Vl53l1x::new(StaticToF::new(500))));
+    // AT24Cxx EEPROM（I2C 0x50，保存用途）与 SHT30 温湿度（I2C 0x44）
+    m.register_i2c_slave(1, Box::new(At24cxx::new()));
+    m.register_i2c_slave(1, Box::new(Sht30::default()));
+    // CAN 总线虚拟节点：CAN1（port 1）上的电机控制器 0x201（读状态→回
+    // rpm=6000/temp=40/status=0x03；LBKM 回环帧与节点响应帧都入 RX FIFO）
+    m.register_can_node(1, Box::new(MotorCtrlNode::default()));
+    // ST7789 LCD 显式挂载到 FSMC Bank1（默认不挂，保持 m13 FSMC 后备缓冲语义）
+    m.enable_st7789();
 
     // INSN_INVALID 兜底：任何非法指令直接判失败（回归守卫）。
     let bad_pc = Arc::new(AtomicU32::new(0));
@@ -309,6 +318,47 @@ fn drvtest_all_drivers_pass() {
             .map(|s| s.read_count()).sum();
         assert!(i2c1_reads > 0, "I2C1 总线读计数为 0（VL53L1X 链路未打通）");
         eprintln!(">>> PMW3901（SPI3 共享总线多从机）+ VL53L1X（I2C 0x29）全链路 ✓（SPI3 访问 {spi3_access}B，I2C1 读 {i2c1_reads} 次）");
+    }
+    // 请求 E：内部总线器件补齐——CAN 节点 / FSMC-ST7789 / I2C EEPROM / I2C SHT30 / SD 持久化
+    {
+        let out_str = String::from_utf8_lossy(&out);
+        // CAN 虚拟节点：0x201 回 rpm=6000/temp=40/status=0x03
+        let has_can = out_str.contains("0x201 节点 rpm=6000");
+        // ST7789：RDDID=0x85 + 窗口填充（模拟器显存校验）
+        let has_lcd_id = out_str.contains("ST7789 RDDID=0x85 正确");
+        let has_lcd_fill = out_str.contains("窗口 (0,0)-(239,1) 已填充");
+        // EEPROM / SHT30
+        let has_eep = out_str.contains("AT24Cxx 写读回");
+        let has_sht = out_str.contains("T=25.0°C RH=50.0%");
+        eprintln!(">>> [BUS-DIAG] can={has_can} lcd_id={has_lcd_id} lcd_fill={has_lcd_fill} eep={has_eep} sht={has_sht}");
+        assert!(has_can, "CAN 节点响应断言未命中");
+        assert!(has_lcd_id && has_lcd_fill, "ST7789 用例断言未命中");
+        assert!(has_eep, "EEPROM 用例断言未命中");
+        assert!(has_sht, "SHT30 用例断言未命中");
+        // ST7789 模拟器显存：顶部 2 行已填充 0xF800（240×2=480 像素）
+        {
+            let lcd = m.st7789.lock().unwrap();
+            assert_eq!(lcd.pixel(0, 0), Some(0xF800), "LCD pixel(0,0) 应为 0xF800");
+            assert_eq!(lcd.pixel(239, 1), Some(0xF800), "LCD pixel(239,1) 应为 0xF800");
+            assert!(lcd.filled_pixels() >= 480, "LCD 填充像素不足");
+        }
+        // CAN 节点真实被访问
+        let can_access: u64 = m.can_nodes.lock().unwrap().iter()
+            .map(|n| n.lock().unwrap().access_count()).sum();
+        assert!(can_access > 0, "CAN 节点未被访问");
+        // I2C1 读计数包含 EEPROM/SHT30（>24 次基线）
+        let i2c1_reads2: u64 = m.i2c.lock().unwrap()[0].lock().unwrap().slaves().iter()
+            .map(|s| s.read_count()).sum();
+        assert!(i2c1_reads2 > 24, "I2C1 读计数未增加（EEPROM/SHT30 链路未打通）");
+        // SD 卡持久化：固件 block_rw 写扇区 0（pattern[i]=i*7+3）→ 落盘断言
+        let sd_path = std::env::temp_dir().join("dsh_sd_persist_test.img");
+        let _ = std::fs::remove_file(&sd_path);
+        m.persist_sd_card(&sd_path);
+        let img = std::fs::read(&sd_path).unwrap_or_default();
+        assert!(img.len() >= 512, "SD 卡映像未落盘");
+        assert_eq!(&img[..3], &[3, 10, 17], "SD 扇区 0 pattern 不符（i*7+3）");
+        let _ = std::fs::remove_file(&sd_path);
+        eprintln!(">>> 请求 E 总线器件全链路：CAN 节点 0x201 ✓ ST7789 显存 0xF800 ✓ EEPROM 0x50 ✓ SHT30 0x44 ✓ SD 扇区持久化 ✓");
     }
     eprintln!(">>> 验收通过：{pass}/{total} 通过，{skip} 跳过，0 失败");
 }

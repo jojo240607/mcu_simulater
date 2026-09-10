@@ -49,7 +49,10 @@ fn inpool(p: u32) -> bool {
     p >= CCM_POOL_LO && p < CCM_POOL_HI
 }
 
+// 请求 C 遗留的临时诊断快照（定位调度器双挂现场）：无最终断言，仅打印；布局
+// 敏感（依赖具体 app.bin 的 main TCB 地址），默认跳过——将来需要再诊断时启用。
 #[test]
+#[ignore]
 fn first_double_add_snapshot() {
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
