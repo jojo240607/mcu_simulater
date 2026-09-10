@@ -52,6 +52,7 @@ use crate::peripheral::{Peripheral};
 use crate::sim::status::{Status, BIT_ANY_ACTIVE, BIT_MPU, BIT_NVIC_PENDING, BIT_WDOG};
 use crate::sim::timing::VirtualClock;
 
+
 /// block hook 冷路径状态（MPU/NVIC/外设 tick 列表），捆进单个 Arc 以缩小闭包捕获体
 ///（bench_probe：H13d 6 字段捕获 97.7 → H13e 3 字段 121+ MIPS，闭包捕获字段数即热路径成本）。
 struct BlockHookCold {
@@ -490,6 +491,30 @@ impl Machine {
         self.register_uart_slave(3, Box::new(Sbus::new(StaticSbus::default())));
     }
 
+    /// [HIL 虚拟外设直通] 用 fly_sim 共享状态装配 I2C 传感器（mpu6050/bmp280/qmc5883）。
+    ///
+    /// fly_sim 每步写 `FlySimState`（Arc<Mutex>），设备动态寄存器经 FlySimSource
+    /// 即时读到；固件 real-sensors 驱动照常经 i2c0 读寄存器。磁力计无真值源，
+    /// 用默认静态模型（不影响 EKF 姿态，mag 未融合）。
+    pub fn attach_flysim_sensors(&self, st: std::sync::Arc<std::sync::Mutex<crate::peripheral::vperiph::data_source::FlySimState>>) {
+        use crate::peripheral::vperiph::data_source::{FlySimKind, FlySimSource, StaticMag};
+        use crate::peripheral::vperiph::i2c::{bmp280, mpu6050, qmc5883};
+        self.register_i2c_slave(1, Box::new(mpu6050(FlySimSource::new(st.clone(), FlySimKind::Imu))));
+        self.register_i2c_slave(1, Box::new(bmp280(FlySimSource::new(st.clone(), FlySimKind::Baro))));
+        self.register_i2c_slave(1, Box::new(qmc5883(StaticMag::default())));
+    }
+
+    /// [HIL 虚拟外设直通] 用 fly_sim 共享状态装配 UART 推流（gps/sbus）。
+    ///
+    /// gps 挂 uart1（USART2, port=2）、sbus 挂 uart2（USART3, port=3），
+    /// 与固件 real-sensors 的 GpsUblox("uart1")/RcSbus("uart2") 对应。
+    pub fn attach_flysim_uart_slaves(&self, st: std::sync::Arc<std::sync::Mutex<crate::peripheral::vperiph::data_source::FlySimState>>) {
+        use crate::peripheral::vperiph::data_source::{FlySimKind, FlySimSource};
+        use crate::peripheral::vperiph::uart::{NmeaGps, Sbus};
+        self.register_uart_slave(2, Box::new(NmeaGps::new(FlySimSource::new(st.clone(), FlySimKind::Gps))));
+        self.register_uart_slave(3, Box::new(Sbus::new(FlySimSource::new(st.clone(), FlySimKind::Sbus))));
+    }
+
     /// 便捷装配：把默认 3 个 I2C 传感器（mpu6050/bmp280/qmc5883）挂到 i2c1。
     pub fn attach_default_sensors(&self) {
         use crate::peripheral::vperiph::data_source::{StaticBaro, StaticImu, StaticMag};
@@ -502,6 +527,9 @@ impl Machine {
     pub fn map_stm32f407_layout(&mut self) -> Result<()> {
         self.cpu.mem_map(0x0800_0000, 0x0008_0000, Prot::ALL)?; // FLASH 512KB
         self.cpu.mem_map(0x2000_0000, 0x0002_0000, Prot::ALL)?; // SRAM1+SRAM2 128KB
+        // SRAM3 64KB（0x2002_0000..0x2002_FFFF）：固件链接脚本未使用，
+        // 专用于 HIL 共享内存虚拟外设（fly_simulater <-> flyctrl 直连，无 USB）。
+        self.cpu.mem_map(0x2002_0000, 0x0001_0000, Prot::ALL)?; // SRAM3
         self.cpu.mem_map(0x1000_0000, 0x0001_0000, Prot::ALL)?; // CCM SRAM 64KB
         self.cpu.mem_map(0x1FFF_0000, 0x0001_0000, Prot::ALL)?; // 系统存储区（电子签名/flash大小等）
         // F407 出厂校准字（系统存储区只读，固件 create 时直读）：

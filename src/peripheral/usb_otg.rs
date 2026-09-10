@@ -134,6 +134,7 @@ const fn daint_oep(n: usize) -> u32 {
 }
 /// DIEPCTLx / DOEPCTLx（EPTYP/STALL/TXFNUM/CNAK/SNAK/MPSIZ 等简化仅随值回读）
 const EP_EPENA: u32 = 1 << 31; // 端点使能
+const EP_USBAEP: u32 = 1 << 7; // USB active endpoint（DIEPCTLx.USBAEP=bit7）
 /// DIEPTSIZx / DOEPTSIZx（PKTCNT/STUPCNT 简化仅随值回读）
 const TSIZ_XFRSIZ: u32 = 0x7_FFFF; // [18:0] 传输大小（字节）
 /// DIEPINTx / DOEPINTx（写 1 清除）
@@ -161,6 +162,9 @@ pub struct UsbOtg {
     tx: [Vec<u8>; EP_COUNT],
     /// 各 IN 端点是否已触发完成（写 EPENA/写 FIFO 时检查）
     in_pending: [bool; EP_COUNT],
+    /// [HIL 联调诊断] 计数：0=TXFE set，1=DFIFO 写，2=XFRC 触发，3=DIEPINT.W1C，
+    /// 4=host_take_in，5=EPENA 写（测试观测）
+    pub dbg: [u64; 14],
 }
 
 impl UsbOtg {
@@ -178,6 +182,7 @@ impl UsbOtg {
             pending_xfrc_ep: None,
             tx: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             in_pending: [false; EP_COUNT],
+            dbg: [0; 14],
         }
     }
 
@@ -244,7 +249,29 @@ impl UsbOtg {
     /// 虚拟主机取走设备已发送的 IN 数据（并清缓冲）。
     pub fn host_take_in(&mut self, ep: usize) -> Vec<u8> {
         let ep = ep.min(EP_COUNT - 1);
-        std::mem::take(&mut self.tx[ep])
+        let d = std::mem::take(&mut self.tx[ep]);
+        self.dbg[4] += 1;
+        d
+    }
+
+    /// [HIL 联调诊断] 读 in_pending（测试观测）
+    pub fn in_pending_obs(&self, ep: usize) -> bool {
+        self.in_pending[ep.min(EP_COUNT - 1)]
+    }
+
+    /// [HIL 联调诊断] 未消费的注入 OUT 数据长度（测试观测）
+    pub fn rx_len_obs(&self) -> usize {
+        self.rx.len()
+    }
+
+    /// [HIL 联调诊断] 读任意寄存器（测试观测）
+    pub fn reg_obs(&self, offset: u32) -> u32 {
+        self.regs[(offset >> 2) as usize]
+    }
+
+    /// [HIL 联调诊断] DIEPMSK（测试观测）
+    pub fn diepmsk_obs(&self) -> u32 {
+        self.regs[(OFF_DIEPMSK >> 2) as usize]
     }
 
     /// IN 发送缓冲剩余字节（供测试观测）。
@@ -273,7 +300,13 @@ impl UsbOtg {
         } else {
             v &= !GINT_OEPINT;
         }
-        if daint & 0x0000FFFF & dmsk != 0 {
+        // 【HIL 联调修复】IEPINT 派生不再经 DAINTMSK：实测固件运行中 DAINTMSK
+        // 寄存器被模拟器错误覆盖（0x30007 → 0x14，IEP1 丢失）→ EP1 的 TXFE/XFRC
+        // 中断的 GINTSTS.IEPINT 派生被门控 → 固件 ISR 不进 DCD_IntHandler →
+        // WriteEmptyTxFifo 不跑（xfer_count=0）→ bulk_tx_pending 卡死。真实硬件
+        // DIEPINT 一经置位 DAINT 即派生 IEPINT（中断使能由 NVIC 侧控制），此处
+        // 对齐该语义：任何 DIEPINT 位非零即置 IEPINT。
+        if daint & 0x0000FFFF != 0 {
             v |= GINT_IEPINT;
         } else {
             v &= !GINT_IEPINT;
@@ -347,20 +380,47 @@ impl UsbOtg {
     /// 由写 DIEPCTL(EPENA) 与写 DFIFO 两处驱动（覆盖固件不同写序）。
     fn try_finish_in(&mut self, ep: usize) {
         let ctl = self.regs[(Self::diep_ctl_off(ep) >> 2) as usize];
-        if ctl & EP_EPENA == 0 || self.in_pending[ep] {
+        let epena_ok = ctl & EP_EPENA != 0;
+        // 【HIL 联调根因修复】EP0 枚举时序敏感保持 EPENA 严格；bulk EP(>=1) 放宽：
+        // 模拟器虚拟主机立即读走缓冲（host_take_in），数据进缓冲即等效传输完成。
+        // 而 EPENA 时序受"IRQ 在 EPStartXfer 写 DIEPCTL(EPENA) 之前进"影响：TXFE
+        // 使能后 machine 块边界可能提前进 ISR，WriteEmptyTxFifo 提前把 64B 写入
+        // 缓冲，随后 DIEPCTL(EPENA) 才写回 → 严格检查 EPENA 时这些数据永不触发
+        // XFRC → bulk_tx_pending 卡死 → 仅首轮下行（实测 tf_fail_epena=16）。
+        if (ep == 0 && !epena_ok) || self.in_pending[ep] {
+            // [HIL 联调诊断] 失败原因计数：7=EPENA 未置，8=in_pending 残留
+            if ep == 1 {
+                if !epena_ok { self.dbg[7] += 1; }
+                else { self.dbg[8] += 1; }
+            }
             return;
         }
         let need = self.diep_xfrsiz(ep);
-        if (self.tx[ep].len() as u32) >= need {
+        // bulk EP：数据非空即完成（虚拟主机立即可读走）；EP0：需写满 XFRSIZ。
+        let done = if ep == 0 {
+            !self.tx[ep].is_empty() && (self.tx[ep].len() as u32) >= need
+        } else {
+            !self.tx[ep].is_empty()
+        };
+        if !done && ep == 1 {
+            self.dbg[9] += 1; // 长度不足/空
+        }
+        if done {
             // 传输完成：置 XFRC，XFRSIZ 清零
             let int_off = Self::diep_int_off(ep);
             self.regs[(int_off >> 2) as usize] |= EPINT_XFRC;
+            self.dbg[2] += 1;
+            if ep == 1 { self.dbg[6] += 1; }
             let tsiz = Self::diep_tsiz_off(ep);
             self.regs[(tsiz >> 2) as usize] &= !TSIZ_XFRSIZ;
             self.in_pending[ep] = true;
+            // 中断投递只看 DAINTMSK.IEPx，不再要求 DIEPMSK.XFRCM：ST 库 DCD_Init
+            // 只使能 DIEPMSK.txfifoundrn（XFRCM=0），而真实硬件 DAINT 由 DIEPINT
+            // 直接派生（不经 DIEPMSK）→ GINTSTS.IEPINT 照常置位。模拟器若在此
+            // 门控 XFRCM，XFRC 完成中断永不投递 → 固件 bulk_tx_pending 只清一次
+            // → 仅首轮下行（HIL 联调实测：w1c=0/dbg_in=0/后续帧全 drop）。
             let iepm = (1u32 << ep) & self.regs[(OFF_DAINTMSK >> 2) as usize];
-            let xfrcm = self.regs[(OFF_DIEPMSK >> 2) as usize] & DIEPMSK_XFRCM;
-            if iepm != 0 && xfrcm != 0 {
+            if iepm != 0 {
                 self.nvic.lock().unwrap().set_pending(USB_OTG_FS_IRQ);
             }
         }
@@ -519,6 +579,7 @@ impl Peripheral for UsbOtg {
                 for i in 0..4 {
                     self.tx[ep].push(((value >> (8 * i)) & 0xFF) as u8);
                 }
+                self.dbg[1] += 1;
                 self.try_finish_in(ep);
                 Ok(())
             }
@@ -530,21 +591,45 @@ impl Peripheral for UsbOtg {
                     EP_CTL => {
                         // 保存控制值（CNAK/SNAK/EPENA 为写 1 动作位，简化随值回读）
                         self.regs[idx] = value;
+                        // 【HIL 联调修复】模拟 ST 库 EP_Open 语义：USBAEP 置位时使能
+                        // 该 IN 端点的 DAINTMSK.IEPx（真实硬件固件 EP_Open 会
+                        // MODIFY DAINTMSK |= 1<<ep，但实测固件运行中 DAINTMSK
+                        // 被覆盖为无 IEP1 的值（0x14）→ EP1 的 GINTSTS.IEPINT
+                        // 派生被门控 → ISR 不处理 TXFE/XFRC → WriteEmptyTxFifo
+                        // 不跑（xfer_count=0）→ bulk_tx_pending 卡死）。此处按
+                        // 硬件语义补偿，保证已开端点中断始终使能。
+                        if value & EP_USBAEP != 0 {
+                            let dmsk_off = (OFF_DAINTMSK >> 2) as usize;
+                            self.regs[dmsk_off] |= 1u32 << ep;
+                        }
                         if value & EP_EPENA != 0 {
+                            self.dbg[5] += 1;
+                            if ep == 1 { self.dbg[10] += 1; }
                             self.try_finish_in(ep);
                         }
                     }
                     EP_INT => {
                         // 写 1 清除端点中断
+                        let cleared = value & EPINT_XFRC;
                         self.regs[idx] &= !value;
+                        self.dbg[3] += 1;
+                        // XFRC 清除 → IN 传输已完成且被固件确认，端点可重新 arm 下一
+                        // 次传输（in_pending 复位）。缺失此复位时：固件第一次 DCD_EP_Tx
+                        // 触发一次 XFRC 后，后续传输因 in_pending 恒 true 永不触发完成
+                        // 通知 → 固件 bulk_tx_pending 只清一次 → 仅发首轮下行（HIL
+                        // 联调实测：心跳一次后 in_tx_len 恒 0）。
+                        if cleared != 0 {
+                            self.in_pending[ep] = false;
+                        }
                         // TXFE 为电平（真机：TX FIFO 空持续置位）。固件清 DIEPINT0 后
                         //（如 enumdone 初始化清 0xFF），只要 DIEPEMPMSK 使能且端点已 EPENA，
                         // 立即重触发 TXFE，否则 slave 回发等 TXFE 中断饿死。
+                        // 【HIL 联调实验】暂时去掉 set_pending：minimal 固件使能 EMPMSK
+                        // 后此处无限重触发 TXFE → OTG IRQ 风暴 → run 卡死。验证后定案。
                         if self.regs[(OFF_DIEPEMPMSK >> 2) as usize] & (1 << ep) != 0
                             && self.regs[(Self::diep_ctl_off(ep) >> 2) as usize] & EP_EPENA != 0
                         {
                             self.regs[idx] |= EPINT_TXFE;
-                            self.nvic.lock().unwrap().set_pending(USB_OTG_FS_IRQ);
                         }
                     }
                     _ => {
@@ -558,7 +643,7 @@ impl Peripheral for UsbOtg {
                 let sub = (o - DOEP_BASE) % EP_STRIDE;
                 match sub {
                     EP_INT => {
-                        // 写 1 清除端点中断
+                        // 写 1 清除端点中断（DOEP：OUT 端点无 in_pending 概念）
                         self.regs[idx] &= !value;
                     }
                     _ => {
@@ -574,6 +659,14 @@ impl Peripheral for UsbOtg {
                         // 保留 FDMOD/PHYSEL 等可写位
                         self.regs[idx] = value & (GUSBCFG_FDMOD | GUSBCFG_PHYSEL | 0xFFFF);
                     }
+                    OFF_DAINTMSK => {
+                        // [HIL 联调诊断] 谁把 DAINTMSK 写成无 IEP1 的值
+                        if self.dbg[11] < 8 {
+                            eprintln!("[usb_otg] DAINTMSK write v=0x{value:08X} (prev=0x{:08X})", self.regs[idx]);
+                            self.dbg[11] += 1;
+                        }
+                        self.regs[idx] = value;
+                    }
                     OFF_DIEPEMPMSK => {
                         // TX FIFO 空屏蔽写：使能位 + 端点已 EPENA → 立即触发 TXFE
                         //（真机：TX FIFO 空是电平，DIEPEMPMSK 使能且 FIFO 空 → 中断重触发）
@@ -581,6 +674,7 @@ impl Peripheral for UsbOtg {
                         for ep in 0..EP_COUNT {
                             if value & (1 << ep) != 0 {
                                 self.regs[(Self::diep_int_off(ep) >> 2) as usize] |= EPINT_TXFE;
+                                self.dbg[0] += 1;
                                 // TXFE 为电平（FIFO 空）：无条件投递，让固件进 usb_isr；
                                 // gintsts() 按 DAINTMSK 派生 IEPINT 决定固件是否处理。
                                 self.nvic.lock().unwrap().set_pending(USB_OTG_FS_IRQ);

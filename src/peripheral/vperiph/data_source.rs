@@ -4,6 +4,7 @@
 //! `SensorModel` 是物理模型 trait：`step(dt)` 推进状态、`value(field)` 取通道值。
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 /// 数据源：从设备动态寄存器的取值来源。
 pub enum DataSource {
@@ -246,3 +247,99 @@ impl SensorModel for StaticSbus {
 /// 空数据源提供者（为 trait 对象保留入口）。
 #[derive(Default)]
 pub struct NopProvider;
+
+
+// ─────────────────────────────────────────────────────────────
+// fly_simulater 直通注入源：FlySimSource
+//
+// fly_sim 物理引擎每步把真值写入共享 `FlySimState`（Arc<Mutex>），虚拟外设
+// 动态寄存器（IMU/气压/GPS/SBUS）经 FlySimSource 即时读到该状态，固件标准
+// 驱动照常读寄存器 —— 实现"PC 物理世界 ↔ MCU 虚拟外设"同进程直通。
+// ─────────────────────────────────────────────────────────────
+
+/// fly_sim 物理引擎写入的共享传感器/RC 状态（每 4ms 物理步更新）。
+#[derive(Clone, Debug, Default)]
+pub struct FlySimState {
+    /// 机体系加速度（比力，m/s²；静止水平时 z=+9.81 抵消重力——与 mpu6050 设备约定一致）
+    pub imu_acc: [f32; 3],
+    /// 机体系角速度（rad/s）
+    pub imu_gyr: [f32; 3],
+    /// 气压（Pa）
+    pub baro_pa: f32,
+    /// GPS 位置（度/米）+ 定位状态
+    pub gps_lat: f32,
+    pub gps_lon: f32,
+    pub gps_alt: f32,
+    pub gps_fix: f32,
+    /// SBUS 通道 0..15（1000..2000；ch2=油门）
+    pub rc_ch: [f32; 16],
+}
+
+/// FlySimSource 的数据角色（决定 value() 解析哪些通道）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FlySimKind {
+    Imu,
+    Baro,
+    Gps,
+    Sbus,
+}
+
+/// 直通注入源：value() 从共享 FlySimState 读取。
+pub struct FlySimSource {
+    state: Arc<Mutex<FlySimState>>,
+    kind: FlySimKind,
+}
+
+impl FlySimSource {
+    pub fn new(state: Arc<Mutex<FlySimState>>, kind: FlySimKind) -> Self {
+        Self { state, kind }
+    }
+}
+
+impl SensorModel for FlySimSource {
+    fn name(&self) -> &str {
+        match self.kind {
+            FlySimKind::Imu => "flysim_imu",
+            FlySimKind::Baro => "flysim_baro",
+            FlySimKind::Gps => "flysim_gps",
+            FlySimKind::Sbus => "flysim_sbus",
+        }
+    }
+    fn step(&mut self, _dt: f32) {}
+    fn value(&self, field: &str) -> f32 {
+        let st = self.state.lock().unwrap();
+        match self.kind {
+            FlySimKind::Imu => match field {
+                "accel.x" => st.imu_acc[0],
+                "accel.y" => st.imu_acc[1],
+                "accel.z" => st.imu_acc[2],
+                "gyro.x" => st.imu_gyr[0],
+                "gyro.y" => st.imu_gyr[1],
+                "gyro.z" => st.imu_gyr[2],
+                _ => 0.0,
+            },
+            FlySimKind::Baro => {
+                if field == "pressure" {
+                    st.baro_pa
+                } else {
+                    0.0
+                }
+            }
+            FlySimKind::Gps => match field {
+                "lat" => st.gps_lat,
+                "lon" => st.gps_lon,
+                "alt" => st.gps_alt,
+                "fix" => st.gps_fix,
+                _ => 0.0,
+            },
+            FlySimKind::Sbus => {
+                let idx: usize = field.strip_prefix("ch").and_then(|n| n.parse().ok()).unwrap_or(16);
+                if idx < 16 {
+                    st.rc_ch[idx]
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
