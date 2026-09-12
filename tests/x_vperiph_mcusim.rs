@@ -10,8 +10,8 @@
 //!     PC 读 TIM CCR1 得占空比 → 电机推力 → 更新物理。
 //! 全程无 USB / 无 MAVLink 帧连接飞控。
 //!
-//! 构建前置：`cd joc-base && cmake --build build_hil`（minimal elf）、
-//! `cd flyctrl && python3 build_app.py --features real-sensors --out /tmp/app_real.bin`。
+//! 构建前置：`cd joc-base && cmake --build build_rel`（minimal elf）、
+//! `cd flyctrl && python3 build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin`。
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -27,8 +27,8 @@ use mcu_simulater::machine::Machine;
 use unicorn_engine::RegisterARM;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
-const SYS: &str = "/home/ubuntu/work/joc-base/build_hil/stm32f407_minimal.elf";
-const APP_REAL: &str = "/tmp/app_real.bin";
+const SYS: &str = "/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
+const APP_REAL: &str = "/tmp/flyctrl_clean.bin";
 
 // TIM 基址（固件 pwm0..3 = TIM3/TIM2/TIM1/TIM4 CH1）
 const TIM3: u64 = 0x4000_0400; // pwm0
@@ -72,7 +72,7 @@ fn vperiph_closed_loop() {
     let sys = Path::new(SYS);
     let app = Path::new(APP_REAL);
     assert!(sys.exists(), "minimal elf 缺失");
-    assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/app_real.bin");
+    assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin");
 
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
@@ -90,8 +90,10 @@ fn vperiph_closed_loop() {
     }
     let m = Arc::new(Mutex::new(m));
 
-    // [临时] 地面站 ARM 等效注入：直接置 G_CMD_ARMED（AtomicBool @0x2000c825）
-    m.lock().unwrap().cpu.mem_write(0x2000_c825, &[1u8]).unwrap();
+    // 地面站 ARM 等效注入：直接置 G_CMD_ARMED（AtomicBool）。
+    // 地址随固件构建变化：`arm-none-eabi-nm app.elf | grep G_CMD_ARMED` 获取，
+    // 重建固件后需同步（当前 clean 基线 = 0x2000b669）。
+    m.lock().unwrap().cpu.mem_write(0x2000_b669, &[1u8]).unwrap();
 
     // 注入初始真值：悬停（静止水平，FRD accel z=-9.81）+ RC 通道
     {
@@ -104,8 +106,10 @@ fn vperiph_closed_loop() {
         st.gps_alt = ALT0;
         st.gps_fix = 3.0;
         st.rc_ch = [1500.0; 16];
-        st.rc_ch[4] = 1800.0; // armed
-        st.rc_ch[3] = 1500.0; // 油门中位
+        // SBUS 通道编码：raw = 992 + (us-1500)/500*819.5。armed 阈值 raw>1700 ≈ us>1932，
+        // 故 1800us 不足（raw=1484<1700），须给足 2000us（raw=1811>1700）。
+        st.rc_ch[4] = 2000.0; // armed（SBUS raw 1811 > 1700）
+        st.rc_ch[3] = 1500.0; // 油门中位（raw 992 → throttle 0.5）
     }
 
     // 物理仿真
@@ -168,15 +172,16 @@ fn vperiph_closed_loop() {
             // 气压：标准大气（h 向上正 = -d）
             let h = -d;
             st.baro_pa = 101_325.0 * (-h / 8434.5).exp();
-            // RC 保持解锁
-            st.rc_ch[4] = 1800.0;
-        }
-        if step % 20 == 0 && step >= 20 {
-            eprintln!("[vperiph] inject imu_z={} baro_pa={}", state.lock().unwrap().imu_acc[2], state.lock().unwrap().baro_pa);
+            // RC 保持解锁（SBUS raw 1811 > 1700）
+            st.rc_ch[4] = 2000.0;
         }
 
         // ---- MCU 推进（sensors 2ms 采样 + control 4ms + PWM 输出）----
-        if let Err(e) = m.lock().unwrap().run(300_000) {
+        // 注意：不可在 if-let 条件里直接 m.lock().unwrap().run(...)：临时 MutexGuard
+        // 存活到整个 if-let 语句结束（含 Err 分支），分支内再 m.lock() 会重入自死锁。
+        // 先用块语句结束 guard 生命周期，再判断结果。
+        let run_res = { m.lock().unwrap().run(300_000) };
+        if let Err(e) = run_res {
             let mut mm = m.lock().unwrap();
             let pc = mm.cpu.reg_read_u32(RegisterARM::PC).unwrap_or(0);
             let sp = mm.cpu.reg_read_u32(RegisterARM::SP).unwrap_or(0);
@@ -184,77 +189,12 @@ fn vperiph_closed_loop() {
             panic!("[vperiph] run ERR at step={step}: {e:?} PC=0x{pc:08x} SP=0x{sp:08x} LR=0x{lr:08x}");
         }
 
-        if step % 50 == 0 {
+        if step % 10 == 0 {
             eprintln!(
                 "[vperiph] step={step} t={:.2}s thrust={thrust:.3} m=[{:.3},{:.3},{:.3},{:.3}] pos=({:.2},{:.2},{:.2})",
                 step as f64 * 0.004, motors[0], motors[1], motors[2], motors[3],
                 pos[0], pos[1], pos[2],
             );
-        }
-        if step % 20 == 0 && step >= 20 {
-            let rd = |off: u64| -> u32 {
-                let b = m.lock().unwrap().cpu.mem_read(0x2002_0000 + off, 4).unwrap();
-                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-            };
-            eprintln!("[vperiph] shm-diag: gates=0x{:08x} est=({:.1},{:.1},{:.1}) vz={:.2} armed={} spv={} rcf={} rcarmed={} thr={:.2} accz={:.2} gyrz={:.2} rpy=({:.1},{:.1},{:.1})",
-                rd(0), f32::from_bits(rd(36)), f32::from_bits(rd(40)), f32::from_bits(rd(4)),
-                f32::from_bits(rd(44)), f32::from_bits(rd(8)) > 0.5,
-                f32::from_bits(rd(20)) > 0.5, f32::from_bits(rd(24)) > 0.5,
-                f32::from_bits(rd(28)) > 0.5, f32::from_bits(rd(32)),
-                f32::from_bits(rd(52)), f32::from_bits(rd(56)),
-                f32::from_bits(rd(12)).to_degrees(), f32::from_bits(rd(16)).to_degrees(),
-                f32::from_bits(rd(48)).to_degrees());
-            eprintln!("[vperiph] armed_flag={} cmd0={:.3} ticks0={:.0} pwmioc={:.0} pwmok={}",
-                f32::from_bits(rd(60)), f32::from_bits(rd(64)), f32::from_bits(rd(68)),
-                f32::from_bits(rd(72)), f32::from_bits(rd(76)) > 0.5);
-            eprintln!("[vperiph] imu=({:.2},{:.2},{:.2}) baro={:.2}",
-                f32::from_bits(rd(80)), f32::from_bits(rd(84)), f32::from_bits(rd(88)),
-                f32::from_bits(rd(92)));
-            {
-                use mcu_simulater::peripheral::vperiph::I2cDir;
-                let mm = m.lock().unwrap();
-                let iv = mm.i2c.lock().unwrap();
-                let mut i0 = iv[0].lock().unwrap();
-                let az = {
-                    let sl = i0.slaves_mut().iter_mut().find(|s| s.addr7() == 0x68).unwrap();
-                    sl.on_start(I2cDir::Write); sl.on_write(0x3B);
-                    sl.on_start(I2cDir::Read);
-                    let _ = (sl.on_read(), sl.on_read(), sl.on_read(), sl.on_read());
-                    (sl.on_read().unwrap(), sl.on_read().unwrap())
-                };
-                let bp = {
-                    let sl = i0.slaves_mut().iter_mut().find(|s| s.addr7() == 0x76).unwrap();
-                    sl.on_start(I2cDir::Write); sl.on_write(0xF7);
-                    sl.on_start(I2cDir::Read);
-                    (sl.on_read().unwrap(), sl.on_read().unwrap())
-                };
-                eprintln!("[vperiph] mpu sim az=0x{:02x}{:02x} baro sim p=0x{:02x}{:02x}",
-                    az.0, az.1, bp.0, bp.1);
-            }
-            let rd2 = |off: u64| -> u32 {
-                let b = m.lock().unwrap().cpu.mem_read(0x2002_0100 + off, 4).unwrap();
-                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-            };
-            let (ufifo, udr, sr1, cr1a, cr3a, sr2, cr1b, cr3b) = {
-                let mm = m.lock().unwrap();
-                let us = mm.usart.lock().unwrap();
-                let u2 = us[2].lock().unwrap();
-                let u1 = us[1].lock().unwrap();
-                (u2.rx_fifo_len(), u2.n_cpu_dr_reads(),
-                 u2.dbg_state().0, u2.dbg_state().1, u2.dbg_state().2,
-                 u1.dbg_state().0, u1.dbg_state().1, u1.dbg_state().2)
-            };
-            let sframes = {
-                let mm = m.lock().unwrap();
-                let us = mm.usart.lock().unwrap();
-                let u2 = us[2].lock().unwrap();
-                u2.slaves().iter().map(|s| s.frames()).sum::<u64>()
-            };
-            eprintln!("[vperiph] uart2: fifo={ufifo} dr={udr} SR=0x{sr1:08x} CR1=0x{cr1a:08x} CR3=0x{cr3a:08x} sbus_frames={sframes}");
-            eprintln!("[vperiph] uart1: SR=0x{sr2:08x} CR1=0x{cr1b:08x} CR3=0x{cr3b:08x}");
-            eprintln!("[vperiph] rcsbus: n={} fill={} fresh={} ch4={} buf0={}",
-                f32::from_bits(rd2(0)), f32::from_bits(rd2(4)) as u32,
-                f32::from_bits(rd2(8)) > 0.5, f32::from_bits(rd2(12)), f32::from_bits(rd2(16)) as u32);
         }
     }
     let wall = t0.elapsed();
@@ -265,6 +205,26 @@ fn vperiph_closed_loop() {
         let t = String::from_utf8_lossy(&out);
         let n = t.len();
         eprintln!("[vperiph] === console FINAL ({n}B) ===\n{}", &t[n.saturating_sub(3000)..]);
+    }
+    {
+        let mut mm = m.lock().unwrap();
+        let est_armed = mm.cpu.mem_read(0x2000_9074 + 116, 1).unwrap()[0];
+        let fr_armed = mm.cpu.mem_read(0x2000_9018 + 0x58, 1).unwrap()[0];
+        let fr_fresh = mm.cpu.mem_read(0x2000_9018 + 0x52, 1).unwrap()[0];
+        let fr_thr = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9018 + 0x4C, 4).unwrap().try_into().unwrap());
+        let cmd_armed = mm.cpu.mem_read(0x2000_b669, 1).unwrap()[0];
+        let gates = u32::from_le_bytes(mm.cpu.mem_read(0x2000_b62c, 4).unwrap().try_into().unwrap());
+        eprintln!("[DIAG] est.armed={est_armed} G_CMD_ARMED={cmd_armed} frame.armed={fr_armed} frame.fresh={fr_fresh} frame.throttle={fr_thr}");
+        eprintln!("[DIAG] HIL_GATES=0x{gates:02x} armed={} rc={} health_ok={} est={} sp={} att_i={} pos_i={}",
+                  (gates>>0)&1, (gates>>1)&1, (gates>>2)&1, (gates>>3)&1, (gates>>4)&1, (gates>>5)&1, (gates>>6)&1);
+        let dm: Vec<String> = (0..4).map(|k| {
+            let off = 0x2000_b61c + 4*k;
+            f32::from_le_bytes(mm.cpu.mem_read(off, 4).unwrap().try_into().unwrap()).to_string()
+        }).collect();
+        eprintln!("[DIAG] DBG_MOTOR=[{}]", dm.join(","));
+        let pre = f32::from_le_bytes(mm.cpu.mem_read(0x2000_b660, 4).unwrap().try_into().unwrap());
+        let thr = f32::from_le_bytes(mm.cpu.mem_read(0x2000_b664, 4).unwrap().try_into().unwrap());
+        eprintln!("[DIAG] DBG_PRE={pre} DBG_THR={thr}");
     }
     assert!(max_thrust > 0.05, "MCU 未回传有效推力（PWM CCR 未通？sensors 链路未通？未解锁？）");
     let st = final_state.expect("物理从未推进（起飞台一直保持？）");

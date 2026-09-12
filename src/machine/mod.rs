@@ -1820,15 +1820,20 @@ impl Machine {
                 // 故此处需完整补全 Cortex-M 异常入口：压 8 字异常帧 + 设置 LR/IPSR/PC。
                 let in_handler = nvic2.lock().unwrap().in_handler();
                 let control = uc.reg_read(RegisterARM::CONTROL).unwrap_or(0) as u32;
-                let exc_return: u32 = if in_handler {
+                let mut exc_return: u32 = if in_handler {
                     0xFFFF_FFF1 // 从 handler 进入，恒 MSP
                 } else if control & 2 != 0 {
                     0xFFFF_FFFD // 线程模式 + PSP
                 } else {
                     0xFFFF_FFF9 // 线程模式 + MSP
                 };
+                // 与 enter_exception 相同：FPCA=1 → 扩展帧（bit4=0），供 RTOS
+                // context.S 的 PendSV 判定 `tst r14,#0x10` 保存/恢复 FPU 寄存器。
+                if control & (1 << 2) != 0 {
+                    exc_return &= !0x10;
+                }
                 // 选栈：与 enter_exception/exception_return 一致，显式读写 MSP/PSP
-                let sp = if in_handler || exc_return == 0xFFFF_FFF9 {
+                let sp = if in_handler || exc_return & 0x4 == 0 {
                     uc.reg_read(RegisterARM::MSP).unwrap_or(0) as u32
                 } else {
                     uc.reg_read(RegisterARM::PSP).unwrap_or(0) as u32
@@ -1852,7 +1857,7 @@ impl Machine {
                     frame[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
                 }
                 let _ = uc.mem_write(sp as u64, &frame);
-                if in_handler || exc_return == 0xFFFF_FFF9 {
+                if in_handler || exc_return & 0x4 == 0 {
                     let _ = uc.reg_write(RegisterARM::MSP, sp as u64);
                 } else {
                     let _ = uc.reg_write(RegisterARM::PSP, sp as u64);
@@ -2128,6 +2133,11 @@ impl Machine {
     /// 栈选择与 EXC_RETURN：handler 模式恒 MSP(0xFFFFFFF1)；
     /// 线程模式按 CONTROL.SPSEL：MSP(0xFFFFFFF9) 或 PSP(0xFFFFFFFD)。
     ///
+    /// EXC_RETURN.FTYPE（bit4）按被中断上下文的 CONTROL.FPCA（bit2）设置：
+    /// FPCA=1（任务用过 VFP）→ bit4=0（扩展帧，0xFFFFFFE1/E9/ED），使 RTOS
+    /// context.S 的 PendSV 保存/恢复 S0-S31+FPSCR（其判定即 `tst r14,#0x10`）。
+    /// 模拟器自身不压 FPU 扩展区——context.S 手动完成 FPU 上下文保存/恢复。
+    ///
     /// `vector` 为向量号：可配置系统异常（PendSV=14 / SysTick=15）或外部中断
     /// （IRQ0..81 → vector 16..97，由 block hook 的 select_pending_vector 给出）。
     fn enter_exception(&mut self, vector: u32) -> Result<()> {
@@ -2136,13 +2146,19 @@ impl Machine {
 
         let in_handler = self.nvic.lock().unwrap().in_handler();
         let control = self.cpu.reg_read_u32(RegisterARM::CONTROL)?;
-        let (sp, exc_return) = if in_handler {
+        let (sp, mut exc_return) = if in_handler {
             (self.cpu.reg_read_u32(RegisterARM::MSP)?, 0xFFFF_FFF1u32)
         } else if control & 2 != 0 {
             (self.cpu.reg_read_u32(RegisterARM::PSP)?, 0xFFFF_FFFD)
         } else {
             (self.cpu.reg_read_u32(RegisterARM::MSP)?, 0xFFFF_FFF9u32)
         };
+        // CONTROL.FPCA=1 → 被中断上下文 FPU 活动：EXC_RETURN 置扩展帧（bit4=0），
+        // 让 RTOS context.S 在 PendSV 里手动保存/恢复 S0-S31+FPSCR（s16-s31 硬件
+        // 从不保存，且模拟器不做懒栈，故必须走 context.S 的 FPU 保存路径）。
+        if control & (1 << 2) != 0 {
+            exc_return &= !0x10;
+        }
 
         // 采集被中断现场（block hook 停机时 PC 停在块首，返回后该块重放）
         let r0 = self.cpu.reg_read_u32(RegisterARM::R0)?;
@@ -2164,7 +2180,9 @@ impl Machine {
             frame[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
         self.cpu.mem_write(sp as u64, &frame)?;
-        let sp_reg = if in_handler || exc_return == 0xFFFF_FFF9 {
+        // 选 SP 寄存器：handler 模式恒 MSP；线程模式按 EXC_RETURN bit2（0=MSP 1=PSP），
+        // 不依赖 FPCA 修改前的 SPSEL 分支——扩展帧（bit4=0）下 bit2 判定不受影响。
+        let sp_reg = if in_handler || exc_return & 0x4 == 0 {
             RegisterARM::MSP
         } else {
             RegisterARM::PSP
