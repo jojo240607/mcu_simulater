@@ -121,13 +121,14 @@ mod tests {
                     idx += 1;
                 }
             }
-            // StaticSbus：ch0..15 默认 1500，ch2=1000
+            // StaticSbus：ch0..15 默认 1500，ch3=1000（油门）
             // ch=1500 → raw=992+0=992 → norm 0；ch=1000 → raw=172 → norm -1.0
             let norm = |v: u16| (v as f32 - 992.0) / 819.5;
             eprintln!("sbus ch={ch:?}");
             assert!((norm(ch[0]) - 0.0).abs() < 0.01, "ch0≈1500(norm 0)");
             assert!((norm(ch[1]) - 0.0).abs() < 0.01, "ch1≈1500(norm 0)");
-            assert!((norm(ch[2]) - (-1.0)).abs() < 0.01, "ch2=1000(norm -1.0)");
+            assert!((norm(ch[2]) - 0.0).abs() < 0.01, "ch2≈1500(norm 0)");
+            assert!((norm(ch[3]) - (-1.0)).abs() < 0.01, "ch3=1000(norm -1.0)");
         } else {
             panic!("source 应为 Math");
         }

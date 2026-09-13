@@ -5,7 +5,7 @@
 //! - 0x3B..0x48 ACCEL_XOUT_H 起 14 字节：accel×3(2B BE) + temp(2B) + gyro×3(2B BE)
 //! - 0x75 WHO_AM_I = 0x68
 //!
-//! 数据源：`StaticImu`（悬停：accel=[0,0,9.81] 抵消重力、gyro=0）。
+//! 数据源：`StaticImu`（悬停：accel=[0,0,-9.81] FRD z 向下、gyro=0）。
 
 use super::super::data_source::{DataSource, SensorModel, StaticImu};
 use super::super::RegFileSlave;
@@ -54,8 +54,8 @@ mod tests {
         assert_eq!(s.peek(0x75), Some(0x68));
         // i2c_write_read(0x3B, 14)：accel BE i16 + temp + gyro BE i16
         let raw = write_read(&mut s, 0x3B, 14);
-        // accel.z = 9.81 → raw = 16384 = 0x4000（BE 高字节在前）
-        assert_eq!(&raw[4..6], &[0x40, 0x00], "accel.z 应为 +1g");
+        // accel.z = -9.81 → raw = -16384 = 0xC000（BE 高字节在前；FRD z 向下）
+        assert_eq!(&raw[4..6], &[0xC0, 0x00], "accel.z 应为 -1g");
         // accel.x/y = 0
         assert_eq!(&raw[0..2], &[0x00, 0x00]);
         assert_eq!(&raw[2..4], &[0x00, 0x00]);

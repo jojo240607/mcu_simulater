@@ -89,7 +89,7 @@ pub struct StaticImu {
 impl Default for StaticImu {
     fn default() -> Self {
         Self {
-            accel: [0.0, 0.0, 9.81], // 静止于水平面：z 轴抵消重力（加速度计测比力）
+            accel: [0.0, 0.0, -9.81], // 静止于水平面（FRD z 向下）：比力 z 轴 = -9.81
             gyro: [0.0, 0.0, 0.0],
         }
     }
@@ -212,7 +212,7 @@ impl SensorModel for StaticGps {
     }
 }
 
-/// 静态 SBUS 模型：恒定摇杆通道值（中位 1500；`ch2`/`ch3` 油门）。
+/// 静态 SBUS 模型：恒定摇杆通道值（中位 1500；`ch3` 油门）。
 #[derive(Clone, Debug)]
 pub struct StaticSbus {
     /// 通道 0..15（1000..2000）
@@ -222,7 +222,7 @@ pub struct StaticSbus {
 impl Default for StaticSbus {
     fn default() -> Self {
         let mut c = [1500.0f32; 16];
-        c[2] = 1000.0; // ch2 油门最小（解锁/怠速验证）
+        c[3] = 1000.0; // ch3 油门最小（解锁/怠速验证）
         Self { channels: c }
     }
 }
@@ -260,7 +260,7 @@ pub struct NopProvider;
 /// fly_sim 物理引擎写入的共享传感器/RC 状态（每 4ms 物理步更新）。
 #[derive(Clone, Debug, Default)]
 pub struct FlySimState {
-    /// 机体系加速度（比力，m/s²；静止水平时 z=+9.81 抵消重力——与 mpu6050 设备约定一致）
+    /// 机体系加速度（比力，m/s²；FRD z 向下，静止水平时 z=-9.81）
     pub imu_acc: [f32; 3],
     /// 机体系角速度（rad/s）
     pub imu_gyr: [f32; 3],
@@ -271,7 +271,7 @@ pub struct FlySimState {
     pub gps_lon: f32,
     pub gps_alt: f32,
     pub gps_fix: f32,
-    /// SBUS 通道 0..15（1000..2000；ch2=油门）
+    /// SBUS 通道 0..15（1000..2000；ch3=油门）
     pub rc_ch: [f32; 16],
 }
 

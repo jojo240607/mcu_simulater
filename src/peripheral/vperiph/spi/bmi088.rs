@@ -286,10 +286,10 @@ mod tests {
     fn static_hover_accel_and_gyro() {
         let mut s = Bmi088::default();
         // ACCEL 数据：0x12 起 6B 顺序 X/Y/Z × (L,H)；StaticImu 悬停
-        // x=0, y=0, z=9.81(1g) → z raw=10920=0x2AA8 LE；x/y raw=0
+        // x=0, y=0, z=-9.81(-1g) → z raw=-10920=0xD558 LE；x/y raw=0
         let acc = read_regs(&mut s, ACC.0, ACC.1, 0x12, 6);
         assert_eq!(&acc[0..4], &[0x00, 0x00, 0x00, 0x00], "accel.x/y=0");
-        assert_eq!(&acc[4..6], &[0xA8, 0x2A], "accel.z raw≈10920 LE");
+        assert_eq!(&acc[4..6], &[0x58, 0xD5], "accel.z raw≈-10920 LE");
         let gyr = read_regs(&mut s, GYR.0, GYR.1, 0x02, 6);
         assert_eq!(&gyr, &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00], "gyro=0");
     }
@@ -313,7 +313,7 @@ mod tests {
         // 读 0x12 起 8 字节：前 6 = 数据区，第 7/8 字节 = 0x18/0x19 寄存器值（0）
         let r = read_regs(&mut s, ACC.0, ACC.1, 0x12, 8);
         assert_eq!(r.len(), 8);
-        assert_eq!(&r[4..6], &[0xA8, 0x2A], "ACC_Z 正确（x/y=0，z=+1g）");
+        assert_eq!(&r[4..6], &[0x58, 0xD5], "ACC_Z 正确（x/y=0，z=-1g）");
         assert_eq!(r[6], 0x00, "0x18 寄存器值");
         assert_eq!(r[7], 0x00, "0x19 寄存器值");
         // 超出文件（0x7F 后）→ 0xFF
