@@ -66,53 +66,18 @@ fn read_thrust(m: &Arc<Mutex<Machine>>) -> [f32; 4] {
     out
 }
 
-#[test]
-fn vperiph_closed_loop() {
-    init_log();
-    let sys = Path::new(SYS);
-    let app = Path::new(APP_REAL);
-    assert!(sys.exists(), "minimal elf 缺失");
-    assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin");
-
-    let mut m = Machine::new_m4f().unwrap();
-    m.map_stm32f407_layout().unwrap();
-
-    // 共享传感器/RC 状态（fly_sim 注入目标）
-    let state = Arc::new(Mutex::new(FlySimState::default()));
-    m.attach_flysim_sensors(state.clone());
-    m.attach_flysim_uart_slaves(state.clone());
-
-    m.load_elf(sys).unwrap();
-    m.load_app_partition(app).unwrap();
-    m.reset().unwrap();
-    for _ in 0..12 {
-        m.run(1_000_000).unwrap();
-    }
-    let m = Arc::new(Mutex::new(m));
-
-    // 地面站 ARM 等效注入：直接置 G_CMD_ARMED（AtomicBool）。
-    // 地址随固件构建变化：`arm-none-eabi-nm app.elf | grep G_CMD_ARMED` 获取，
-    // 重建固件后需同步（当前 clean 基线 = 0x2000b669）。
-    m.lock().unwrap().cpu.mem_write(0x2000_b669, &[1u8]).unwrap();
-
-    // 注入初始真值：悬停（静止水平，FRD accel z=-9.81）+ RC 通道
-    {
-        let mut st = state.lock().unwrap();
-        st.imu_acc = [0.0, 0.0, 9.81];
-        st.imu_gyr = [0.0, 0.0, 0.0];
-        st.baro_pa = 101325.0;
-        st.gps_lat = LAT0;
-        st.gps_lon = LON0;
-        st.gps_alt = ALT0;
-        st.gps_fix = 3.0;
-        st.rc_ch = [1500.0; 16];
-        // SBUS 通道编码：raw = 992 + (us-1500)/500*819.5。armed 阈值 raw>1700 ≈ us>1932，
-        // 故 1800us 不足（raw=1484<1700），须给足 2000us（raw=1811>1700）。
-        st.rc_ch[4] = 2000.0; // armed（SBUS raw 1811 > 1700）
-        st.rc_ch[3] = 1500.0; // 油门中位（raw 992 → throttle 0.5）
-    }
-
-    // 物理仿真
+/// 共享的"注入 + 推进 + 读回 PWM"单步逻辑，供多个闭环测试复用。
+///
+/// `steps` 为物理步数（每步 4ms）。`hold_thresh` 为起飞台保持的推力阈值。
+/// 返回 `(final_state, max_thrust, vec![(step, pos)])` 以便调用方做收敛判定。
+#[allow(clippy::too_many_arguments)]
+fn run_closed_loop(
+    m: &Arc<Mutex<Machine>>,
+    state: &Arc<Mutex<FlySimState>>,
+    steps: u64,
+    hold_thresh: f32,
+    log_every: u64,
+) -> (Option<flyctrl_core::vehicle::VehicleState>, f32, Vec<(u64, [f32; 3])>) {
     let mut sim = SimLoop::new(
         ToyWorld::new(9.81),
         &VehicleConfig::default_quad(),
@@ -128,15 +93,16 @@ fn vperiph_closed_loop() {
     let mut held = true;
     let mut max_thrust = 0.0f32;
     let mut final_state = None;
+    let mut traj = Vec::new();
 
-    for step in 0..60u64 {
+    for step in 0..steps {
         // ---- 读回 PWM 推力（上一拍固件输出）----
-        let motors = read_thrust(&m);
+        let motors = read_thrust(m);
         let thrust = motors.iter().sum::<f32>();
         max_thrust = max_thrust.max(thrust);
 
         // ---- 物理推进 / 起飞台保持 ----
-        let (st, imu_true) = if held && thrust < 0.05 {
+        let (st, imu_true) = if held && thrust < hold_thresh {
             (None, flyctrl_core::vehicle::ImuSample {
                 accel: [
                     flyctrl_core::units::MeterPerSecondSquared(0.0),
@@ -169,17 +135,17 @@ fn vperiph_closed_loop() {
             st.gps_lon = LON0 + e / (111_320.0 * LAT0.to_radians().cos());
             st.gps_alt = ALT0 - d; // d 向下正 → 越低 alt 越小
             st.gps_fix = 3.0;
-            // 气压：标准大气（h 向上正 = -d）
-            let h = -d;
+            // 气压：标准大气（h 向上正 = -(d - 家庭点)）。家庭点=起飞台(d=-5)，
+            // 与 GPS 原点（首次定位锁定）对齐 → 起飞台 baro 读 h=0、GPS 读 d=0，
+            // 消除 EKF 高度源冲突（历史根因：GPS d=0 vs baro d=-5 折中 → hold_alt
+            // 锁定错误值 → 机体下沉到错误高度）。
+            let h = -(d + 5.0);
             st.baro_pa = 101_325.0 * (-h / 8434.5).exp();
             // RC 保持解锁（SBUS raw 1811 > 1700）
             st.rc_ch[4] = 2000.0;
         }
 
         // ---- MCU 推进（sensors 2ms 采样 + control 4ms + PWM 输出）----
-        // 注意：不可在 if-let 条件里直接 m.lock().unwrap().run(...)：临时 MutexGuard
-        // 存活到整个 if-let 语句结束（含 Err 分支），分支内再 m.lock() 会重入自死锁。
-        // 先用块语句结束 guard 生命周期，再判断结果。
         let run_res = { m.lock().unwrap().run(300_000) };
         if let Err(e) = run_res {
             let mut mm = m.lock().unwrap();
@@ -189,7 +155,10 @@ fn vperiph_closed_loop() {
             panic!("[vperiph] run ERR at step={step}: {e:?} PC=0x{pc:08x} SP=0x{sp:08x} LR=0x{lr:08x}");
         }
 
-        if step % 10 == 0 {
+        if let Some(s) = st {
+            traj.push((step, [s.pos[0].0, s.pos[1].0, s.pos[2].0]));
+        }
+        if log_every > 0 && step % log_every == 0 {
             eprintln!(
                 "[vperiph] step={step} t={:.2}s thrust={thrust:.3} m=[{:.3},{:.3},{:.3},{:.3}] pos=({:.2},{:.2},{:.2})",
                 step as f64 * 0.004, motors[0], motors[1], motors[2], motors[3],
@@ -198,6 +167,69 @@ fn vperiph_closed_loop() {
         }
     }
     let wall = t0.elapsed();
+    eprintln!(
+        "[vperiph] 阶段完成：{steps} 步（{:.1}s 仿真），墙钟 {:.1}s，max_thrust={max_thrust:.3}",
+        steps as f64 * 0.004, wall.as_secs_f64(),
+    );
+    (final_state, max_thrust, traj)
+}
+
+#[test]
+fn vperiph_closed_loop() {
+    init_log();
+    let sys = Path::new(SYS);
+    let app = Path::new(APP_REAL);
+    assert!(sys.exists(), "minimal elf 缺失");
+    assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin");
+
+    let mut m = Machine::new_m4f().unwrap();
+    m.map_stm32f407_layout().unwrap();
+
+    // 共享传感器/RC 状态（fly_sim 注入目标）
+    let state = Arc::new(Mutex::new(FlySimState::default()));
+    m.attach_flysim_sensors(state.clone());
+    m.attach_flysim_uart_slaves(state.clone());
+
+    // 【关键】boot 前注入初始真值：固件 boot 阶段（12×1M 周期）内 sensors/control 任务
+    // 已开始采样，若 FlySimState 保持默认（baro_pa=0 → 气压高 44330m、gps 无效），
+    // EKF 高度会被污染到 -6454m（历史根因），解锁瞬间 hold_alt 锁定该垃圾值 → 持续下沉。
+    // 静止水平 FRD 悬停 + 气压 h=5m（起飞台悬停点）→ EKF 从首拍即收敛到 d≈-5。
+    // RC 保持中性：boot 阶段未解锁 → 不输出 PWM → 起飞台保持成立。
+    {
+        let mut st = state.lock().unwrap();
+        st.imu_acc = [0.0, 0.0, -9.81];
+        st.imu_gyr = [0.0, 0.0, 0.0];
+        st.baro_pa = 101_325.0f32; // h=0 家庭点气压（d=-5 起飞台；与 GPS 原点对齐，消除高度源冲突）
+        st.gps_lat = LAT0;
+        st.gps_lon = LON0;
+        st.gps_alt = ALT0 + 5.0; // 起飞台(d=-5) alt=9 → ref_alt=9 → 运行期 d_fw=0，气压单独驱动 d=-5
+        st.gps_fix = 3.0;
+        st.rc_ch = [1500.0; 16];
+    }
+
+    m.load_elf(sys).unwrap();
+    m.load_app_partition(app).unwrap();
+    m.reset().unwrap();
+    for _ in 0..12 {
+        m.run(1_000_000).unwrap();
+    }
+    let m = Arc::new(Mutex::new(m));
+
+    // 地面站 ARM 等效注入：直接置 G_CMD_ARMED（AtomicBool）。
+    // 地址随固件构建变化：`arm-none-eabi-nm app.elf | grep G_CMD_ARMED` 获取，
+    // 重建固件后需同步（当前 clean 基线 = 0x2000b669）。
+    m.lock().unwrap().cpu.mem_write(0x2000_b669, &[1u8]).unwrap();
+
+    // 解锁 RC：ch4=2000（SBUS raw 1811 > 1700 armed）、ch3=1500（油门中位 raw 992 → 0.5）
+    {
+        let mut st = state.lock().unwrap();
+        st.rc_ch[4] = 2000.0;
+        st.rc_ch[3] = 1500.0;
+    }
+
+    let m2 = m.clone();
+    let st2 = state.clone();
+    let (final_state, max_thrust, _traj) = run_closed_loop(&m2, &st2, 60, 0.05, 10);
 
     // ---- 断言 ----
     {
@@ -234,9 +266,106 @@ fn vperiph_closed_loop() {
     assert!(st.att.roll().is_finite() && st.att.roll().abs() < 1.0, "roll 发散：{}", st.att.roll());
     assert!(st.att.pitch().is_finite() && st.att.pitch().abs() < 1.0, "pitch 发散：{}", st.att.pitch());
     eprintln!(
-        "[vperiph] 闭环完成：墙钟 {:.1}s，max_thrust={max_thrust:.3}，末态 pos=({:.2},{:.2},{:.2}) roll={:.3}° pitch={:.3}°",
-        wall.as_secs_f64(), st.pos[0].0, st.pos[1].0, st.pos[2].0,
+        "[vperiph] 闭环完成：max_thrust={max_thrust:.3}，末态 pos=({:.2},{:.2},{:.2}) roll={:.3}° pitch={:.3}°",
+        st.pos[0].0, st.pos[1].0, st.pos[2].0,
         st.att.roll().to_degrees(), st.att.pitch().to_degrees(),
     );
     eprintln!(">>> [VPERIPH-MCUSIM] 虚拟外设直通闭环验证通过 ✓");
+}
+
+/// [虚拟外设直通] 长时悬停收敛验证：起飞台保持 → 升到 5m 悬停点 → 保持稳定。
+///
+/// 判定：仿真末段（最后 30%）位置应收敛在悬停点附近（|dz|<0.8m、水平 <0.5m），
+/// 姿态 roll/pitch 全程 < 3°，且终态速度小（说明已收敛而非仍在飘）。
+#[test]
+fn vperiph_hover_long() {
+    init_log();
+    let sys = Path::new(SYS);
+    let app = Path::new(APP_REAL);
+    assert!(sys.exists(), "minimal elf 缺失");
+    assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin");
+
+    let mut m = Machine::new_m4f().unwrap();
+    m.map_stm32f407_layout().unwrap();
+
+    let state = Arc::new(Mutex::new(FlySimState::default()));
+    m.attach_flysim_sensors(state.clone());
+    m.attach_flysim_uart_slaves(state.clone());
+
+    // 【关键】boot 前注入初始真值：boot 阶段 sensors 已采样，若默认 baro_pa=0 →
+    // EKF 高度被污染到 -6454m，解锁时 hold_alt 锁定垃圾值 → 悬停测试持续下沉（历史根因）。
+    // 静止水平 FRD 悬停 + 气压 h=5m + GPS 有效 → EKF 从首拍即收敛到 d≈-5。
+    {
+        let mut st = state.lock().unwrap();
+        st.imu_acc = [0.0, 0.0, -9.81];
+        st.imu_gyr = [0.0, 0.0, 0.0];
+        st.baro_pa = 101_325.0f32; // h=0 家庭点气压（d=-5 起飞台；与 GPS 原点对齐，消除高度源冲突）
+        st.gps_lat = LAT0;
+        st.gps_lon = LON0;
+        st.gps_alt = ALT0 + 5.0; // 起飞台(d=-5) alt=9 → ref_alt=9 → 运行期 d_fw=0，气压单独驱动 d=-5
+        st.gps_fix = 3.0;
+        st.rc_ch = [1500.0; 16];
+    }
+
+    m.load_elf(sys).unwrap();
+    m.load_app_partition(app).unwrap();
+    m.reset().unwrap();
+    for _ in 0..12 {
+        m.run(1_000_000).unwrap();
+    }
+    let m = Arc::new(Mutex::new(m));
+
+    // ARM（G_CMD_ARMED 直接置 1）
+    m.lock().unwrap().cpu.mem_write(0x2000_b669, &[1u8]).unwrap();
+
+    // 解锁 RC：ch4=2000（armed）、ch3=1500（油门中位）
+    {
+        let mut st = state.lock().unwrap();
+        st.rc_ch[4] = 2000.0;
+        st.rc_ch[3] = 1500.0;
+    }
+
+    // 300 步 = 1.2s 仿真：起飞台保持（thrust<0.05 不出台）→ 升空 → 悬停
+    let (final_state, max_thrust, traj) = run_closed_loop(&m, &state, 300, 0.05, 25);
+
+    // ---- 断言 ----
+    {
+        let out = m.lock().unwrap().console.lock().unwrap().output().to_vec();
+        let t = String::from_utf8_lossy(&out);
+        let n = t.len();
+        eprintln!("[vperiph-hover] === console FINAL ({n}B) ===\n{}", &t[n.saturating_sub(3000)..]);
+    }
+    assert!(max_thrust > 0.05, "MCU 未输出有效推力");
+    let st = final_state.expect("物理从未推进（起飞台一直保持？）");
+
+    // 末段收敛：取最后 30% 轨迹点的位置均值，应接近悬停点 (0,0,-5)
+    let n = traj.len();
+    assert!(n >= 50, "轨迹点太少：{n}");
+    let tail = &traj[n * 7 / 10..];
+    let avg = |k: usize| -> f64 { tail.iter().map(|(_, p)| p[k] as f64).sum::<f64>() / tail.len() as f64 };
+    let (ax, ay, az) = (avg(0), avg(1), avg(2));
+    let dx = ax.abs();
+    let dy = ay.abs();
+    let dz = (az - (-5.0)).abs();
+    eprintln!(
+        "[vperiph-hover] 末段均值 pos=({ax:.3},{ay:.3},{az:.3}) |dx|={dx:.3} |dy|={dy:.3} |dz|={dz:.3} (n={})",
+        tail.len()
+    );
+
+    // 有限性 & 姿态不发散
+    for v in [st.pos[0].0, st.pos[1].0, st.pos[2].0] {
+        assert!(v.is_finite() && v.abs() < 100.0, "位置发散：{v}");
+    }
+    assert!(st.att.roll().is_finite() && st.att.roll().abs() < 0.05, "roll 发散：{}", st.att.roll());
+    assert!(st.att.pitch().is_finite() && st.att.pitch().abs() < 0.05, "pitch 发散：{}", st.att.pitch());
+
+    // 收敛判定：末段位置应稳定在悬停点附近
+    assert!(dz < 0.8, "高度未收敛到 5m 悬停点：末段 |dz|={dz:.3}（期望 <0.8m）");
+    assert!(dx < 0.5 && dy < 0.5, "水平未收敛：|dx|={dx:.3} |dy|={dy:.3}（期望 <0.5m）");
+
+    eprintln!(
+        "[vperiph-hover] 悬停收敛 OK：末段 pos≈({ax:.2},{ay:.2},{az:.2})m 姿态=({:.2}°,{:.2}°)",
+        st.att.roll().to_degrees(), st.att.pitch().to_degrees(),
+    );
+    eprintln!(">>> [VPERIPH-MCUSIM] 长时悬停收敛验证通过 ✓");
 }
