@@ -49,13 +49,13 @@
 
 | 字段 | 类型 | 物理量 | 说明 |
 |---|---|---|---|
-| `imu_acc[3]` | f32 | m/s² | 机体系**比力**（FRD）。静止水平悬停 = `(0,0,9.81)`（抵消重力，与 mpu6050 设备约定一致）；hil.rs tilt alignment 期望悬停比力 `(0,0,-9.81)`（FRD） |
+| `imu_acc[3]` | f32 | m/s² | 机体系**比力**（FRD）。静止水平悬停 = `(0,0,-9.81)`（抵消重力，与 mpu6050 设备约定、hil.rs tilt alignment 一致） |
 | `imu_gyr[3]` | f32 | rad/s | 机体系角速度 |
 | `baro_pa` | f32 | Pa | 气压（101325 = 海平面） |
 | `gps_lat/lon` | f32 | 度 | 位置 |
 | `gps_alt` | f32 | 米 | 海拔（向下为正，NED） |
 | `gps_fix` | f32 | — | 定位状态（0/1/2/3） |
-| `rc_ch[16]` | f32 | 1000..2000 | SBUS 通道（ch2=油门，ch4=armed 常见约定） |
+| `rc_ch[16]` | f32 | 1000..2000 | SBUS 通道（ch3=油门，ch4=armed；注入 1000..2000，SBUS raw 换算见 §7.1 #3） |
 
 设备寄存器换算（`vperiph/i2c/mpu6050.rs`、`bmp280.rs`，动态寄存器读时求值）：
 
@@ -80,7 +80,7 @@
 let state = Arc::new(Mutex::new(FlySimState::default()));
 // 2) 装配虚拟外设（挂到 I2C1 / UART2,3）
 m.attach_flysim_sensors(state.clone());      // mpu6050/bmp280/qmc5883（qmc 静态）
-m.attach_flysim_uart_slaves(state.clone());  // NmeaGps(Sbus 推流)
+m.attach_flysim_uart_slaves(state.clone());  // NmeaGps(USART2) + Sbus(USART3) 推流
 // 3) 每物理步注入（写 FlySimState 字段）
 let mut st = state.lock().unwrap();
 st.imu_acc = [ax, ay, az];   // 机体系比力 m/s²（FRD 悬停 = (0,0,-9.81)）
@@ -97,41 +97,76 @@ st.rc_ch[..] = /* 1000..2000 */;
 
 ## 6. 固件侧观测约定（联调诊断共享区）
 
-control.rs 每 control 拍直写共享 RAM（0x2002_0000 起 f32 数组，测试 rd(off) 读 4B LE）：
+control.rs / pid.rs 用 `#[used] static` 直写诊断变量（测试按符号地址 rd() 读 LE），
+地址随固件构建变化，重建后以 `arm-none-eabi-nm app.elf` 复核（见 §7.3 地址表）：
 
-| off | 含义 | off | 含义 |
+- `DBG_MOTOR[4]`（`app/src/flyctrl/control.rs:240`）：4 路 clamp 后电机指令，每 control 拍刷新。
+- `DBG_PID[12]` / `DBG_PRE` / `DBG_THR`（`core/src/controller/pid.rs`）：垂向 PID 环诊断。
+- `HIL_DIAG_GATES`（`core/src/hil.rs`）：7-bit 联调门（armed/rc_fresh/health/est_finite/sp_finite/att_inited/pos_inited）。
+
+RcSbus 观测此前约定在 0x2002_0100 起共享 RAM，已随旧共享数组废弃；当前 SBUS 状态
+以 `RcSbus::read()` 返回的 `RcInput`（fresh/armed/throttle）为准。
+
+## 7. 验证状态（2026-09 更新：2025-06 阻塞全部解决）
+
+### 7.1 已解决阻塞及根因
+
+| # | 2025-06 阻塞 | 根因 | 解决方案 | 验证 |
+|---|---|---|---|---|
+| 1 | run 偶发 `UC_ERR_INSN_INVALID` / emu_start 卡死 | Unicorn `translate.c` 在 IT 指令结束后未清零 `condexec_bits` → 后续指令被错误解释为条件执行 | 打补丁：`gen_set_condexec` 在 IT 块结束时写 0（校验哈希在 `.cargo-checksum.json`） | `x_jos_p2`、`x_vperiph_mcusim` 长跑稳定 |
+| 2 | 固件 I2C 读间歇返回 0 → EKF 垂向发散 vz=-130 → PWM 中位 | 悬停比力符号约定不一致：I2C/SPI 注入 +9.81、hil.rs tilt alignment 期望 -9.81 → EKF 失配 | 统一 FRD 约定：悬停比力 `(0,0,-9.81)`（data_source/mpu6050/bmi088 同改）；clamp 恢复标准 `clamp(v,0,1)` | 闭环 300 步稳定收敛 |
+| 3 | SBUS UART 推流：CR3 无 DMAR → IDLE ring 空 → RcSbus 恒 n=0 | 固件 uart2 期望 DMA+IDLE 收帧；模拟器 CR3 无 DMAR，字节只进 rx_fifo | 模拟器按真机语义走 **CPU 轮询读 DR 路径**：`read(SR)` 返回含 IDLE 状态、`read(DR)` 弹 rx_fifo 并清 IDLE（`src/peripheral/usart.rs:292-326`）；SBUS 驱动改为标准 8E2 100kbps 反向电平 + `UART_IOCTL_SET_INVERTED` | `RcSbus::read()` 解出 ch、armed=ch4>1700、throttle=ch3 |
+| 4 | GPS 链路（gps_w=false） | 同 #3 的 UART 推流问题 | 同 #3 解决；`NmeaGps` 经同一 rx_fifo 路径推流 | 闭环内 gps_fix=3 生效 |
+
+另有两项**结构性根因修复**（非阻塞，属必要修正）：
+- **Non-HIL setpoint_valid 恒 false** → 改 true，使 `hil_pos_inited` gate 可置位、执行器不再恒 0。
+- **HIL IMU 单次消费**：`f.imu = None` 读后即清，防止同一 32ms 帧被 8 次积分。
+
+### 7.2 闭环验证协议（`tests/x_vperiph_mcusim.rs`）
+
+两个子测试共享 `run_closed_loop` 单步逻辑（读 PWM → 物理推进 → 注入真值 → run(N) 推进固件）：
+
+| 测试 | 步数 | 场景 | 判定 |
 |---|---|---|---|
-| 0 | hil gates（HIL_DIAG_GATES 位域） | 11 | est.vel[2] |
-| 1 | est.pos[2] | 12 | yaw |
-| 2 | armed_eff | 13 | imu.accel[2] |
-| 3 | roll | 14 | imu.gyro[2] |
-| 4 | pitch | 15 | armed 强制标志（1.0） |
-| 5 | setpoint_valid | 16 | cmd.motor[0]（clamp 后） |
-| 6 | rc.fresh | 17 | PWM ticks |
-| 7 | rc.armed | 18 | pwm ioctl 返回 |
-| 8 | rc.throttle | 19 | pwm_dev[0] is_some |
-| 9 | est.pos[0] | 20-22 | imu.accel[0..2]（全量） |
-| 10 | est.pos[1] | 23 | baro_alt |
+| `vperiph_closed_loop` | 60（0.24s） | 起飞台保持 → 升空 | max_thrust>0.05；pos 有限；roll/pitch<1° |
+| `vperiph_hover_long` | 300（1.2s） | 升到 5m 悬停点保持 | 末段（后 30%）|dz|<0.8m、|dx|,|dy|<0.5m；roll/pitch<0.05rad |
 
-0x2002_0100 起：RcSbus 观测（n / fill / fresh / ch[4] / buf[0]）。
+运行前置（构建固件）：
+```bash
+cd /home/ubuntu/work/joc-base && cmake --build build_rel          # minimal elf
+cd /home/ubuntu/work/flyctrl && python3 build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin
+cd /home/ubuntu/work/mcu_simulater && cargo test --release --offline --test x_vperiph_mcusim
+```
+预期输出末尾：`>>> [VPERIPH-MCUSIM] 虚拟外设直通闭环验证通过 ✓` 与 `>>> [VPERIPH-MCUSIM] 长时悬停收敛验证通过 ✓`。
 
-## 7. 验证状态与已知阻塞（2025-06 记录）
+### 7.3 诊断共享区地址（随固件构建变化，重建后以 nm 复核）
 
-**已验证（架构链路端到端）**：
-- FlySimState 注入 → FlySimSource → RegFile 动态寄存器编码正确（测试模拟 on_read：
-  accel.z=9.81 → raw=0x4000；-9.81 → 0xC000；baro 101325 → p20=0x18BCD0）。
-- hil gates 全过（HIL_DIAG_GATES=127：armed/rc_fresh/health/est_finite/sp_finite/att/pos）。
-- control 输出 cmd 非 0；PWM 设备 open 成功（pwmok=true），TIM CCR1 写路径通
-  （中位 us=1000 → ticks≈206，ARR≈515 对应 400Hz）。
+| 地址 | 符号 | 含义 |
+|---|---|---|
+| `0x2000_b61c` | `DBG_MOTOR[4]` | 4 路 clamp 后电机指令 |
+| `0x2000_b62c` | `HIL_DIAG_GATES` | 7-bit 位域：armed(0)/rc_fresh(1)/health(2)/est_finite(3)/sp_finite(4)/att_inited(5)/pos_inited(6) |
+| `0x2000_b630` | `DBG_PID[12]` | 垂向 PID 环诊断（每组 4 f32） |
+| `0x2000_b660` | `DBG_PRE` | 垂向环误差 |
+| `0x2000_b664` | `DBG_THR` | 垂向环输出油门 |
+| `0x2000_b669` | `G_CMD_ARMED` | 地面站 ARM 标志（测试直接置 1 模拟解锁） |
 
-**已知阻塞（mcu_sim/Unicorn 模拟层，待深挖）**：
-1. run 不稳定：偶发 UC_ERR_INSN_INVALID（~step 172），或 emu_start 内部卡死
-   （block 内不返回，风暴护栏 1M 段无法兜底；同一代码多次运行结果不同）。
-2. run 内固件 I2C 读间歇返回 0（注入 -9.81 但固件偶发读到 0 → EKF 垂向速度发散
-   vz=-130 → des_thrust 被 clamp 到 0 → PWM 中位）。测试直接模拟 on_read 读对，
-   断点在固件经 mcu_sim I2C1 状态机的事务路径。
-3. SBUS UART 推流链路：固件 uart2（DMA+IDLE）的 CR3 无 DMAR → 字节只进 rx_fifo，
-   IDLE ring 空 → RcSbus read 恒 n=0。当前用 control 临时放宽
-   （`let rc_fresh = true` / `armed_eff = true`，均带 TODO）绕过，最终需修 DMA
-   使能时序或改 board engine。
-4. GPS 链路（gps_w=false）同 UART 推流问题，可后补。
+复核命令：`arm-none-eabi-nm app.elf | grep -E 'HIL_DIAG_GATES|DBG_MOTOR|DBG_PID|DBG_PRE|DBG_THR|G_CMD_ARMED'`。
+这些 `#[used] static` 诊断变量的语义另见 §6。
+
+### 7.4 HIL 事件驱动同步
+
+- 每物理步（4ms）与固件 control 拍（4ms）对齐，经 `HIL_EVT` 信号量同步
+  （`flyctrl/core/src/hil.rs`，`Semaphore<1>`，cfg feature="hil" 引入）。
+- `HilContext::step_hil()` 为 SIL/HIL 共用步进：注入 IMU 真值 → 推进 EKF → 取期望轨迹点 → 更新执行器。
+- 虚拟外设/推流时钟以**退休指令数**为基准（`dt = Δretired / VIRT_INSN_PER_SEC`），与中断频率解耦。
+
+### 7.5 FRD 坐标约定（易错点速查）
+
+| 量 | 约定 | 悬停值 |
+|---|---|---|
+| 机体系比力（accel） | FRD（前右下） | `(0,0,-9.81)` m/s² |
+| 世界位置 | NED（n,e,d 向下正） | 起飞台 d=-5 |
+| baro 高度 | 固件内部**向上正**，step_hil 内部取反为 D 向下 | 家庭点 h=0 |
+| GPS alt | 海拔（m） | 起飞台 alt=9 → ref_alt=9 |
+
+关键对齐：GPS 原点（首次定位锁定）与气压家庭点（起飞台 d=-5）对齐，避免 EKF 高度源冲突（历史根因：GPS d=0 vs baro d=-5 折中 → hold_alt 锁错 → 机体持续下沉）。
