@@ -177,6 +177,15 @@ pub struct Machine {
     halt_requested: std::cell::Cell<bool>,
     /// 遥测记录器（P2-1）：run() 段后按退休间隔采样观测点
     telemetry: Option<crate::telemetry::Telemetry>,
+    /// GDB 指令级断点集（P2-3）：block hook 检查块起始地址命中
+    gdb_breaks: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
+    /// GDB 断点命中标志（run() 段循环置位，GDB 继续命令消费）
+    gdb_hit: std::cell::Cell<bool>,
+    /// 软件断点原指令保存（地址 → 原字节；清除时恢复）
+    sw_breaks: std::cell::RefCell<std::collections::HashMap<u32, Vec<u8>>>,
+    /// GDB 精确断点 code hook（有断点时安装：逐指令检查 PC 命中；无断点时移除，
+    /// 避免每指令回调开销）
+    gdb_code_hook: std::cell::RefCell<Option<crate::core::UcHookId>>,
 }
 
 impl Machine {
@@ -277,6 +286,10 @@ impl Machine {
             uart_drop: std::cell::RefCell::new(std::collections::HashMap::new()),
             halt_requested: std::cell::Cell::new(false),
             telemetry: None,
+            gdb_breaks: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            gdb_hit: std::cell::Cell::new(false),
+            sw_breaks: std::cell::RefCell::new(std::collections::HashMap::new()),
+            gdb_code_hook: std::cell::RefCell::new(None),
         })
     }
 
@@ -634,6 +647,83 @@ impl Machine {
         // 恢复后清 Halt 观察点（快照点不处于 halt 状态）
         self.halt_requested.set(false);
         crate::checkpoint::restore(&mut self.cpu, snap, &self.retired_insts, &self.last_virt_retired)
+    }
+
+    /// GDB 设置软件断点（P2-3）：block hook 区间检查（主停机制）+ 把断点地址的
+    /// Thumb 指令改写为 BKPT(0xBEBE)（GDB 插入后读内存验证软件断点生效；
+    /// 若区间检查未截停，BKPT 落入 HardFault 由固件异常路径兜底）。
+    pub fn gdb_set_break(&mut self, addr: u32) -> bool {
+        let addr = addr & !1;
+        self.gdb_breaks.lock().unwrap().insert(addr);
+        // 保存原指令并写入 BKPT（仅 FLASH/RAM 可写区域；外设区忽略）
+        let orig = match self.cpu.mem_read(addr as u64, 2) {
+            Ok(b) if b.len() == 2 => b,
+            _ => return false,
+        };
+        self.sw_break_save(addr, orig);
+        let ok = self.cpu.mem_write(addr as u64, &[0xBE, 0xBE]).is_ok();
+        self.ensure_gdb_code_hook();
+        ok
+    }
+    /// 清除软件断点：恢复原指令。
+    pub fn gdb_clear_break(&mut self, addr: u32) {
+        let addr = addr & !1;
+        self.gdb_breaks.lock().unwrap().remove(&addr);
+        if let Some(orig) = self.sw_break_take(addr) {
+            let _ = self.cpu.mem_write(addr as u64, &orig);
+        }
+        self.maybe_drop_gdb_code_hook();
+    }
+    /// 安装精确断点 code hook（幂等；逐指令检查 PC 命中，命中即停）。
+    /// 断点调试期间性能下降（每指令一次回调），无断点时移除恢复全速。
+    fn ensure_gdb_code_hook(&mut self) {
+        if self.gdb_code_hook.borrow().is_some() {
+            return;
+        }
+        let breaks = self.gdb_breaks.clone();
+        let nvic = self.nvic.clone();
+        let id = self
+            .cpu
+            .add_code_hook(0, u64::MAX, move |uc, addr, _size| {
+                if breaks
+                    .lock()
+                    .unwrap()
+                    .contains(&((addr as u32) & !1))
+                {
+                    nvic.lock()
+                        .unwrap()
+                        .set_stop_reason(StopReason::Breakpoint);
+                    let _ = uc.emu_stop();
+                }
+            })
+            .ok();
+        *self.gdb_code_hook.borrow_mut() = id;
+    }
+    /// 断点集清空时移除 code hook（恢复全速）。
+    fn maybe_drop_gdb_code_hook(&mut self) {
+        if !self.gdb_breaks.lock().unwrap().is_empty() {
+            return;
+        }
+        if let Some(id) = self.gdb_code_hook.borrow_mut().take() {
+            let _ = self.cpu.remove_hook(id);
+        }
+    }
+    /// 软件断点原指令保存表（地址 → 原 2 字节）。
+    fn sw_break_save(&self, addr: u32, orig: Vec<u8>) {
+        self.sw_breaks.borrow_mut().insert(addr, orig);
+    }
+    fn sw_break_take(&self, addr: u32) -> Option<Vec<u8>> {
+        self.sw_breaks.borrow_mut().remove(&addr)
+    }
+    /// 断点命中标志（继续命令消费后复位）。
+    pub fn gdb_break_hit(&self) -> bool {
+        self.gdb_hit.get()
+    }
+    pub fn gdb_break_hit_take(&self) -> bool {
+        self.gdb_hit.replace(false)
+    }
+    pub fn gdb_breaks_len(&self) -> usize {
+        self.gdb_breaks.lock().unwrap().len()
     }
 
     /// 装配遥测记录器（调试平台 P2-1）：run() 段后按退休间隔采样观测点。
@@ -2268,6 +2358,11 @@ impl Machine {
                     self.install_data_access_hook()?;
                 }
                 StopReason::None => budget_exhausted = true, // 达到指令数上限
+                StopReason::Breakpoint => {
+                    // GDB 断点命中：置标志供调试器消费（继续命令检查）
+                    self.gdb_hit.set(true);
+                    break;
+                }
             }
 
             // 段后故障检查：本段新退休量可能已越过观察点（Halt 停在本段后）

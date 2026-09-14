@@ -78,9 +78,9 @@ fn gdb_rsp_end_to_end() {
     assert!(r.contains("PacketSize"), "qSupported 应回特性：{r}");
     assert_eq!(rsp_send(&mut s, "?"), "S05");
 
-    // 2) 寄存器读取：184 hex
+    // 2) 寄存器读取：336 hex（GDB 默认 ARM 布局 168B = r0-r15 + f0-f7×12B + fps + cpsr）
     let g = rsp_send(&mut s, "g");
-    assert_eq!(g.len(), 23 * 8, "寄存器串长度");
+    assert_eq!(g.len(), 336, "寄存器串长度");
 
     // 3) 内存读写
     assert_eq!(rsp_send(&mut s, &format!("M{:x},4:deadbeef", G_TX)), "OK");
@@ -94,8 +94,7 @@ fn gdb_rsp_end_to_end() {
     let g3 = rsp_send(&mut s, "g");
     assert!(g3.starts_with("44332211"), "r0 应写回 0x11223344");
 
-    // 5) 断点 + 继续 → 命中（断点设在当前 PC——GDB 惯例 PC 对齐）
-    //    先读当前 PC（寄存器串中 PC 在 index 15×8，小端 hex）
+    // 5) 断点 + 继续 → 命中（断点设在当前 PC=Reset_Handler 入口；block hook 精确停）
     let pc_hex = std::str::from_utf8(&g.as_bytes()[15 * 8..16 * 8]).unwrap();
     let pc_le = u32::from_str_radix(
         &format!("{}{}{}{}", &pc_hex[6..8], &pc_hex[4..6], &pc_hex[2..4], &pc_hex[0..2]),
@@ -104,7 +103,7 @@ fn gdb_rsp_end_to_end() {
     .unwrap();
     assert_eq!(rsp_send(&mut s, &format!("Z0,{:x},2", pc_le & !1)), "OK");
     let r = rsp_send(&mut s, "c");
-    assert_eq!(r, "S05", "断点应立即命中");
+    assert_eq!(r, "S05", "断点应立即命中（指令级）");
     assert_eq!(rsp_send(&mut s, &format!("z0,{:x},2", pc_le & !1)), "OK");
 
     // 6) 单步

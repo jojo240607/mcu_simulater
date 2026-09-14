@@ -57,6 +57,8 @@ pub enum StopReason {
     /// block hook 检到 MPU 已使能但数据访问 hook 未安装：run() 懒安装 hook + 刷 TB
     /// 后继续（避免启动早期 hook helper 翻译触发 Unicorn 首指令副作用丢失缺陷）。
     MpuEnable,
+    /// block hook 检到 GDB 指令级断点（PC 命中）：run() 停止供调试器接管
+    Breakpoint,
 }
 
 /// NVIC 寄存器组

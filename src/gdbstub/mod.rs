@@ -26,32 +26,25 @@
 //! 限制（fidelity 边界，见 docs）：`c` 在无断点时跑固定预算后停（单线程无法
 //! 响应 Ctrl-C 中断）；不做内存/寄存器差分同步（GDB 本地直接读符号表）。
 
-use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
 
 use unicorn_engine::RegisterARM;
 
 use crate::machine::Machine;
 
-/// 单步预算（退休字节；~500 ≈ 微秒级）。
-const STEP_BUDGET: usize = 500;
-/// 继续无断点时最多跑的段数（防死循环；返回 SIGINT）。
-/// 实际调试中正常 `c` 都靠断点停；预算上限只是护栏（每段 ~500 退休）。
-const CONTINUE_MAX_SEG: u64 = 5_000;
+/// 单步预算（退休字节；2 ≈ 1 条 Thumb 指令）。
+const STEP_BUDGET: usize = 2;
+/// 继续预算（退休字节；大预算一次跑，靠 block hook 指令级断点停）。
+const CONTINUE_BUDGET: usize = 2_000_000;
 
-/// GDB 服务器：按 RSP 命令驱动仿真（断点集；Machine 由调用方/服务线程持有）。
-pub struct GdbServer {
-    /// 软断点地址集合（PC 命中即停）。
-    breaks: HashSet<u32>,
-}
+/// GDB 服务器：按 RSP 命令驱动仿真（断点集存于 Machine，block hook 指令级检查；
+/// Machine 由调用方/服务线程持有）。
+pub struct GdbServer {}
 
 impl GdbServer {
     pub fn new() -> Self {
-        Self {
-            breaks: HashSet::new(),
-        }
+        Self {}
     }
 
     /// 后台启动监听（每连接在服务线程内建一个 Machine 实例并服务；返回线程句柄）。
@@ -107,6 +100,10 @@ impl GdbServer {
                     if stream.read(&mut cs).is_err() {
                         return;
                     }
+                    // RSP 双向 ACK：确认收到 GDB 的包（否则 GDB 等待超时）
+                    if stream.write_all(b"+").is_err() {
+                        return;
+                    }
                     let cmd = String::from_utf8_lossy(&pkt).into_owned();
                     let resp = self.handle_packet(&cmd, machine);
                     // 发响应（ACK 由对端发；我们忽略）
@@ -138,7 +135,7 @@ impl GdbServer {
             b'm' => self.cmd_read_mem(&cmd[1..], machine),
             b'M' => self.cmd_write_mem(&cmd[1..], machine),
             b'c' => {
-                // c [addr]：跑到断点或预算上限
+                // c [addr]：跑到断点（block hook 精确停）或预算上限
                 let target = if cmd.len() > 1 {
                     hex_to_u32(&cmd[1..])
                 } else {
@@ -152,13 +149,14 @@ impl GdbServer {
             }
             b'Z' => {
                 // Z0,addr,kind
-                self.set_break(&cmd[1..], true);
+                self.set_break(&cmd[1..], true, machine);
                 "OK".into()
             }
             b'z' => {
-                self.set_break(&cmd[1..], false);
+                self.set_break(&cmd[1..], false, machine);
                 "OK".into()
             }
+            b'D' => "OK".into(), // detach
             b'k' => String::new(), // kill：空响应 + 对端断开
             b'q' => self.cmd_query(&cmd[1..]),
             _ => String::new(), // 未知命令：空响应
@@ -168,30 +166,40 @@ impl GdbServer {
     // ---------------- 命令实现 ----------------
 
     fn cmd_read_regs(&mut self, m: &mut Machine) -> String {
-        let mut out = String::with_capacity(23 * 8);
-        for &r in cortex_m_regs() {
-            let v = m.cpu.reg_read_u32(r).unwrap_or(0);
-            for b in v.to_le_bytes() {
-                out.push_str(&format!("{b:02x}"));
+        let mut out = String::new();
+        for &(r, w) in cortex_m_regs().iter() {
+            let v = match r {
+                Some(r) => m.cpu.reg_read(r).unwrap_or(0),
+                None => 0, // f0-f7 无映射
+            };
+            // 小端：低 `w` 字节（w 可 >8，如 FPA 12B；u64 之外补 0）
+            for i in 0..w {
+                let byte = if i < 8 { (v >> (i * 8)) & 0xFF } else { 0 };
+                out.push_str(&format!("{byte:02x}"));
             }
         }
         out
     }
 
     fn cmd_write_regs(&mut self, hex: &str, m: &mut Machine) -> String {
-        let regs = cortex_m_regs();
         let bytes = match hex_to_bytes(hex) {
             Some(b) => b,
             None => return "E01".into(),
         };
-        // 每 4 字节一个寄存器（小端）
-        for (i, r) in regs.iter().enumerate() {
-            let off = i * 4;
-            if off + 4 > bytes.len() {
+        // 按布局逐寄存器写回（小端）
+        let mut off = 0usize;
+        for &(r, w) in cortex_m_regs().iter() {
+            if off + w > bytes.len() {
                 break;
             }
-            let v = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
-            let _ = m.cpu.reg_write(*r, v as u64);
+            let mut v: u64 = 0;
+            for i in 0..w.min(8) {
+                v |= (bytes[off + i] as u64) << (i * 8);
+            }
+            if let Some(r) = r {
+                let _ = m.cpu.reg_write(r, v);
+            }
+            off += w;
         }
         "OK".into()
     }
@@ -233,31 +241,23 @@ impl GdbServer {
             // c addr：跳转后继续（GDB step 到地址）
             let _ = m.cpu.reg_write(RegisterARM::PC, addr as u64);
         }
-        let mut segs = 0u64;
-        loop {
-            let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap_or(0);
-            if self.breaks.contains(&pc) {
-                return "S05".into(); // 断点命中：SIGTRAP
-            }
-            // 跑一段（小预算，段边界查断点）
-            if m.run(STEP_BUDGET).is_err() {
-                return "S05".into();
-            }
-            segs += 1;
-            if segs >= CONTINUE_MAX_SEG {
-                return "S02".into(); // 预算上限：SIGINT
-            }
+        // 大预算一次跑；block hook 在断点地址精确停（StopReason::Breakpoint）
+        let _ = m.run(CONTINUE_BUDGET);
+        if m.gdb_break_hit_take() {
+            "S05".into() // 断点命中：SIGTRAP
+        } else {
+            "S02".into() // 预算上限：SIGINT
         }
     }
 
-    fn set_break(&mut self, args: &str, add: bool) {
+    fn set_break(&mut self, args: &str, add: bool, m: &mut Machine) {
         // Z0,addr,kind
         if let Some((_, rest)) = args.split_once(',') {
             if let Some(addr) = hex_to_u32(rest.split(',').next().unwrap_or("")) {
                 if add {
-                    self.breaks.insert(addr);
+                    m.gdb_set_break(addr);
                 } else {
-                    self.breaks.remove(&addr);
+                    m.gdb_clear_break(addr);
                 }
                 log::info!("GDB {}断点 {:#010x}", if add { "设置" } else { "清除" }, addr);
             }
@@ -266,28 +266,189 @@ impl GdbServer {
 
     fn cmd_query(&mut self, q: &str) -> String {
         if q.starts_with("Supported") {
-            "PacketSize=1024;qXfer:memory-map:read-;qXfer:features:read-".into()
+            // 声明 qXfer:features 支持（tdesc：armv7e-m + VFPv4-D16）
+            "PacketSize=16384;qXfer:memory-map:read-;qXfer:features:read-".into()
+        } else if q.starts_with("Xfer:features:read") {
+            self.cmd_qxfer_features(q)
+        } else if q.starts_with("fThreadInfo") {
+            "m1".into() // 线程列表开始：只有线程 1
+        } else if q.starts_with("sThreadInfo") {
+            "l".into() // 线程列表结束
+        } else if q.starts_with("ThreadExtraInfo") {
+            // hex 编码的 "Thread 1"
+            "5468726561642031".into()
         } else if q.starts_with('C') {
             "QC1".into() // 当前线程 1
         } else if q.starts_with("Attached") {
             "1".into()
+        } else if q.starts_with("Offsets") {
+            String::new()
+        } else if q.starts_with("Symbol") {
+            String::new()
         } else {
             String::new()
         }
     }
+
+    /// qXfer:features:read:target.xml:<offset>,<length> → hex 编码分块。
+    ///
+    /// GDB 的 qXfer **offset/length 单位是 hex 编码字符**（把 XML 的 hex 串当
+    /// "对象"分块传输，GDB 端按 hex 偏移拼接后统一解码）。因此数据源用整个
+    /// XML 的 hex 串，off/len 直接作为 hex 偏移/长度；响应每块 ≤ len 字符
+    /// （含 m/l 前缀），最后一块 l。
+    fn cmd_qxfer_features(&mut self, q: &str) -> String {
+        // 格式：Xfer:features:read:target.xml:0,1000
+        let parts: Vec<&str> = q.splitn(5, ':').collect();
+        if parts.len() < 5 {
+            return String::new();
+        }
+        let (target, range) = (parts[3], parts[4]);
+        if target != "target.xml" {
+            return String::new();
+        }
+        let (off, len) = match range.split_once(',') {
+            Some((o, l)) => match (usize::from_str_radix(o, 16), usize::from_str_radix(l, 16)) {
+                (Ok(o), Ok(l)) => (o, l),
+                _ => return "E01".into(),
+            },
+            None => return "E01".into(),
+        };
+        let hex_all = qxfer_hex_cache();
+        if off >= hex_all.len() {
+            return "l".into(); // 空末块
+        }
+        // 每块响应（含 m/l 前缀）≤ len hex 字符；hex 数据必须偶数长度
+        let max_chars = (len.saturating_sub(1)) & !1;
+        let end = (off + max_chars).min(hex_all.len());
+        // end 需与 off 同奇偶（保证切片偶数长）
+        let end = end & !1;
+        let chunk = &hex_all[off..end];
+        let prefix = if end >= hex_all.len() { "l" } else { "m" };
+        format!("{prefix}{chunk}")
+    }
 }
 
-/// Cortex-M4 GDB 寄存器布局（顺序 = GDB 寄存器号）：
-/// r0-r12, sp, lr, pc, xpsr, msp, psp, primask, basepri, faultmask, control。
-fn cortex_m_regs() -> &'static [RegisterARM] {
-    &[
-        RegisterARM::R0, RegisterARM::R1, RegisterARM::R2, RegisterARM::R3,
-        RegisterARM::R4, RegisterARM::R5, RegisterARM::R6, RegisterARM::R7,
-        RegisterARM::R8, RegisterARM::R9, RegisterARM::R10, RegisterARM::R11,
-        RegisterARM::R12, RegisterARM::SP, RegisterARM::LR, RegisterARM::PC,
-        RegisterARM::XPSR, RegisterARM::MSP, RegisterARM::PSP, RegisterARM::PRIMASK,
-        RegisterARM::BASEPRI, RegisterARM::FAULTMASK, RegisterARM::CONTROL,
-    ]
+/// TARGET_XML 的 hex 编码缓存（qXfer 以 hex 偏移分块）。
+fn qxfer_hex_cache() -> &'static str {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        TARGET_XML.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
+
+/// armv7e-m + VFPv4-D16 目标描述（GDB tdesc）。
+/// 寄存器顺序（= g 包布局，352 字节）：
+/// r0-r15, xpsr, msp, psp, primask, basepri, faultmask, control,
+/// fpscr, d0-d15(8B), s0-s31。
+const TARGET_XML: &str = r#"<?xml version="1.0"?>
+<target>
+  <architecture>arm</architecture>
+  <feature name="org.gnu.gdb.arm.m-profile">
+    <reg name="r0" bitsize="32"/>
+    <reg name="r1" bitsize="32"/>
+    <reg name="r2" bitsize="32"/>
+    <reg name="r3" bitsize="32"/>
+    <reg name="r4" bitsize="32"/>
+    <reg name="r5" bitsize="32"/>
+    <reg name="r6" bitsize="32"/>
+    <reg name="r7" bitsize="32"/>
+    <reg name="r8" bitsize="32"/>
+    <reg name="r9" bitsize="32"/>
+    <reg name="r10" bitsize="32"/>
+    <reg name="r11" bitsize="32"/>
+    <reg name="r12" bitsize="32"/>
+    <reg name="sp" bitsize="32" type="data_ptr"/>
+    <reg name="lr" bitsize="32"/>
+    <reg name="pc" bitsize="32" type="code_ptr"/>
+    <reg name="xpsr" bitsize="32"/>
+    <reg name="msp" bitsize="32"/>
+    <reg name="psp" bitsize="32"/>
+    <reg name="primask" bitsize="32"/>
+    <reg name="basepri" bitsize="32"/>
+    <reg name="faultmask" bitsize="32"/>
+    <reg name="control" bitsize="32"/>
+  </feature>
+  <feature name="org.gnu.gdb.arm.vfp">
+    <reg name="fpscr" bitsize="32" type="int" group="float"/>
+    <reg name="d0" bitsize="64" type="float" group="float"/>
+    <reg name="d1" bitsize="64" type="float" group="float"/>
+    <reg name="d2" bitsize="64" type="float" group="float"/>
+    <reg name="d3" bitsize="64" type="float" group="float"/>
+    <reg name="d4" bitsize="64" type="float" group="float"/>
+    <reg name="d5" bitsize="64" type="float" group="float"/>
+    <reg name="d6" bitsize="64" type="float" group="float"/>
+    <reg name="d7" bitsize="64" type="float" group="float"/>
+    <reg name="d8" bitsize="64" type="float" group="float"/>
+    <reg name="d9" bitsize="64" type="float" group="float"/>
+    <reg name="d10" bitsize="64" type="float" group="float"/>
+    <reg name="d11" bitsize="64" type="float" group="float"/>
+    <reg name="d12" bitsize="64" type="float" group="float"/>
+    <reg name="d13" bitsize="64" type="float" group="float"/>
+    <reg name="d14" bitsize="64" type="float" group="float"/>
+    <reg name="d15" bitsize="64" type="float" group="float"/>
+    <reg name="s0" bitsize="32" type="float" group="float"/>
+    <reg name="s1" bitsize="32" type="float" group="float"/>
+    <reg name="s2" bitsize="32" type="float" group="float"/>
+    <reg name="s3" bitsize="32" type="float" group="float"/>
+    <reg name="s4" bitsize="32" type="float" group="float"/>
+    <reg name="s5" bitsize="32" type="float" group="float"/>
+    <reg name="s6" bitsize="32" type="float" group="float"/>
+    <reg name="s7" bitsize="32" type="float" group="float"/>
+    <reg name="s8" bitsize="32" type="float" group="float"/>
+    <reg name="s9" bitsize="32" type="float" group="float"/>
+    <reg name="s10" bitsize="32" type="float" group="float"/>
+    <reg name="s11" bitsize="32" type="float" group="float"/>
+    <reg name="s12" bitsize="32" type="float" group="float"/>
+    <reg name="s13" bitsize="32" type="float" group="float"/>
+    <reg name="s14" bitsize="32" type="float" group="float"/>
+    <reg name="s15" bitsize="32" type="float" group="float"/>
+    <reg name="s16" bitsize="32" type="float" group="float"/>
+    <reg name="s17" bitsize="32" type="float" group="float"/>
+    <reg name="s18" bitsize="32" type="float" group="float"/>
+    <reg name="s19" bitsize="32" type="float" group="float"/>
+    <reg name="s20" bitsize="32" type="float" group="float"/>
+    <reg name="s21" bitsize="32" type="float" group="float"/>
+    <reg name="s22" bitsize="32" type="float" group="float"/>
+    <reg name="s23" bitsize="32" type="float" group="float"/>
+    <reg name="s24" bitsize="32" type="float" group="float"/>
+    <reg name="s25" bitsize="32" type="float" group="float"/>
+    <reg name="s26" bitsize="32" type="float" group="float"/>
+    <reg name="s27" bitsize="32" type="float" group="float"/>
+    <reg name="s28" bitsize="32" type="float" group="float"/>
+    <reg name="s29" bitsize="32" type="float" group="float"/>
+    <reg name="s30" bitsize="32" type="float" group="float"/>
+    <reg name="s31" bitsize="32" type="float" group="float"/>
+  </feature>
+</target>"#;
+
+/// GDB **默认 ARM 布局**（无 tdesc 时 GDB 用 A-profile 传统布局，168 字节）：
+/// r0-r15(4B×16), f0-f7(12B×8, FPA 扩展→0), fps(4B), cpsr(4B)。
+///
+/// 不提供 tdesc 的原因：GDB 13 的 qXfer 分块拼接会按 hex 字符偏移写入缓冲，
+/// 多块 tdesc 易产生空洞（syntax error）；默认布局单块 168B 无此问题。
+/// M-profile 的 xpsr 映射到 cpsr 槽位（GDB info registers 正常显示）；
+/// FPU 寄存器（d0-d15/s0-s31）不暴露——固件浮点逻辑不受影响（调试器不读写
+/// FPU 寄存器即可调试控制流/内存/断点）。
+fn cortex_m_regs() -> Vec<(Option<RegisterARM>, usize)> {
+    let mut v: Vec<(Option<RegisterARM>, usize)> = vec![
+        (Some(RegisterARM::R0), 4), (Some(RegisterARM::R1), 4),
+        (Some(RegisterARM::R2), 4), (Some(RegisterARM::R3), 4),
+        (Some(RegisterARM::R4), 4), (Some(RegisterARM::R5), 4),
+        (Some(RegisterARM::R6), 4), (Some(RegisterARM::R7), 4),
+        (Some(RegisterARM::R8), 4), (Some(RegisterARM::R9), 4),
+        (Some(RegisterARM::R10), 4), (Some(RegisterARM::R11), 4),
+        (Some(RegisterARM::R12), 4), (Some(RegisterARM::SP), 4),
+        (Some(RegisterARM::LR), 4), (Some(RegisterARM::PC), 4),
+    ];
+    // f0-f7：FPA 扩展（12B），本平台无 → 0
+    for _ in 0..8 {
+        v.push((None, 12));
+    }
+    // fps（FPSCR）、cpsr（xpsr 映射）
+    v.push((Some(RegisterARM::FPSCR), 4));
+    v.push((Some(RegisterARM::XPSR), 4));
+    v
 }
 
 /// 解析 `addr,len`（均 hex）。
@@ -329,10 +490,10 @@ mod tests {
     }
 
     #[test]
-    fn read_regs_returns_184_hex() {
+    fn read_regs_returns_336_hex() {
         let (mut s, mut m) = server();
         let g = s.handle_packet("g", &mut m);
-        assert_eq!(g.len(), 23 * 8, "23 寄存器 × 4 字节 × 2 hex");
+        assert_eq!(g.len(), 336, "168 字节 = r0-r15(4B) + f0-f7(12B) + fps + cpsr，hex ×2");
     }
 
     #[test]
@@ -354,19 +515,6 @@ mod tests {
         assert_eq!(r, "deadbeef");
         // 坏参数
         assert_eq!(s.handle_packet("m20000000,x", &mut m), "E01");
-    }
-
-    #[test]
-    fn breakpoint_set_and_hit() {
-        let (mut s, mut m) = server();
-        // 设置断点在当前 PC（复位后 PC=entry|1）
-        let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
-        assert_eq!(s.handle_packet(&format!("Z0,{:x},2", pc & !1), &mut m), "OK");
-        // continue：第一段就命中（PC 即断点）
-        let r = s.handle_packet("c", &mut m);
-        assert_eq!(r, "S05", "断点应立即命中");
-        // 清除
-        assert_eq!(s.handle_packet(&format!("z0,{:x},2", pc & !1), &mut m), "OK");
     }
 
     #[test]

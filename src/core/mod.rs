@@ -6,8 +6,10 @@
 use std::fmt;
 
 use unicorn_engine::{
-    uc_error, Arch, ArmCpuModel, HookType, MemType, Mode, Prot, RegisterARM, UcHookId, Unicorn,
+    uc_error, Arch, ArmCpuModel, HookType, MemType, Mode, Prot, RegisterARM, Unicorn,
 };
+
+pub use unicorn_engine::UcHookId;
 
 use crate::peripheral::dma::DmaMem;
 use crate::peripheral::mpu::MemManageKind;
@@ -180,6 +182,11 @@ impl Cpu {
     /// 注册 block hook（每个基本块执行前回调，供中断投递检查等使用）。
     ///
     /// 回调签名：`(uc, address, size)`。`begin/end` 传 `1, 0` 表示全范围（Unicorn 约定）。
+    /// 移除已注册 hook（GDB 精确断点 code hook 动态装卸用）。
+    pub fn remove_hook(&mut self, id: UcHookId) -> Result<()> {
+        self.raw().remove_hook(id).map_err(crate::core::CoreError::from)
+    }
+
     pub fn add_block_hook<F>(&mut self, begin: u64, end: u64, cb: F) -> Result<UcHookId>
     where
         F: for<'b> FnMut(&mut Unicorn<'b, ()>, u64, u32) + 'static,
