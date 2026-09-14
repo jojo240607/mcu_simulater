@@ -527,8 +527,25 @@ impl Machine {
         self.register_i2c_slave(1, Box::new(qmc5883(StaticMag::default())));
     }
 
-    pub fn map_stm32f407_layout(&mut self) -> Result<()> {
-        self.cpu.mem_map(0x0800_0000, 0x0008_0000, Prot::ALL)?; // FLASH 512KB
+    /// 装配总线事务嗅探器（调试平台 P0-1）：把同一嗅探器注入到全部已挂载
+    /// I2C/SPI/USART 外设，并注入虚拟时钟作为时间戳来源。
+    ///
+    /// 调用时机：外设挂载完成后（`attach_peripherals` 之后）。之后调用者/测试持
+    /// 同一 `Arc<Mutex<BusTrace>>` 读取事务日志（`drain` / `drain_formatted`）。
+    pub fn attach_bus_trace(&self, trace: std::sync::Arc<std::sync::Mutex<crate::trace::BusTrace>>) {
+        trace.lock().unwrap().set_retired(Some(self.retired_insts.clone()));
+        for p in self.i2c.lock().unwrap().iter() {
+            p.lock().unwrap().set_trace(Some(trace.clone()));
+        }
+        for p in self.spi.lock().unwrap().iter() {
+            p.lock().unwrap().set_trace(Some(trace.clone()));
+        }
+        for p in self.usart.lock().unwrap().iter() {
+            p.lock().unwrap().set_trace(Some(trace.clone()));
+        }
+    }
+
+    pub fn map_stm32f407_layout(&mut self) -> Result<()> {        self.cpu.mem_map(0x0800_0000, 0x0008_0000, Prot::ALL)?; // FLASH 512KB
         self.cpu.mem_map(0x2000_0000, 0x0002_0000, Prot::ALL)?; // SRAM1+SRAM2 128KB
         // SRAM3 64KB（0x2002_0000..0x2002_FFFF）：固件链接脚本未使用，
         // 专用于 HIL 共享内存虚拟外设（fly_simulater <-> flyctrl 直连，无 USB）。

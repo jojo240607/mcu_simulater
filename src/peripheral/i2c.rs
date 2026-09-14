@@ -92,6 +92,8 @@ pub struct I2c {
     read_dir: bool,
     /// 当前匹配从设备索引（地址阶段命中后）
     cur_slave: Option<usize>,
+    /// 总线事务嗅探器（调试平台 P0-1；默认 None 零回归）
+    trace: Option<Arc<Mutex<crate::trace::BusTrace>>>,
 }
 
 impl I2c {
@@ -107,6 +109,19 @@ impl I2c {
             addr_phase: false,
             read_dir: false,
             cur_slave: None,
+            trace: None,
+        }
+    }
+
+    /// 挂载总线事务嗅探器（调试/测试；None 关闭）。
+    pub fn set_trace(&mut self, trace: Option<Arc<Mutex<crate::trace::BusTrace>>>) {
+        self.trace = trace;
+    }
+
+    /// 记录一条事务嗅探事件（enabled 时为 no-op）。
+    fn trace_record(&self, kind: crate::trace::TraceKind) {
+        if let Some(t) = &self.trace {
+            t.lock().unwrap().record(crate::trace::BusKind::I2c, self.port, kind);
         }
     }
 
@@ -158,10 +173,20 @@ impl I2c {
             self.slaves[idx].on_start(if rw == 1 { I2cDir::Read } else { I2cDir::Write });
             self.regs[5] |= SR1_ADDR; // 地址匹配 → ADDR（读 SR2 清）
             self.regs[5] &= !SR1_AF;
+            self.trace_record(crate::trace::TraceKind::I2cStart {
+                addr7,
+                read: rw == 1,
+                matched: true,
+            });
         } else {
             self.cur_slave = None;
             self.regs[5] &= !SR1_ADDR;
             self.regs[5] |= SR1_AF; // 无此从设备 → AF（固件判"no such device"）
+            self.trace_record(crate::trace::TraceKind::I2cStart {
+                addr7,
+                read: rw == 1,
+                matched: false,
+            });
         }
     }
 
@@ -172,6 +197,7 @@ impl I2c {
         }
         self.regs[5] |= SR1_TXE;
         self.regs[5] |= SR1_BTF;
+        self.trace_record(crate::trace::TraceKind::I2cWrite { byte });
     }
 
     /// 预取下一读字节（读方向：从设备 on_read → RXNE；None → AF）。
@@ -188,9 +214,11 @@ impl I2c {
                 self.rx_byte = b;
                 self.regs[5] |= SR1_RXNE;
                 self.regs[5] |= SR1_BTF;
+                self.trace_record(crate::trace::TraceKind::I2cRead { byte: Some(b) });
             }
             None => {
                 self.regs[5] |= SR1_AF; // 从设备无数据/断线 → AF（固件读失败）
+                self.trace_record(crate::trace::TraceKind::I2cRead { byte: None });
             }
         }
     }
@@ -382,6 +410,10 @@ impl Peripheral for I2c {
                     if value & CR1_START != 0 {
                         self.regs[5] |= SR1_SB;
                         self.addr_phase = true;
+                    }
+                    // STOP 位写 1 → 事务结束（嗅探记录；STOP 硬件自清）
+                    if value & CR1_STOP != 0 {
+                        self.trace_record(crate::trace::TraceKind::I2cStop);
                     }
                     self.set_pending_if_buf();
                 }

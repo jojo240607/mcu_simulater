@@ -13,6 +13,7 @@
 //! - [`config`]：配置 DSL 解析
 //! - [`monitor`]：Monitor REPL
 //! - [`gdbstub`]：GDB 远程调试（M1 启用）
+//! - [`trace`]：总线事务嗅探器（调试平台 P0-1）
 
 pub mod bus;
 pub mod config;
@@ -22,3 +23,4 @@ pub mod machine;
 pub mod monitor;
 pub mod peripheral;
 pub mod sim;
+pub mod trace;

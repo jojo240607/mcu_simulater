@@ -81,6 +81,8 @@ pub struct Usart {
     /// 模拟硬件 USART 数据寄存器被 DMA/中断及时搬走的语义；POLL 读（uart_hal_read_dr）
     /// 与 DMA 读（PeriphToMem 读 DR）都从队首消费。
     rx_fifo: VecDeque<u8>,
+    /// 总线事务嗅探器（调试平台 P0-1；默认 None 零回归）
+    trace: Option<Arc<Mutex<crate::trace::BusTrace>>>,
 }
 
 impl Usart {
@@ -104,6 +106,19 @@ impl Usart {
             slaves: Vec::new(),
             rx_fifo: VecDeque::new(),
             n_cpu_dr_reads: 0,
+            trace: None,
+        }
+    }
+
+    /// 挂载总线事务嗅探器（调试/测试；None 关闭）。
+    pub fn set_trace(&mut self, trace: Option<Arc<Mutex<crate::trace::BusTrace>>>) {
+        self.trace = trace;
+    }
+
+    /// 记录一条事务嗅探事件（enabled 时为 no-op）。
+    fn trace_record(&self, kind: crate::trace::TraceKind) {
+        if let Some(t) = &self.trace {
+            t.lock().unwrap().record(crate::trace::BusKind::Usart, self.port, kind);
         }
     }
 
@@ -137,6 +152,7 @@ impl Usart {
 
     /// 发送字节（发布 UartByte 事件；仅 TE+UE 生效）
     fn tx(&self, byte: u8) {
+        self.trace_record(crate::trace::TraceKind::UartTx { byte });
         let ev = Event::UartByte {
             port: self.port,
             byte,
@@ -148,6 +164,7 @@ impl Usart {
     /// 置 SR.IDLE + 按 IDLEIE 挂起中断——固件 IDLE ISR 读 SR/DR 清 IDLE 并
     /// flush 环形 DMA 缓冲（uart_idle_flush），read() 才有字节可读。
     pub fn notify_frame_end(&mut self) {
+        self.trace_record(crate::trace::TraceKind::UartIdle);
         self.regs[0] |= SR_IDLE;
         if self.regs[3] & CR1_IDLEIE != 0 {
             self.nvic.lock().unwrap().set_pending(self.irq);
@@ -197,6 +214,7 @@ impl Usart {
         self.rx_fifo.push_back(byte);
         self.regs[0] |= SR_RXNE;
         self.set_pending_if_rx();
+        self.trace_record(crate::trace::TraceKind::UartRx { byte });
     }
 
     /// 虚拟推流 FIFO 当前长度（观测/断言：固件是否消费了推流字节）。

@@ -72,6 +72,8 @@ pub struct Spi {
     /// 虚拟从设备表（同总线多从机：片选经 GPIO 事件按 CS 路由，主机发字节 →
     /// 选中从机 on_byte 直路由，回送字节锁存为 RX；未选中回 0xFF）
     slaves: Vec<Box<dyn VirtualSpiSlave>>,
+    /// 总线事务嗅探器（调试平台 P0-1；默认 None 零回归）
+    trace: Option<Arc<Mutex<crate::trace::BusTrace>>>,
 }
 
 impl Spi {
@@ -84,6 +86,19 @@ impl Spi {
             bus,
             nvic,
             slaves: Vec::new(),
+            trace: None,
+        }
+    }
+
+    /// 挂载总线事务嗅探器（调试/测试；None 关闭）。
+    pub fn set_trace(&mut self, trace: Option<Arc<Mutex<crate::trace::BusTrace>>>) {
+        self.trace = trace;
+    }
+
+    /// 记录一条事务嗅探事件（enabled 时为 no-op）。
+    fn trace_record(&self, kind: crate::trace::TraceKind) {
+        if let Some(t) = &self.trace {
+            t.lock().unwrap().record(crate::trace::BusKind::Spi, self.port, kind);
         }
     }
 
@@ -99,6 +114,7 @@ impl Spi {
 
     /// 片选引脚变化转发给全部虚拟从设备（GPIO 事件；从机自行过滤关注的引脚）。
     pub fn route_cs(&mut self, port: u8, pin: u8, level: bool) {
+        self.trace_record(crate::trace::TraceKind::SpiCs { pin, level });
         for sl in &mut self.slaves {
             sl.on_cs(port, pin, level);
         }
@@ -151,6 +167,7 @@ impl Spi {
             self.regs[2] |= SR_RXNE;
             self.set_pending_if_irq();
         }
+        self.trace_record(crate::trace::TraceKind::SpiByte { tx: byte, rx: reply });
         self.tx(byte);
     }
 
