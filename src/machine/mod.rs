@@ -169,6 +169,12 @@ pub struct Machine {
     vec_entries: std::cell::RefCell<Vec<u64>>,
     /// 最近一次异常抢占前的 PC（= 被中断块的 PC，诊在何处不停被抢）
     last_switch_pc: std::cell::Cell<u32>,
+    /// 时间轴故障剧本（P1-1）：run() 按虚拟时间触发到期动作（NACK/丢帧/观察点）
+    fault: Option<crate::fault::FaultScript>,
+    /// UART 端口丢帧计数（port → 剩余丢弃帧数；u32::MAX = 持续丢弃）
+    uart_drop: std::cell::RefCell<std::collections::HashMap<u8, u32>>,
+    /// Halt 观察点：FaultAction::Halt 触发后 run() 提前返回
+    halt_requested: std::cell::Cell<bool>,
 }
 
 impl Machine {
@@ -265,6 +271,9 @@ impl Machine {
             last_virt_retired: std::cell::Cell::new(0),
             vec_entries: std::cell::RefCell::new(vec![0u64; 97]),
             last_switch_pc: std::cell::Cell::new(0),
+            fault: None,
+            uart_drop: std::cell::RefCell::new(std::collections::HashMap::new()),
+            halt_requested: std::cell::Cell::new(false),
         })
     }
 
@@ -457,11 +466,23 @@ impl Machine {
         let mut feeds: Vec<(u8, Vec<u8>)> = Vec::new();
         {
             let uv = self.usart.lock().unwrap();
+            let mut drop = self.uart_drop.borrow_mut();
             for u in uv.iter() {
                 let mut uu = u.lock().unwrap();
+                let port = uu.port;
+                // 丢帧（P1-1 故障剧本）：该端口剩余丢弃帧数 > 0 → 跳过本轮推流
+                let skipping = drop.get(&port).copied().unwrap_or(0) > 0;
+                if skipping {
+                    if let Some(f) = drop.get_mut(&port) {
+                        if *f != u32::MAX {
+                            *f -= 1; // 有限丢帧：逐帧递减
+                        }
+                    }
+                    continue;
+                }
                 let bytes = uu.collect_slave_bytes(dt);
                 if !bytes.is_empty() {
-                    feeds.push((uu.port, bytes));
+                    feeds.push((port, bytes));
                 }
             }
         }
@@ -532,6 +553,73 @@ impl Machine {
     ///
     /// 调用时机：外设挂载完成后（`attach_peripherals` 之后）。之后调用者/测试持
     /// 同一 `Arc<Mutex<BusTrace>>` 读取事务日志（`drain` / `drain_formatted`）。
+    /// 装配时间轴故障剧本（调试平台 P1-1）。
+    ///
+    /// run() 按虚拟时间（retired / VIRTUAL_INSNS_PER_SEC）触发到期事件：
+    /// NACK 注入 / UART 丢帧 / Halt 观察点。`reset()` 后脚本保持（可重放）。
+    pub fn attach_fault_script(&mut self, script: crate::fault::FaultScript) {
+        log::info!(
+            "[fault] 装配剧本 '{}'：{} 个事件",
+            script.name,
+            script.events().len()
+        );
+        self.fault = Some(script);
+    }
+
+    /// 当前故障剧本是否已全部触发（测试/调试断言）。
+    pub fn fault_all_fired(&self) -> bool {
+        self.fault.as_ref().map(|s| s.all_fired()).unwrap_or(true)
+    }
+
+    /// 当前是否处于 Halt 观察点（FaultAction::Halt 触发后为 true）。
+    pub fn halted(&self) -> bool {
+        self.halt_requested.get()
+    }
+
+    /// 清除 Halt 观察点（继续推进）。
+    pub fn clear_halt(&self) {
+        self.halt_requested.set(false);
+    }
+
+    /// 推进时间轴故障剧本（run() 每轮调用）：触发到期事件并落地动作。
+    fn step_fault(&mut self) {
+        let actions = match &mut self.fault {
+            Some(script) => {
+                let retired = self.retired_insts.load(Ordering::Relaxed);
+                crate::fault::step_script(script, retired, &mut self.uart_drop.borrow_mut())
+            }
+            None => Vec::new(),
+        };
+        for a in actions {
+            match a {
+                crate::fault::FaultAction::I2cNack { port, addr7, on } => {
+                    let ok = self.inject_i2c_nack(port, addr7, on);
+                    log::info!("[fault] t={:.3}s I2C{port} NACK@{addr7:#04x} on={on} (applied={ok})",
+                        self.virtual_sec());
+                }
+                crate::fault::FaultAction::UartDrop { port, frames } => {
+                    log::info!("[fault] t={:.3}s UART{port} 丢帧开始（frames={frames}）",
+                        self.virtual_sec());
+                }
+                crate::fault::FaultAction::UartResume { port } => {
+                    log::info!("[fault] t={:.3}s UART{port} 推流恢复", self.virtual_sec());
+                }
+                crate::fault::FaultAction::Log { msg } => {
+                    log::info!("[fault] t={:.3}s {msg}", self.virtual_sec());
+                }
+                crate::fault::FaultAction::Halt => {
+                    self.halt_requested.set(true);
+                    log::info!("[fault] t={:.3}s Halt 观察点（run 提前返回）", self.virtual_sec());
+                }
+            }
+        }
+    }
+
+    /// 当前虚拟时间（秒，retired / VIRTUAL_INSNS_PER_SEC 口径，与推流时钟一致）。
+    pub fn virtual_sec(&self) -> f32 {
+        self.retired_insts.load(Ordering::Relaxed) as f32 / crate::sim::timing::VIRTUAL_INSNS_PER_SEC
+    }
+
     pub fn attach_bus_trace(&self, trace: std::sync::Arc<std::sync::Mutex<crate::trace::BusTrace>>) {
         trace.lock().unwrap().set_retired(Some(self.retired_insts.clone()));
         for p in self.i2c.lock().unwrap().iter() {
@@ -2062,6 +2150,17 @@ impl Machine {
 
         let mut remaining = count;
         while remaining > 0 {
+            // Halt 观察点：故障剧本触发后提前返回（调用方检查 halted()）
+            if self.halt_requested.get() {
+                break;
+            }
+            // 时间轴故障剧本（P1-1）：段边界按虚拟时间（retired 实时折算）检查到期
+            // 事件。段前 + 段后各查一次：段前覆盖"上次段已过观察点"；段后覆盖
+            // "本段新退休量越过观察点"（无中断固件单段即跑满预算，仅段前查会漏触发）。
+            self.step_fault();
+            if self.halt_requested.get() {
+                break; // 本段触发 Halt → 不执行本段，立即返回
+            }
             let iters = self.run_iterations.get();
             if iters - base_iters >= MAX_ITERS_PER_CALL {
                 let pc = self.cpu.reg_read_u32(RegisterARM::PC)?;
@@ -2099,6 +2198,10 @@ impl Machine {
             self.dma2.lock().unwrap().process(&mut self.cpu);
 
             let reason = self.nvic.lock().unwrap().take_stop_reason();
+            // 预算耗尽（StopReason::None）时延迟到段后检查完成再退出：
+            // 否则 match 内 break 会跳过段后故障检查（无中断固件单段耗尽预算，
+            // Halt 观察点/故障注入会漏触发）。
+            let mut budget_exhausted = false;
             match reason {
                 StopReason::Switch(vector) => {
                     // 诊断：记录被抢占点与按向量入场计数（中断暴风/唤醒停滞归因）
@@ -2117,13 +2220,22 @@ impl Machine {
                     // MPU 已使能：懒安装数据访问 hook（含刷 TB），此后内存访问受 MPU 检查
                     self.install_data_access_hook()?;
                 }
-                StopReason::None => break, // 达到指令数上限
+                StopReason::None => budget_exhausted = true, // 达到指令数上限
+            }
+
+            // 段后故障检查：本段新退休量可能已越过观察点（Halt 停在本段后）
+            self.step_fault();
+            if self.halt_requested.get() {
+                break;
             }
 
             // 按本轮实际退休量递减预算（block hook 已累计；看门狗 continue 分支因未退休指令，
             // 用累计式扣减不受影响——下一轮仍按"本次 run() 起点以来的总退休量"计算）。
             let retired = self.retired_insts.load(Ordering::Relaxed) - retired_base;
             remaining = count.saturating_sub(retired as usize);
+            if budget_exhausted {
+                break;
+            }
         }
         Ok(())
     }
