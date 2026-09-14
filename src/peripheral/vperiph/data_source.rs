@@ -79,6 +79,163 @@ impl SensorModel for Box<dyn SensorModel> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 数字域缺陷（virtual_direct_mode.md §9）：模拟真实传感器数字链路的保真度损失。
+// 属于 mcu_sim 外设层（模拟器侧），不污染 fly_sim 物理模型。
+// ---------------------------------------------------------------------------
+
+/// 数字域缺陷配置。
+///
+/// 真实传感器模拟量 → ADC → 数字总线的链路会引入三类系统性损失，固件驱动
+/// 看到的寄存器值永远带这些痕迹——调试固件时（EKF 融合、健康监测阈值）应
+/// 复现它们，否则固件在仿真里"太干净"而掩盖真实缺陷：
+/// - **量化**：`adc_bits` 位 ADC（如 12bit）→ 输出阶梯（LSB = 2·FS / 2^bits）
+/// - **量程饱和**：`full_scale` 满量程（如 ±16g）→ 超量程钳位
+/// - **ODR 降采样**：`odr_hz` 输出数据率（IMU 1kHz / 气压计 25Hz）→ 零阶保持
+///   （两次输出之间读到的值不变，模拟"数据寄存器只在 ODR 节拍更新"）
+/// - **传输延迟**：`delay_s` 采样→寄存器可见延迟（ADC 转换 + 总线时序）→
+///   读到的值是 delay 秒前的
+///
+/// 全部可选（None = 无该缺陷）；包装 [`DigitalModel`] 透明作用于设备寄存器
+/// 填充（`DataSource::value` 链路），不改动物理模型本身。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DigitalDefect {
+    /// 量化位深（None = 全精度）。LSB = 2·FS / 2^bits。
+    pub adc_bits: Option<u8>,
+    /// 满量程（±FS 饱和钳位；量化基准）。
+    pub full_scale: Option<f32>,
+    /// 输出数据率 Hz（零阶保持）。
+    pub odr_hz: Option<f32>,
+    /// 传输延迟秒（读回 delay 前的值）。
+    pub delay_s: Option<f32>,
+}
+
+impl DigitalDefect {
+    /// 预置配置：12bit 满量程 ±16g、1kHz ODR、0.5ms 延迟（通用 IMU 数字链路）。
+    pub fn imu_typical() -> Self {
+        Self {
+            adc_bits: Some(12),
+            full_scale: Some(16.0),
+            odr_hz: Some(1000.0),
+            delay_s: Some(0.0005),
+        }
+    }
+
+    /// 预置配置：20bit、25Hz ODR、5ms 延迟（气压计典型）。
+    pub fn baro_typical() -> Self {
+        Self {
+            adc_bits: Some(20),
+            full_scale: None,
+            odr_hz: Some(25.0),
+            delay_s: Some(0.005),
+        }
+    }
+}
+
+/// 数字域缺陷包装器：透明改写 [`SensorModel::value`] 输出（量化/饱和/ODR/延迟）。
+///
+/// 用法：把任意 SensorModel（Static/FlySimSource/自定义）包一层后传给设备工厂
+/// （`mpu6050(…)` / `bmp280(…)` 等）——寄存器填充链路自动带上缺陷痕迹：
+/// ```rust
+/// let imu = DigitalModel::wrap(
+///     Box::new(FlySimSource::new(st, FlySimKind::Imu)),
+///     DigitalDefect::imu_typical(),
+/// );
+/// machine.register_i2c_slave(1, Box::new(mpu6050(imu)));
+/// ```
+pub struct DigitalModel {
+    inner: Box<dyn SensorModel>,
+    defect: DigitalDefect,
+    /// 累计虚拟时间（step 推进；value 的 ODR/延迟时间基准）。
+    /// 用 Mutex 而非 Cell/RefCell：SensorModel 要求 Send+Sync（虚拟外设跨线程），
+    /// value() 调用频率低（寄存器读时刷新），锁开销可忽略。
+    sim_t: std::sync::Mutex<f32>,
+    /// ODR 零阶保持：field → (上次更新时间, 当前保持值)
+    hold: std::sync::Mutex<std::collections::HashMap<String, (f32, f32)>>,
+    /// 延迟历史：field → (时间, 值) 采样序列（窗口裁剪，读回 delay 前的值）
+    hist: std::sync::Mutex<std::collections::HashMap<String, Vec<(f32, f32)>>>,
+}
+
+impl DigitalModel {
+    pub fn wrap(inner: Box<dyn SensorModel>, defect: DigitalDefect) -> Box<dyn SensorModel> {
+        Box::new(Self {
+            inner,
+            defect,
+            sim_t: std::sync::Mutex::new(0.0),
+            hold: std::sync::Mutex::new(std::collections::HashMap::new()),
+            hist: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// 内部原始值（测试/对比用）。
+    pub fn raw_value(&self, field: &str) -> f32 {
+        self.inner.value(field)
+    }
+}
+
+impl SensorModel for DigitalModel {
+    fn name(&self) -> &str {
+        "digital"
+    }
+
+    fn step(&mut self, dt: f32) {
+        self.inner.step(dt);
+        *self.sim_t.lock().unwrap() += dt;
+    }
+
+    fn value(&self, field: &str) -> f32 {
+        let mut v = self.inner.value(field);
+        let t = *self.sim_t.lock().unwrap();
+
+        // 1) 量程饱和（超量程钳位；顺带作为量化的基准 FS）
+        let fs = self.defect.full_scale;
+        if let Some(f) = fs {
+            v = v.clamp(-f, f);
+        }
+
+        // 2) 量化：输出阶梯，LSB = 2·FS / 2^bits（FS 缺省按 ±1 计）
+        if let Some(bits) = self.defect.adc_bits {
+            let f = fs.unwrap_or(1.0);
+            let lsb = (2.0 * f) / (1u64 << bits) as f32;
+            v = (v / lsb).round() * lsb;
+        }
+
+        // 3) ODR 零阶保持：两次输出之间保持上次值（数据寄存器只在 ODR 节拍更新）
+        if let Some(odr) = self.defect.odr_hz {
+            let period = 1.0 / odr;
+            let mut hold = self.hold.lock().unwrap();
+            // 首读：entry 初始为"已过期"（t-period 且值为当前读），首读即输出新值
+            let entry = hold.entry(field.to_string()).or_insert((t - period, v));
+            if t - entry.0 >= period {
+                *entry = (t, v);
+            } else {
+                v = entry.1;
+            }
+        }
+
+        // 4) 传输延迟：读回 delay 秒前的值（按采样历史线性近似；窗口裁剪防增长）
+        if let Some(delay) = self.defect.delay_s {
+            let mut hist = self.hist.lock().unwrap();
+            let h = hist.entry(field.to_string()).or_default();
+            h.push((t, v));
+            let cutoff = t - delay - 1.0;
+            h.retain(|(ht, _)| *ht >= cutoff);
+            let target = t - delay;
+            let mut chosen = v;
+            for (ht, hv) in h.iter().rev() {
+                if *ht <= target {
+                    chosen = *hv;
+                    break;
+                }
+            }
+            v = chosen;
+        }
+
+        v
+    }
+}
+
+
 /// 静态 IMU 模型：恒定 accel/gyro（悬停 = accel 抵消重力，gyro 归零）。
 #[derive(Clone, Debug)]
 pub struct StaticImu {
@@ -354,5 +511,155 @@ impl SensorModel for FlySimSource {
                 }
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 共享状态模型：测试经 Arc 引用改值（包装后仍可驱动，验证 ODR/延迟）。
+    #[derive(Clone)]
+    struct SharedCtl {
+        state: Arc<Mutex<std::collections::HashMap<String, f32>>>,
+    }
+    impl SharedCtl {
+        fn new() -> (Self, Arc<Mutex<std::collections::HashMap<String, f32>>>) {
+            let state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+            (Self { state: state.clone() }, state)
+        }
+    }
+    impl SensorModel for SharedCtl {
+        fn name(&self) -> &str {
+            "shared"
+        }
+        fn step(&mut self, _dt: f32) {}
+        fn value(&self, field: &str) -> f32 {
+            self.state.lock().unwrap().get(field).copied().unwrap_or(0.0)
+        }
+    }
+
+    #[test]
+    fn quantization_creates_steps() {
+        let (ctl, st) = SharedCtl::new();
+        st.lock().unwrap().insert("accel.z".into(), -9.81);
+        let d = DigitalModel::wrap(Box::new(ctl), DigitalDefect {
+            adc_bits: Some(8),
+            full_scale: Some(16.0),
+            ..Default::default()
+        });
+        // 8bit、±16g：LSB = 32/256 = 0.125 → -9.81 量化到 0.125 整数倍
+        let v = d.value("accel.z");
+        let nearest = (-9.81f32 / 0.125).round() * 0.125;
+        assert!((v - nearest).abs() < 1e-6, "应量化到 LSB 整数倍：v={v} nearest={nearest}");
+        assert!((v - (-9.81)).abs() > 1e-3, "量化后应偏离原始值（缺陷可见）");
+    }
+
+    #[test]
+    fn full_scale_saturation_clamps() {
+        let (ctl, st) = SharedCtl::new();
+        st.lock().unwrap().insert("accel.z".into(), 25.0);
+        let d = DigitalModel::wrap(Box::new(ctl), DigitalDefect {
+            full_scale: Some(16.0),
+            ..Default::default()
+        });
+        assert_eq!(d.value("accel.z"), 16.0, "超量程应钳位到 +FS");
+    }
+
+    #[test]
+    fn odr_zero_order_hold_holds_between_ticks() {
+        let (ctl, st) = SharedCtl::new();
+        let mut d = DigitalModel::wrap(Box::new(ctl), DigitalDefect {
+            odr_hz: Some(10.0), // 100ms 输出一次
+            ..Default::default()
+        });
+        // t=0：首读 1.0（初始 hold）
+        st.lock().unwrap().insert("accel.x".into(), 1.0);
+        assert_eq!(d.value("accel.x"), 1.0);
+
+        // 改值但时间未过 ODR 周期（step 50ms < 100ms）→ 保持旧值
+        st.lock().unwrap().insert("accel.x".into(), 9.0);
+        d.step(0.05);
+        assert_eq!(d.value("accel.x"), 1.0, "ODR 未到节拍应保持上次输出");
+
+        // 时间越过周期（再 60ms > 100ms）→ 更新为新值
+        d.step(0.06);
+        assert_eq!(d.value("accel.x"), 9.0, "ODR 节拍到应输出新值");
+    }
+
+    #[test]
+    fn delay_returns_past_value() {
+        let (ctl, st) = SharedCtl::new();
+        let mut d = DigitalModel::wrap(Box::new(ctl), DigitalDefect {
+            delay_s: Some(0.1),
+            ..Default::default()
+        });
+        // t=0：采样 v=1.0
+        st.lock().unwrap().insert("x".into(), 1.0);
+        assert_eq!(d.value("x"), 1.0);
+        // t=0.05：改值 9.0 并采样（读回的是 0.05-0.1<0 时刻 → 无历史 → 当前值）
+        st.lock().unwrap().insert("x".into(), 9.0);
+        d.step(0.05);
+        assert_eq!(d.value("x"), 9.0);
+        // t=0.12：读回 0.02 时刻的值 → 1.0（延迟可见）
+        d.step(0.07);
+        assert_eq!(d.value("x"), 1.0, "延迟读回应返回 delay 前的历史值");
+        // t=0.2：读回 0.1 时刻 → 9.0（历史已更新）
+        d.step(0.08);
+        assert_eq!(d.value("x"), 9.0);
+    }
+
+    #[test]
+    fn typical_profiles() {
+        let d = DigitalDefect::imu_typical();
+        assert_eq!(d.adc_bits, Some(12));
+        assert_eq!(d.full_scale, Some(16.0));
+        assert_eq!(d.odr_hz, Some(1000.0));
+        assert!(d.delay_s.unwrap() > 0.0);
+        let b = DigitalDefect::baro_typical();
+        assert_eq!(b.odr_hz, Some(25.0));
+        assert!(b.delay_s.unwrap() > 0.0);
+    }
+}
+
+/// 共享静态模型：value 恒返回当前设定值，测试/脚本可经 `Arc` 引用实时改值。
+///
+/// 用途：集成测试与故障剧本需要"包装后改传感器值"（ODR/延迟/卡死验证），
+/// 而 `DigitalModel` 的 inner 不可达——共享模型经外部 Arc 驱动即可。
+#[derive(Clone, Default)]
+pub struct SharedStatic {
+    state: Arc<Mutex<std::collections::HashMap<String, f32>>>,
+}
+
+impl SharedStatic {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 设定通道值（返回 self，链式构造）。
+    pub fn with(mut self, field: &str, v: f32) -> Self {
+        self.set(field, v);
+        self
+    }
+
+    /// 设定通道值。
+    pub fn set(&mut self, field: &str, v: f32) {
+        self.state.lock().unwrap().insert(field.to_string(), v);
+    }
+
+    /// 共享状态句柄（外部驱动改值）。
+    pub fn state(&self) -> Arc<Mutex<std::collections::HashMap<String, f32>>> {
+        self.state.clone()
+    }
+}
+
+impl SensorModel for SharedStatic {
+    fn name(&self) -> &str {
+        "shared_static"
+    }
+    fn step(&mut self, _dt: f32) {}
+    fn value(&self, field: &str) -> f32 {
+        self.state.lock().unwrap().get(field).copied().unwrap_or(0.0)
     }
 }
