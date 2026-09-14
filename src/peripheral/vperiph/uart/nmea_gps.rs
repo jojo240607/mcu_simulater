@@ -29,9 +29,9 @@ impl NmeaGps {
         }
     }
 
-    /// 帧周期默认 0.2s（5Hz）：u-blox 驱动 probe 每 10ms 读 1 字节（300ms 窗口
-    /// 读不完 70 字节帧），提高推流频率让 drain（2ms/字节）在测试窗口内读到
-    /// 完整 GGA 建立定位。
+    /// 设置帧周期（秒）。构造函数默认 0.05s（20Hz）：u-blox 驱动 probe 每 10ms
+    /// 读 1 字节（300ms 窗口读不完 70 字节帧），20Hz 推流让 drain（2ms/字节）
+    /// 在测试窗口内读到完整 GGA 建立定位。
     pub fn set_period(&mut self, period: f32) {
         self.period = period;
     }

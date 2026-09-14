@@ -258,6 +258,13 @@ pub struct NopProvider;
 // ─────────────────────────────────────────────────────────────
 
 /// fly_sim 物理引擎写入的共享传感器/RC 状态（每 4ms 物理步更新）。
+///
+/// **一致性不变量（锁步）**：本状态只在物理步间隙（两次 `machine::run()`
+/// 之间）被写入，`run()` 期间必须保持冻结。虚拟外设的 `FlySimSource::value()`
+/// 在固件读取瞬间从本状态取值，多字节读事务（如 14 字节 IMU burst）的字节
+/// 一致性完全依赖该锁步——**禁止任何线程在 `run()` 进行中写入本状态**，
+/// 否则会发生跨物理步撕裂（accel.x 来自步 k、accel.y 来自步 k+1）。
+/// 参见 `docs/virtual_direct_mode.md` §8.1。
 #[derive(Clone, Debug, Default)]
 pub struct FlySimState {
     /// 机体系加速度（比力，m/s²；FRD z 向下，静止水平时 z=-9.81）

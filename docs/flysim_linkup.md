@@ -21,7 +21,7 @@
 │   RegFileSlave.add_dynamic(offset,len,src,fill)                 │
 │     ├ 每读字节前 refresh_dynamic() → fill(value(field))        │
 │     ├ i2c1: mpu6050@0x68 / bmp280@0x76 / qmc5883@0x0D          │
-│     └ uart2: NmeaGps（GPS）/ uart3: Sbus（SBUS 推流）          │
+│     └ USART2: NmeaGps（GPS）/ USART3: Sbus（SBUS 推流）        │
 ├──────────────────────────────────────────────────────────────┤
 │ 固件 flyctrl（app real-sensors）                               │
 │   sensors_task 2ms 采样 → SensorStack                          │
@@ -71,7 +71,8 @@
 
 - 测试主循环每步 = 一个物理步（4ms）：读回 PWM 推力 → `SimLoop::step_hil(&cmd)` 更新动力学 → 写 `FlySimState`（imu/pos/baro/gps/rc）→ `machine.run(N)` 推进固件（sensors 2ms 采样 + control 4ms + PWM 写）→ 下一物理步。
 - 固件 control 拍（4ms）与物理步（4ms）对齐；sensors 采样 2ms 为固件内部频率。
-- `run(N)` 的虚拟时间按退休指令数推进（`dt = Δretired / VIRT_INSN_PER_SEC`），虚拟外设/推流时钟以指令为基准，与中断频率解耦。
+- `run(N)` 的虚拟时间按退休指令数推进（`dt = Δretired / VIRTUAL_INSNS_PER_SEC`，
+  权威常量见 `src/sim/timing.rs`），虚拟外设/推流时钟以指令为基准，与中断频率解耦。
 
 ## 5. 注入 API
 
@@ -153,12 +154,18 @@ cd /home/ubuntu/work/mcu_simulater && cargo test --release --offline --test x_vp
 复核命令：`arm-none-eabi-nm app.elf | grep -E 'HIL_DIAG_GATES|DBG_MOTOR|DBG_PID|DBG_PRE|DBG_THR|G_CMD_ARMED'`。
 这些 `#[used] static` 诊断变量的语义另见 §6。
 
-### 7.4 HIL 事件驱动同步
+### 7.4 同步机制（vperiph 锁步 + HIL 事件同步并存）
 
-- 每物理步（4ms）与固件 control 拍（4ms）对齐，经 `HIL_EVT` 信号量同步
-  （`flyctrl/core/src/hil.rs`，`Semaphore<1>`，cfg feature="hil" 引入）。
-- `HilContext::step_hil()` 为 SIL/HIL 共用步进：注入 IMU 真值 → 推进 EKF → 取期望轨迹点 → 更新执行器。
-- 虚拟外设/推流时钟以**退休指令数**为基准（`dt = Δretired / VIRT_INSN_PER_SEC`），与中断频率解耦。
+- **vperiph 模式（闭环测试实际机制）**：`run_closed_loop` 是**锁步**驱动——
+  读回 PWM 推力 → 物理推进（4ms）→ 写 FlySimState → `machine.run(N)` 推进固件，
+  无信号量。FlySimState 只在两次 `run()` 之间写入（`run()` 期间冻结），
+  多字节读事务的一致性由该锁步保证。
+- **HIL 模式（另一条路径）**：`HIL_EVT` 信号量同步
+  （`flyctrl/core/src/hil.rs`，`Semaphore<1>`，cfg feature="hil" 引入），
+  PC 每 ~32ms 注入一帧 `HIL_SENSOR`。`HilContext::step_hil()` 为 SIL/HIL 共用
+  步进：注入 IMU 真值 → 推进 EKF → 取期望轨迹点 → 更新执行器。
+- 虚拟外设/推流时钟以**退休指令数**为基准（`dt = Δretired / VIRTUAL_INSNS_PER_SEC`，
+  权威常量见 `src/sim/timing.rs`），与中断频率解耦（SBUS/GPS 均 20Hz）。
 
 ### 7.5 FRD 坐标约定（易错点速查）
 

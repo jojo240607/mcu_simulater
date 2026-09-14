@@ -1,6 +1,11 @@
 //! SBUS 遥控从设备：按帧周期推 25 字节 SBUS 帧（16×11bit 通道，LSB 位流）。
 //!
 //! 数据源：`StaticSbus`（通道中位 1500，ch2=1000 油门最小）。
+//!
+//! 注意：真机 SBUS 规格约 100Hz（帧周期 ~10ms），但本模拟器推流周期
+//! 默认 0.05s（20Hz）——`VirtualUartSlave::step` 的 `dt` 来自退休指令基准的
+//! 虚拟从设备时钟（`sim::timing::VIRTUAL_INSNS_PER_SEC`），与 CPU 虚拟时钟
+//! 独立校准，20Hz 已足够固件 RcSbus 稳定解帧（armed=ch4>1700）。
 
 use super::super::data_source::{DataSource, SensorModel};
 use super::VirtualUartSlave;
@@ -8,7 +13,7 @@ use super::VirtualUartSlave;
 /// SBUS 遥控从设备：按帧周期推 25 字节 SBUS 帧（16×11bit 通道，LSB 位流）。
 pub struct Sbus {
     source: DataSource,
-    /// 帧周期（秒；SBUS ~100Hz）
+    /// 帧周期（秒；本模拟器默认 20Hz，见模块注释）
     period: f32,
     acc: f32,
     pub frames: u64,

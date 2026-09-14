@@ -50,7 +50,7 @@ use crate::peripheral::usart::{Usart, USART1_IRQ, USART2_IRQ, USART3_IRQ, UART4_
 use crate::peripheral::wdog::{Iwdg, ResetReason, WdogResetReq, Wwdg};
 use crate::peripheral::{Peripheral};
 use crate::sim::status::{Status, BIT_ANY_ACTIVE, BIT_MPU, BIT_NVIC_PENDING, BIT_WDOG};
-use crate::sim::timing::VirtualClock;
+use crate::sim::timing::{VirtualClock, VIRTUAL_INSNS_PER_SEC};
 
 
 /// block hook 冷路径状态（MPU/NVIC/外设 tick 列表），捆进单个 Arc 以缩小闭包捕获体
@@ -496,6 +496,9 @@ impl Machine {
     /// fly_sim 每步写 `FlySimState`（Arc<Mutex>），设备动态寄存器经 FlySimSource
     /// 即时读到；固件 real-sensors 驱动照常经 i2c0 读寄存器。磁力计无真值源，
     /// 用默认静态模型（不影响 EKF 姿态，mag 未融合）。
+    ///
+    /// **一致性不变量**：`FlySimState` 只能在两次 `run()` 之间写入（run 期间冻结），
+    /// 见 `FlySimState` 文档与 `docs/virtual_direct_mode.md` §8.1。
     pub fn attach_flysim_sensors(&self, st: std::sync::Arc<std::sync::Mutex<crate::peripheral::vperiph::data_source::FlySimState>>) {
         use crate::peripheral::vperiph::data_source::{FlySimKind, FlySimSource, StaticMag};
         use crate::peripheral::vperiph::i2c::{bmp280, mpu6050, qmc5883};
@@ -1754,8 +1757,10 @@ impl Machine {
             }
             // 块级推进虚拟时钟，并 tick 活动外设（TIM/DMA/DAC/RTC/IWDG/WWDG）。
             // 对齐 QEMU icount 口径：每个 TB 按「访客字节 = 虚拟周期」折算，使 SysTick
-            // reload(168000 周期) 大致对应 ~6 万条退休指令（真机 1ms 同量级）。原 ×AVG=3
-            // 使 SysTick 密 ~3.1 倍（校准见 x_sys_retire_calib: 每 SysTick≈1.98e4 退休）。
+            // reload(168000 周期) 大致对应 ~4-6 万条退休指令（真机 1ms 同量级；
+            // 实测均值 ~4.6 万，见 tests/x_sys_retire_calib.rs）。注意历史注释中的
+            // "≈1.98e4 退休"是旧 ×AVG=3 口径（timing.rs BlockWeighted 已废弃），
+            // 与新口径不矛盾——当前生效的是「访客字节 = 虚拟周期」。
             let cycles = size as u64;
             clock.advance(cycles);
             // 快路径：BIT_ANY_ACTIVE 由外设区 MMIO 写置位（外设激活只可能发生在 MMIO 写，
@@ -2027,13 +2032,13 @@ impl Machine {
         let retired_base = self.retired_insts.load(Ordering::Relaxed);
 
         // 虚拟从设备时钟按退役指令数推进（每个 run() 一次）：
-        //   dt = Δretired / VIRT_INSN_PER_SEC。口径 = 当前非风暴稳态（~13 段 × 1ms
-        //   每 run(400K) → ~30M 指令/虚拟秒）。段内逐段推进（旧实现每段 dt=0.001）
-        //   会在中断风暴下自放大：段数膨胀 → 虚拟时间膨胀 → 推流字节膨胀 → 更多中断。
-        //   改为指令基准后推流速率恒定（GPS 20Hz / SBUS 100Hz），与中断频率无关。
-        const VIRT_INSN_PER_SEC: f32 = 30.0e6;
+        //   dt = Δretired / VIRTUAL_INSNS_PER_SEC（权威常量见 sim::timing）。
+        // 口径 = 当前非风暴稳态（~13 段 × 1ms 每 run(400K) → ~30M 指令/虚拟秒）。
+        // 段内逐段推进（旧实现每段 dt=0.001）会在中断风暴下自放大：段数膨胀 →
+        // 虚拟时间膨胀 → 推流字节膨胀 → 更多中断。改为指令基准后推流速率恒定
+        //（GPS 20Hz / SBUS 20Hz，period=0.05s），与中断频率无关。
         let retired_now = self.retired_insts.load(Ordering::Relaxed);
-        let dt = (retired_now - self.last_virt_retired.get()) as f32 / VIRT_INSN_PER_SEC;
+        let dt = (retired_now - self.last_virt_retired.get()) as f32 / VIRTUAL_INSNS_PER_SEC;
         self.last_virt_retired.set(retired_now);
         self.step_virtual_slaves(dt);
         self.step_virtual_uart(dt);
