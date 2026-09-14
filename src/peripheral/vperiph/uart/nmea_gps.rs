@@ -135,10 +135,9 @@ impl VirtualUartSlave for NmeaGps {
             if let DataSource::Math(m) = &self.source {
                 // 每周期推 GGA（位置/高度）+ RMC（位置/速度）两条：
                 // 固件 u-blox 驱动 drain 逐行解析，GGA 建定位锁 NED 原点，
-                // RMC 提供 Doppler 速度供 EKF update_vel。
-                // 【注意】曾尝试 GGA/RMC 交替推流（各 20Hz），实测 GPS 整体丢失
-                // 加剧（hb gps=false 全程、垂向发散）——两帧同周期推送更稳定，
-                // 保持一起推（各 20Hz 帧率）。
+                // RMC 提供 Doppler 速度供 EKF update_vel（水平速度约束）。
+                // 【注】曾实验 GGA-only（禁 RMC）——正确 baro 下 t≈32s 仍失稳，
+                // 证实水平失稳根因不在 RMC 注入（见 x_hover_demo 注释）。
                 for b in self.build_gga(m.as_ref()) {
                     tx(b);
                 }

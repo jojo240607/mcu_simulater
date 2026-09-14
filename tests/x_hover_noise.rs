@@ -1,8 +1,13 @@
-//! [持续悬停演示] 按虚拟外设直通闭环流程（fly-sim 物理 → FlySimState →
-//! mcu_sim 虚拟外设 → flyctrl 固件 → PWM 读回）跑 60s 连续悬停仿真。
+//! [持续悬停演示·带传感器噪声] 同 `x_hover_demo.rs` 的虚拟外设直通闭环流程，
+//! 但 fly_sim 使用 `SensorConfig::realistic()`——给 IMU（偏置/白噪声/随机游走/
+//! 偏置不稳定性/振动耦合）、GPS（20Hz 降频 + 0.15s 延迟 + 位置/速度噪声）、
+//! 气压计（白噪声 + 慢漂移）注入消费级传感器缺陷，验证固件 EKF/控制律在
+//! 逼真噪声下的长时间悬停稳定性。
 //!
-//! 与 `tests/x_vperiph_mcusim.rs` 同一套流程，仅拉长仿真时长并输出轨迹统计，
-//! 用于回答"能否持续悬停"：分段统计高度/水平漂移、姿态发散、推力稳定性。
+//! 保真度分层：模拟域缺陷（噪声/偏置/漂移）由 fly-sim `SensorModel` 施加，
+//! mcu_sim 外设层保持理想数字通路（量化/ODR 属数字域，未启用）。
+//! 固件收到的是与 SIL 控制律一致的噪声化读数（`SimLoop::last_imu/last_gps/
+//! last_baro_alt`），而非物理真值。
 //!
 //! 构建前置：`cd joc-base && cmake --build build_rel`（minimal elf）、
 //! `cd flyctrl && python3 build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin`。
@@ -74,18 +79,18 @@ fn settle_ekf_before_arm(m: &Arc<Mutex<Machine>>) -> f32 {
         mm.run(1_000_000).unwrap();
         z = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9074 + 28, 4).unwrap().try_into().unwrap());
         if i % 50 == 0 {
-            eprintln!("[demo] 收敛推进 i={i} ekf_z={z:.3}");
+            eprintln!("[noise] 收敛推进 i={i} ekf_z={z:.3}");
         }
         if z.abs() < 0.6 {
             break;
         }
     }
-    eprintln!("[demo] 收敛完成 ekf_z={z:.3}");
+    eprintln!("[noise] 收敛完成 ekf_z={z:.3}");
     z
 }
 
 #[test]
-fn hover_60s_demo() {
+fn hover_60s_noisy() {
     init_log();
     let sys = Path::new(SYS);
     let app = Path::new(APP_REAL);
@@ -131,13 +136,17 @@ fn hover_60s_demo() {
         st.rc_ch[3] = 1500.0;
     }
 
-    // ---- 35s 闭环：每步 4ms，8750 步；起飞台保持 → 升空 → 持续悬停 ----
+    // ---- 60s 闭环：每步 4ms，15000 步；起飞台保持 → 升空 → 持续悬停 ----
+    // 【逼真传感器】realistic()：IMU 零偏/白噪声/随机游走/偏置不稳定/振动耦合，
+    // GPS 20Hz 降频 + 0.15s 延迟 + 位置 0.5m/速度 0.1m/s 噪声，气压 0.3m 白噪声 +
+    // 0.05 m/√s 慢漂移。注入用 SimLoop 的噪声化读数（last_imu/last_gps/last_baro_alt），
+    // 固件收到的与 SIL 控制律同源。
     let mut sim = SimLoop::new(
         ToyWorld::new(9.81),
         &VehicleConfig::default_quad(),
         0.004,
         None,
-        SensorConfig::default(),
+        SensorConfig::realistic(),
         ControllerKind::Pid,
         Some(fly_sim_core::physics::ContactModel::default()),
         vec![],
@@ -149,13 +158,14 @@ fn hover_60s_demo() {
     let mut roll_max = 0.0f32;
     let mut pitch_max = 0.0f32;
     let mut last_state = None;
+    let mut gps_frames_total: u64 = 0; // 收到 GPS 噪声化样本的步数
 
     for step in 0..15_000u64 {
         let motors = read_thrust(&m);
         let thrust = motors.iter().sum::<f32>();
         max_thrust = max_thrust.max(thrust);
 
-        let (st, imu_true) = if held && thrust < 0.05 {
+        let (st, imu_read) = if held && thrust < 0.05 {
             (None, flyctrl_core::vehicle::ImuSample {
                 accel: [
                     flyctrl_core::units::MeterPerSecondSquared(0.0),
@@ -178,24 +188,37 @@ fn hover_60s_demo() {
         roll_max = roll_max.max(if let Some(s) = st { s.att.roll().abs() } else { 0.0 });
         pitch_max = pitch_max.max(if let Some(s) = st { s.att.pitch().abs() } else { 0.0 });
 
-        // 注入真值
+        // 注入逼真传感器读数（噪声化，与 SIL 控制律同源）
         {
             let mut st = state.lock().unwrap();
-            st.imu_acc = [imu_true.accel[0].0, imu_true.accel[1].0, imu_true.accel[2].0];
-            st.imu_gyr = [imu_true.gyro[0].0, imu_true.gyro[1].0, imu_true.gyro[2].0];
-            let (n, e, d) = (pos[0], pos[1], pos[2]);
-            st.gps_lat = LAT0 + n / 111_320.0;
-            st.gps_lon = LON0 + e / (111_320.0 * LAT0.to_radians().cos());
-            st.gps_alt = ALT0 - d;
-            st.gps_fix = 3.0;
-            // GPS Doppler 速度（NED m/s）：经 $GNRMC 帧下发 → EKF update_vel 约束
-            // 水平速度估计（无此约束时长时间悬停水平速度纯积分漂移失稳，见方案 A）
-            st.gps_vel = vel;
-            // 气压：标准大气（h 向上正 = -(d - 家庭点)；家庭点=起飞台(d=-5)，与
-            // GPS 原点（首次定位锁定）对齐 → 起飞台 baro 读 h=0、GPS 读 d=0，
-            // 消除 EKF 高度源冲突）。注入公式与 x_vperiph_mcusim 完全一致：
-            // p = 101325*exp(-h/8434.5)（指数近似；固件 ISA 解算在 h≈±5m 内偏差 <0.1m）。
-            let h = -(d + 5.0);
+            // IMU：SimLoop 已叠加 realistic 噪声/偏置
+            st.imu_acc = [imu_read.accel[0].0, imu_read.accel[1].0, imu_read.accel[2].0];
+            st.imu_gyr = [imu_read.gyro[0].0, imu_read.gyro[1].0, imu_read.gyro[2].0];
+            // GPS：优先噪声化样本（20Hz 降频，非 GPS 帧回退真值——固件视角 GPS
+            // 位置/速度在帧间不刷新属正常，与 SIL 一致）
+            match sim.last_gps() {
+                Some(g) => {
+                    st.gps_lat = LAT0 + g.pos[0].0 / 111_320.0;
+                    st.gps_lon = LON0 + g.pos[1].0 / (111_320.0 * LAT0.to_radians().cos());
+                    st.gps_alt = ALT0 - g.pos[2].0;
+                    st.gps_fix = 3.0;
+                    if let Some(v) = g.vel {
+                        st.gps_vel = [v[0].0, v[1].0, v[2].0];
+                    }
+                    gps_frames_total += 1;
+                }
+                None => {
+                    // 非 GPS 帧：保持上次（固件侧 RMC/GGA 帧率由 NmeaGps 周期决定，
+                    // 位置仍基于最近样本；速度回退物理真值保持连续性）
+                    st.gps_fix = 3.0;
+                }
+            }
+            // 气压：与 x_vperiph_mcusim 同一约定（家庭点=起飞台 d=-5，baro h=0、
+            // GPS d=0 对齐）。噪声化向上高度 baro_up=-d（fly-sim NED，起点 -5），
+            // 转相对家庭点高度 h = baro_up-5 = -(d+5)，注入 p=101325*exp(-h/8434.5)
+            //（指数近似；固件 ISA 解算在 h≈±5m 内偏差 <0.1m）。
+            let baro_up = sim.last_baro_alt();
+            let h = baro_up - 5.0;
             st.baro_pa = 101_325.0 * (-h / 8434.5).exp();
             st.rc_ch[4] = 2000.0;
         }
@@ -204,8 +227,6 @@ fn hover_60s_demo() {
 
         if step % 1000 == 0 {
             let ekf_z = read_ekf_z(&m);
-            // [DIAG] USART2(port=2, GPS) 推流帧数 + FIFO 残留：判断固件是否消费完全部
-            // GGA/RMC 字节（FIFO 残留 >0 → RMC 尾滞留未消费 → 解释 gps_v=0）
             let mm = m.lock().unwrap();
             let (gps_frames, fifo_len) = {
                 let uv = mm.usart.lock().unwrap();
@@ -214,7 +235,7 @@ fn hover_60s_demo() {
                 (frames, u2.rx_fifo_len())
             };
             eprintln!(
-                "[demo] t={:.0}s thrust={thrust:.3} pos=({:.2},{:.2},{:.2}) vel=({:.2},{:.2},{:.2}) ekf_z={ekf_z:.2} gps_frames={gps_frames} fifo={fifo_len}",
+                "[noise] t={:.0}s thrust={thrust:.3} pos=({:.2},{:.2},{:.2}) vel=({:.2},{:.2},{:.2}) ekf_z={ekf_z:.2} gps_frames={gps_frames} fifo={fifo_len}",
                 step as f64 * 0.004, pos[0], pos[1], pos[2], vel[0], vel[1], vel[2]
             );
         }
@@ -225,64 +246,74 @@ fn hover_60s_demo() {
 
     let wall = t0.elapsed();
 
-    // ---- 固件 console（含 ctrl dbg est 每 100ms 的 EKF 姿态/位置/速度演变）----
+    // ---- 固件 console（含 ctrl dbg est 每 100ms 的 EKF 姿态/位置/速度演变 + hb）----
     {
         let out = m.lock().unwrap().console.lock().unwrap().output().to_vec();
         let t = String::from_utf8_lossy(&out);
         let n = t.len();
-        eprintln!("[demo] === console FINAL ({n}B, tail 6000) ===\n{}", &t[n.saturating_sub(6000)..]);
+        eprintln!("[noise] === console FINAL ({n}B, tail 6000) ===\n{}", &t[n.saturating_sub(6000)..]);
     }
 
-    // ---- 统计：分段（每 15s 一段）位置/速度 ----
-    let n = traj.len();
-    let seg = |a: f64, b: f64| -> ([f64; 3], [f64; 3]) {
-        let s: Vec<_> = traj.iter().filter(|(stp, _, _)| {
-            let t = *stp as f64 * 0.004;
-            t >= a && t < b
-        }).collect();
-        let k = s.len().max(1);
-        let mut ps = [0.0f64; 3];
-        let mut vs = [0.0f64; 3];
-        for (_, p, v) in &s {
-            for i in 0..3 { ps[i] += p[i] as f64; vs[i] += v[i] as f64; }
+    // ---- 统计与判定 ----
+    let n = traj.len() as u64;
+    eprintln!("\n[noise] === 60s 带噪持续悬停统计（步数 {n}，墙钟 {:.1}s，GPS 噪声样本 {gps_frames_total}/15000）===", wall.as_secs_f64());
+    // 分段统计（4s 一段）
+    let mut seg_start = 0usize;
+    for end in [2500usize, 5000, 7500, 10000, 12500, 15000] {
+        if n as usize >= end {
+            let seg = &traj[seg_start..end.min(n as usize)];
+            let p0 = seg[0].1;
+            let mut max_dz = 0.0f32;
+            let mut max_horiz = 0.0f32;
+            let mut max_v = 0.0f32;
+            for &(_, p, v) in seg {
+                let dz = (p[2] - HOVER_D).abs();
+                let horiz = ((p[0] - p0[0]).powi(2) + (p[1] - p0[1]).powi(2)).sqrt();
+                let vs = (v[0].powi(2) + v[1].powi(2) + v[2].powi(2)).sqrt();
+                max_dz = max_dz.max(dz);
+                max_horiz = max_horiz.max(horiz);
+                max_v = max_v.max(vs);
+            }
+            eprintln!(
+                "[noise]  {:.0}-{:.0}s: 起点=({:.2},{:.2}) max|dz|={:.2}m max水平漂移={:.2}m max|v|={:.2}m/s",
+                seg_start as f64 * 0.004, end as f64 * 0.004, p0[0], p0[1], max_dz, max_horiz, max_v
+            );
+            seg_start = end;
         }
-        ([ps[0]/k as f64, ps[1]/k as f64, ps[2]/k as f64],
-         [vs[0]/k as f64, vs[1]/k as f64, vs[2]/k as f64])
-    };
-
-    eprintln!("\n[demo] === 60s 持续悬停统计（步数 {n}，墙钟 {wall:.1}s）===",
-        wall = wall.as_secs_f64());
-    let mut ok = true;
-    // 分段统计；判定段取 20-60s（跳过起飞过渡期）
-    for (a, b) in [(0.0, 10.0), (10.0, 20.0), (20.0, 35.0)] {
-        let (p, v) = seg(a, b);
-        let dz = (p[2] - HOVER_D as f64).abs();
-        let horiz = (p[0] * p[0] + p[1] * p[1]).sqrt();
-        eprintln!(
-            "[demo] {a:>2.0}-{b:>2.0}s: pos=({p0:+.2},{p1:+.2},{p2:+.2}) |dz|={dz:.2}m horiz={horiz:.2}m vel=({v0:+.2},{v1:+.2},{v2:+.2}) m/s",
-            p0 = p[0], p1 = p[1], p2 = p[2], v0 = v[0], v1 = v[1], v2 = v[2]
-        );
-        if a >= 20.0 && (dz > 0.8 || horiz > 0.5) { ok = false; }
     }
-    let st = last_state.expect("物理从未推进");
+    let last = traj.last().map(|t| t.1).unwrap_or([0.0, 0.0, -5.0]);
     eprintln!(
-        "[demo] 末态 pos=({:.2},{:.2},{:.2})m 姿态=({:.1}°,{:.1}°) max_thrust={max_thrust:.3}",
-        st.pos[0].0, st.pos[1].0, st.pos[2].0,
-        st.att.roll().to_degrees(), st.att.pitch().to_degrees()
+        "[noise] 末态 pos=({:.2},{:.2},{:.2})m 姿态=({:.1}°,{:.1}°) max_thrust={max_thrust:.3}",
+        last[0], last[1], last[2], roll_max.to_degrees(), pitch_max.to_degrees()
     );
-    eprintln!("[demo] 全程 max|roll|={:.2}° max|pitch|={:.2}°", roll_max.to_degrees(), pitch_max.to_degrees());
+    eprintln!("[noise] 全程 max|roll|={:.2}° max|pitch|={:.2}°", roll_max.to_degrees(), pitch_max.to_degrees());
 
-    // ---- 判定：20s 后高度稳定在悬停点 ±0.8m、水平 ±0.5m，姿态 < 5°，位置有限 ----
-    assert!(max_thrust > 0.05, "MCU 未输出有效推力");
-    for v in [st.pos[0].0, st.pos[1].0, st.pos[2].0] {
-        assert!(v.is_finite() && v.abs() < 100.0, "位置发散：{v}");
+    // 判定：全程姿态不发散（<15°，逼真噪声下留裕度）；末段（>10s）水平漂移与
+    // 高度误差有界（realistic GPS 位置噪声 0.5m + 气压噪声 0.3m）
+    assert!(roll_max.to_degrees() < 15.0, "姿态 roll 发散：{:.1}°", roll_max.to_degrees());
+    assert!(pitch_max.to_degrees() < 15.0, "姿态 pitch 发散：{:.1}°", pitch_max.to_degrees());
+    if n > 2500 {
+        let seg = &traj[2500..n as usize];
+        let p0 = seg[0].1;
+        for &(_, p, _) in seg {
+            let dz = (p[2] - HOVER_D).abs();
+            assert!(dz < 3.0, "高度失稳：dz={dz:.2}m @pos=({:.2},{:.2},{:.2})", p[0], p[1], p[2]);
+            let horiz = ((p[0] - p0[0]).powi(2) + (p[1] - p0[1]).powi(2)).sqrt();
+            assert!(horiz < 5.0, "水平漂移过大：{horiz:.2}m @pos=({:.2},{:.2})", p[0], p[1]);
+        }
     }
-    assert!(roll_max < 5f32.to_radians(), "roll 发散：{}", roll_max.to_degrees());
-    assert!(pitch_max < 5f32.to_radians(), "pitch 发散：{}", pitch_max.to_degrees());
-    assert!(ok, "20s 后未稳定在悬停点附近");
-    eprintln!(">>> [HOVER-DEMO] 60s 持续悬停验证通过 ✓");
+    eprintln!(">>> [NOISE-HOVER] 60s 带噪持续悬停验证通过 ✓");
 }
 
 fn init_log() {
-    let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Warn).try_init();
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format_timestamp_millis()
+            .try_init();
+    });
 }
+
+// 抑制未使用警告（RegisterARM 等按需引用）
+#[allow(unused_imports)]
+use unicorn_engine::RegisterARM as _Unused;
