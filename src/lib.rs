@@ -14,6 +14,7 @@
 //! - [`monitor`]：Monitor REPL
 //! - [`gdbstub`]：GDB 远程调试（M1 启用）
 //! - [`trace`]：总线事务嗅探器（调试平台 P0-1）
+//! - [`telemetry`]：遥测时间线导出（调试平台 P2-1）
 
 pub mod bus;
 pub mod config;
@@ -24,4 +25,5 @@ pub mod machine;
 pub mod monitor;
 pub mod peripheral;
 pub mod sim;
+pub mod telemetry;
 pub mod trace;

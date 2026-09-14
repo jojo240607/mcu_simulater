@@ -175,6 +175,8 @@ pub struct Machine {
     uart_drop: std::cell::RefCell<std::collections::HashMap<u8, u32>>,
     /// Halt 观察点：FaultAction::Halt 触发后 run() 提前返回
     halt_requested: std::cell::Cell<bool>,
+    /// 遥测记录器（P2-1）：run() 段后按退休间隔采样观测点
+    telemetry: Option<crate::telemetry::Telemetry>,
 }
 
 impl Machine {
@@ -274,6 +276,7 @@ impl Machine {
             fault: None,
             uart_drop: std::cell::RefCell::new(std::collections::HashMap::new()),
             halt_requested: std::cell::Cell::new(false),
+            telemetry: None,
         })
     }
 
@@ -618,6 +621,37 @@ impl Machine {
     /// 当前虚拟时间（秒，retired / VIRTUAL_INSNS_PER_SEC 口径，与推流时钟一致）。
     pub fn virtual_sec(&self) -> f32 {
         self.retired_insts.load(Ordering::Relaxed) as f32 / crate::sim::timing::VIRTUAL_INSNS_PER_SEC
+    }
+
+    /// 装配遥测记录器（调试平台 P2-1）：run() 段后按退休间隔采样观测点。
+    pub fn attach_telemetry(&mut self, telemetry: crate::telemetry::Telemetry) {
+        log::info!(
+            "[telemetry] 装配 {} 个观测点，周期 {} 退休",
+            telemetry.watches().len(),
+            telemetry.period_retired()
+        );
+        self.telemetry = Some(telemetry);
+    }
+
+    /// 导出遥测 CSV（time_us + 各观测点列）。
+    pub fn telemetry_csv(&self) -> String {
+        match &self.telemetry {
+            Some(t) => t.to_csv(),
+            None => String::new(),
+        }
+    }
+
+    /// 遥测采样行数（测试/调试断言）。
+    pub fn telemetry_rows(&self) -> usize {
+        self.telemetry.as_ref().map(|t| t.row_count()).unwrap_or(0)
+    }
+
+    /// 段后遥测采样（run() 内调用）。
+    fn step_telemetry(&mut self) {
+        if let Some(t) = &mut self.telemetry {
+            let retired = self.retired_insts.load(Ordering::Relaxed);
+            t.sample(&mut self.cpu, retired);
+        }
     }
 
     pub fn attach_bus_trace(&self, trace: std::sync::Arc<std::sync::Mutex<crate::trace::BusTrace>>) {
@@ -2228,6 +2262,9 @@ impl Machine {
             if self.halt_requested.get() {
                 break;
             }
+
+            // 段后遥测采样（P2-1）：按退休间隔记录观测点时间线
+            self.step_telemetry();
 
             // 按本轮实际退休量递减预算（block hook 已累计；看门狗 continue 分支因未退休指令，
             // 用累计式扣减不受影响——下一轮仍按"本次 run() 起点以来的总退休量"计算）。
