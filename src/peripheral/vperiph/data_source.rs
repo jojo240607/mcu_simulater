@@ -278,6 +278,9 @@ pub struct FlySimState {
     pub gps_lon: f32,
     pub gps_alt: f32,
     pub gps_fix: f32,
+    /// GPS NED 速度（m/s；北/东/下，向下正）。Doppler 速度经 `$GNRMC` 帧下发，
+    /// 固件 EKF `update_vel` 用它约束水平速度（否则长时间悬停水平速度纯积分漂移）。
+    pub gps_vel: [f32; 3],
     /// SBUS 通道 0..15（1000..2000；ch3=油门）
     pub rc_ch: [f32; 16],
 }
@@ -337,6 +340,9 @@ impl SensorModel for FlySimSource {
                 "lon" => st.gps_lon,
                 "alt" => st.gps_alt,
                 "fix" => st.gps_fix,
+                "vel_n" => st.gps_vel[0],
+                "vel_e" => st.gps_vel[1],
+                "vel_d" => st.gps_vel[2],
                 _ => 0.0,
             },
             FlySimKind::Sbus => {

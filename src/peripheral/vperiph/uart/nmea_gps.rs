@@ -69,6 +69,49 @@ impl NmeaGps {
         line.push_str(&format!("*{:02X}\r\n", cs));
         line.into_bytes()
     }
+
+    /// 生成一条 `$GNRMC` 帧字节（NMEA-0183 推荐最小导航信息，含地速/航向）。
+    ///
+    /// 格式：`$GNRMC,hhmmss,A,ddmm.mmmm,N,dddmm.mmmm,E,speed,course,ddmmyy,,,D*cs`
+    /// - speed：地速（节，knots = m/s × 1.94384）
+    /// - course：对地航向（真北顺时针，度；0=北 90=东）
+    ///
+    /// 速度来源：数据源的 `vel_n`/`vel_e`（NED 北/东向 m/s）。固件 `GpsUblox`
+    /// 解析 RMC 得 Doppler 速度 → `PosSample::with_vel` → EKF `update_vel`，
+    /// 约束水平速度估计（无此约束时长时间悬停水平速度纯积分漂移失稳）。
+    fn build_rmc(&self, v: &dyn SensorModel) -> Vec<u8> {
+        let lat = v.value("lat"); // 度（北正）
+        let lon = v.value("lon"); // 度（东正）
+        let vn = v.value("vel_n"); // m/s（北）
+        let ve = v.value("vel_e"); // m/s（东）
+        let lat_abs = lat.abs();
+        let lat_deg = lat_abs as u32;
+        let lat_min = (lat_abs - lat_deg as f32) * 60.0;
+        let lon_abs = lon.abs();
+        let lon_deg = lon_abs as u32;
+        let lon_min = (lon_abs - lon_deg as f32) * 60.0;
+        let ns = if lat >= 0.0 { 'N' } else { 'S' };
+        let ew = if lon >= 0.0 { 'E' } else { 'W' };
+        // NED 北/东速度 → 地速（节）+ 航向（真北顺时针）
+        let speed_knots = (vn * vn + ve * ve).sqrt() * 1.943_84;
+        let course_deg = ve.atan2(vn).to_degrees().rem_euclid(360.0);
+        let body = format!(
+            "GNRMC,{:06},A,{:02}{:07.4},{},{:03}{:07.4},{},{:.1},{:.1},010100,,,D",
+            120000u32,
+            lat_deg,
+            lat_min,
+            ns,
+            lon_deg,
+            lon_min,
+            ew,
+            speed_knots,
+            course_deg,
+        );
+        let mut line = format!("${body}");
+        let cs = nmea_checksum(body.as_bytes());
+        line.push_str(&format!("*{:02X}\r\n", cs));
+        line.into_bytes()
+    }
 }
 
 impl VirtualUartSlave for NmeaGps {
@@ -90,8 +133,16 @@ impl VirtualUartSlave for NmeaGps {
             self.acc -= self.period;
             self.frames += 1;
             if let DataSource::Math(m) = &self.source {
-                let frame = self.build_gga(m.as_ref());
-                for b in frame {
+                // 每周期推 GGA（位置/高度）+ RMC（位置/速度）两条：
+                // 固件 u-blox 驱动 drain 逐行解析，GGA 建定位锁 NED 原点，
+                // RMC 提供 Doppler 速度供 EKF update_vel。
+                // 【注意】曾尝试 GGA/RMC 交替推流（各 20Hz），实测 GPS 整体丢失
+                // 加剧（hb gps=false 全程、垂向发散）——两帧同周期推送更稳定，
+                // 保持一起推（各 20Hz 帧率）。
+                for b in self.build_gga(m.as_ref()) {
+                    tx(b);
+                }
+                for b in self.build_rmc(m.as_ref()) {
                     tx(b);
                 }
             }
@@ -130,6 +181,51 @@ mod tests {
             assert_eq!(f[3], "N");
             assert_eq!(f[6], "3", "fix=3");
             assert_eq!(f[9], "4.0", "alt=4.0m");
+        } else {
+            panic!("source 应为 Math");
+        }
+    }
+
+    #[test]
+    fn rmc_frame_format_and_checksum() {
+        let mut gps = NmeaGps::new(StaticGps::default());
+        if let DataSource::Math(m) = &gps.source {
+            let frame = gps.build_rmc(m.as_ref());
+            let s = String::from_utf8_lossy(&frame);
+            eprintln!("RMC frame: {s:?}");
+            assert!(s.starts_with("$GNRMC,"), "应以 $GNRMC 开头: {s:?}");
+            assert!(s.ends_with("\r\n"), "应以 CRLF 结尾: {s:?}");
+            let star = s.find('*').expect("应有 *");
+            let body = &s[1..star];
+            let cs = nmea_cs(body.as_bytes());
+            let exp = u8::from_str_radix(&s[star + 1..star + 3], 16).unwrap();
+            assert_eq!(cs, exp, "校验和不符: body={body}");
+            // 字段：status=A、lat/lon、speed/course（StaticGps vel=0 → speed=0 course=0）
+            let f: Vec<&str> = s.split(',').collect();
+            assert_eq!(f[1], "120000", "UTC 时间");
+            assert_eq!(f[2], "A", "status");
+            assert_eq!(f[3], "3113.8240", "纬度 ddmm.mmmm");
+            assert_eq!(f[4], "N");
+            assert_eq!(f[7], "0.0", "地速=0（静止）");
+            assert_eq!(f[8], "0.0", "航向=0（北）");
+        } else {
+            panic!("source 应为 Math");
+        }
+    }
+
+    #[test]
+    fn rmc_velocity_from_vel_fields() {
+        // vel_n=5 m/s、vel_e=0 → speed≈9.72 节、course=0（北）
+        let src = StaticGps { lat: 31.2304, lon: 121.4737, alt: 4.0, vel: [5.0, 0.0, 0.0] };
+        let mut gps = NmeaGps::new(src);
+        if let DataSource::Math(m) = &gps.source {
+            let frame = gps.build_rmc(m.as_ref());
+            let s = String::from_utf8_lossy(&frame).into_owned();
+            let f: Vec<&str> = s.split(',').collect();
+            let speed: f32 = f[7].parse().unwrap();
+            let course: f32 = f[8].parse().unwrap();
+            assert!((speed - 9.72).abs() < 0.1, "speed={speed} 应≈9.72节");
+            assert!((course - 0.0).abs() < 0.1, "course={course} 应=0（北向）");
         } else {
             panic!("source 应为 Math");
         }
