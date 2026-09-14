@@ -15,8 +15,10 @@
 //! - [`gdbstub`]：GDB 远程调试（M1 启用）
 //! - [`trace`]：总线事务嗅探器（调试平台 P0-1）
 //! - [`telemetry`]：遥测时间线导出（调试平台 P2-1）
+//! - [`checkpoint`]：快照/恢复（调试平台 P2-2）
 
 pub mod bus;
+pub mod checkpoint;
 pub mod config;
 pub mod core;
 pub mod events;

@@ -623,6 +623,19 @@ impl Machine {
         self.retired_insts.load(Ordering::Relaxed) as f32 / crate::sim::timing::VIRTUAL_INSNS_PER_SEC
     }
 
+    /// 保存快照（调试平台 P2-2）：CPU 寄存器 + RAM + retired 虚拟时间。
+    pub fn snapshot(&mut self) -> std::result::Result<crate::checkpoint::Snapshot, String> {
+        let retired = self.retired_insts.load(Ordering::Relaxed);
+        crate::checkpoint::snapshot(&mut self.cpu, retired)
+    }
+
+    /// 恢复快照（回滚到保存点）：寄存器 + RAM + retired（时间线连续续跑）。
+    pub fn restore(&mut self, snap: &crate::checkpoint::Snapshot) -> std::result::Result<(), String> {
+        // 恢复后清 Halt 观察点（快照点不处于 halt 状态）
+        self.halt_requested.set(false);
+        crate::checkpoint::restore(&mut self.cpu, snap, &self.retired_insts, &self.last_virt_retired)
+    }
+
     /// 装配遥测记录器（调试平台 P2-1）：run() 段后按退休间隔采样观测点。
     pub fn attach_telemetry(&mut self, telemetry: crate::telemetry::Telemetry) {
         log::info!(
