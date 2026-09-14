@@ -35,7 +35,19 @@ fn drvtest_all_drivers_pass() {
     // GYRO_CS=GPIOE8（port4/pin7,8）。固件 bmi088 驱动经 GPIO 拉低 CS + SPI XFER
     // 全链路读传感器数据；须在 run() 前挂（系统分区启动时 bmi088_create 会 open
     // spi2 并读 WHO_AM_I 校验——从机此时必须已挂载）。
-    m.register_spi_slave(3, Box::new(Bmi088::new((4, 7), (4, 8), StaticImu::default())));
+    // 朝向：真实板卡 BMI088 芯片平放（z 轴朝上）→ 静止 accel.z=+9.81（datasheet
+    // 1g=10920 LSB 取正），drvtest 固件按此验收；模型需给芯片坐标系比力。
+    m.register_spi_slave(
+        3,
+        Box::new(Bmi088::new(
+            (4, 7),
+            (4, 8),
+            StaticImu {
+                accel: [0.0, 0.0, 9.81],
+                gyro: [0.0; 3],
+            },
+        )),
+    );
 
     // SPI NOR Flash 虚拟从机：挂 SPI1（板级 spi_flash0 依赖 "spi1" = SPI2 硬件），
     // CS=GPIOE9（port4/pin9）。绑定唯一临时文件——固件写数据后宿主机侧

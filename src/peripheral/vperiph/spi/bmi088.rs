@@ -14,8 +14,15 @@
 //! - ACCEL ±3g 量程：10920 LSB/g（raw = g × 10920，16bit 有符号）
 //! - GYRO  ±2000dps：16.4 LSB/dps（raw = dps × 16.4，16bit 有符号）
 //!
-//! 数据源：`StaticImu`（悬停：accel=[0,0,9.81]、gyro=0）→ 静态水平：accel.z raw≈10920、
-//! gyro raw=0。读取瞬间刷新（仿 `RegFileSlave` 动态寄存器）。
+//! # 坐标系约定（重要）
+//!
+//! 模型输入是**芯片坐标系比力**（SensorModel 的 accel.x/y/z，单位 m/s²）：
+//! **芯片平放（z 轴朝上）静止时 accel.z = +9.81**（datasheet 灵敏度表 1g=10920
+//! LSB 取正号；drvtest 固件即按此验收）。安装朝向由**传入的模型**表达：
+//! - 平放 z 朝上：`StaticImu { accel: [0.0, 0.0, 9.81], .. }` → raw z ≈ +10920
+//! - 倒装（FRD z 向下，`StaticImu::default()`）：raw z ≈ -10920（比力 -1g）
+//!
+//! 读取瞬间刷新（仿 `RegFileSlave` 动态寄存器）。
 
 use super::VirtualSpiSlave;
 use crate::peripheral::vperiph::data_source::{DataSource, SensorModel, StaticImu};
@@ -284,14 +291,28 @@ mod tests {
 
     #[test]
     fn static_hover_accel_and_gyro() {
-        let mut s = Bmi088::default();
-        // ACCEL 数据：0x12 起 6B 顺序 X/Y/Z × (L,H)；StaticImu 悬停
-        // x=0, y=0, z=-9.81(-1g) → z raw=-10920=0xD558 LE；x/y raw=0
+        // 芯片平放（z 轴朝上）静止：accel.z = +9.81 → raw = +10920 = 0x2A98 LE
+        let imu = StaticImu {
+            accel: [0.0, 0.0, 9.81],
+            gyro: [0.0; 3],
+        };
+        let mut s = Bmi088::new(ACC, GYR, imu);
+        // ACCEL 数据：0x12 起 6B 顺序 X/Y/Z × (L,H)
         let acc = read_regs(&mut s, ACC.0, ACC.1, 0x12, 6);
         assert_eq!(&acc[0..4], &[0x00, 0x00, 0x00, 0x00], "accel.x/y=0");
-        assert_eq!(&acc[4..6], &[0x58, 0xD5], "accel.z raw≈-10920 LE");
+        assert_eq!(&acc[4..6], &[0xA8, 0x2A], "accel.z raw≈+10920 LE（1g=10920 LSB）");
         let gyr = read_regs(&mut s, GYR.0, GYR.1, 0x02, 6);
         assert_eq!(&gyr, &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00], "gyro=0");
+    }
+
+    #[test]
+    fn frd_downward_mount_reads_negative_g() {
+        // 倒装（FRD z 向下，StaticImu::default() 比力 -1g）→ raw = -10920 = 0xD558 LE：
+        // 安装朝向由模型表达，换算只做 g → LSB 线性映射
+        let mut s = Bmi088::default();
+        let acc = read_regs(&mut s, ACC.0, ACC.1, 0x12, 6);
+        assert_eq!(&acc[0..4], &[0x00, 0x00, 0x00, 0x00], "accel.x/y=0");
+        assert_eq!(&acc[4..6], &[0x58, 0xD5], "accel.z raw≈-10920 LE（比力 -1g）");
     }
 
     #[test]
@@ -309,11 +330,16 @@ mod tests {
 
     #[test]
     fn continuous_read_increments_addr() {
-        let mut s = Bmi088::default();
+        // 芯片平放 z 朝上：z=+1g → 0x2A98 LE
+        let imu = StaticImu {
+            accel: [0.0, 0.0, 9.81],
+            gyro: [0.0; 3],
+        };
+        let mut s = Bmi088::new(ACC, GYR, imu);
         // 读 0x12 起 8 字节：前 6 = 数据区，第 7/8 字节 = 0x18/0x19 寄存器值（0）
         let r = read_regs(&mut s, ACC.0, ACC.1, 0x12, 8);
         assert_eq!(r.len(), 8);
-        assert_eq!(&r[4..6], &[0x58, 0xD5], "ACC_Z 正确（x/y=0，z=-1g）");
+        assert_eq!(&r[4..6], &[0xA8, 0x2A], "ACC_Z 正确（x/y=0，z=+1g 平放）");
         assert_eq!(r[6], 0x00, "0x18 寄存器值");
         assert_eq!(r[7], 0x00, "0x19 寄存器值");
         // 超出文件（0x7F 后）→ 0xFF
