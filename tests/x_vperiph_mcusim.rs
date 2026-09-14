@@ -66,6 +66,97 @@ fn read_thrust(m: &Arc<Mutex<Machine>>) -> [f32; 4] {
     out
 }
 
+/// EST_STATE 布局（由 telemetry_entry 反汇编 + 运行期 f32 转储交叉确认）：
+///   offset 0:   VehicleState (72B)，但编译器对结构体字段做了重排（非 repr(C)）：
+///     +0   att 四元数 (16B) — dump index 0 恒为 1.0（att.w 水平悬停）
+///     +16  time_boot_ms (4B)
+///     +20  pos[0]  +24 pos[1]  +28 pos[2]  (NED, D 向下正) — dump index 5/6/7
+///     +32  vel[0]  +36 vel[1]  +40 vel[2]  — dump index 8/9/10
+///     +44  omega[3] +56 airspeed +60 accel_bias[3]
+///   offset 72:  Health (1B)
+///   offset 73:  armed (1B)
+/// 依据：telemetry_entry 0x08064128-0x08064196 把 sp+32/36/40/44/48/52（EST_STATE 拷贝
+/// 偏移 +20/+24/+28/+32/+36/+40）写入 LOCAL_POSITION_NED payload pos/vel 各分量；
+/// 且运行期转储 index7 与固件控制台 est.pos[2] 数值吻合（早期 ≈1.0）。
+/// 读 EKF 估计高度 est.pos[2]（f32，NED D 向下正）。
+fn read_ekf_z(m: &Arc<Mutex<Machine>>) -> f32 {
+    let b = m.lock().unwrap().cpu.mem_read(0x2000_9074 + 28, 4).unwrap();
+    f32::from_le_bytes(b.try_into().unwrap())
+}
+
+/// [DIAG] 转储 EST_STATE 前 72B（VehicleState）为 18 个 f32，定位 est.pos[2] 实际偏移。
+fn dump_est_state(m: &Arc<Mutex<Machine>>) -> Vec<f32> {
+    let b = m.lock().unwrap().cpu.mem_read(0x2000_9074, 72).unwrap();
+    (0..18).map(|i| f32::from_le_bytes([b[i*4], b[i*4+1], b[i*4+2], b[i*4+3]])).collect()
+}
+
+/// [DIAG] boot 后、ARM 前转储 EKF 状态 + 传感器帧字段，定位 boot 阶段 EKF z 漂移。
+/// 内存布局（据 symbol 表）：
+///   EST_STATE    @0x2000_9074 (VehicleState 72B; pos[2] @ +28)
+///   SENSOR_FRAME @0x2000_9018 (SensorFrame: imu Option(24B) + rc(24B) + gps Option(24B) + baro Option(4B)...)
+fn dump_boot_state(m: &mut Machine) {
+    fn rd(m: &mut Machine, addr: u64, len: usize) -> Vec<u8> {
+        m.cpu.mem_read(addr, len).unwrap_or_default()
+    }
+    fn f32at(m: &mut Machine, addr: u64) -> f32 {
+        let b = rd(m, addr, 4);
+        if b.len() < 4 { f32::NAN } else { f32::from_le_bytes([b[0], b[1], b[2], b[3]]) }
+    }
+    fn u32at(m: &mut Machine, addr: u64) -> u32 {
+        let b = rd(m, addr, 4);
+        if b.len() < 4 { 0 } else { u32::from_le_bytes([b[0], b[1], b[2], b[3]]) }
+    }
+    fn u8at(m: &mut Machine, addr: u64) -> u8 {
+        rd(m, addr, 1).first().copied().unwrap_or(0)
+    }
+    let ekf_z = f32at(m, 0x2000_9074 + 28);
+    let ekf_velz = f32at(m, 0x2000_9074 + 40);
+    // SENSOR_FRAME 字段（据 mod.rs SensorFrame 布局推断；不稳妥则显示原始字节）
+    let fr = rd(m, 0x2000_9018, 96);
+    eprintln!(
+        "[DIAG-BOOT] EKF pos=({:.3},{:.3},{:.3}) vel=({:.3},{:.3},{:.3})",
+        f32at(m, 0x2000_9074 + 20), f32at(m, 0x2000_9074 + 24), ekf_z,
+        f32at(m, 0x2000_9074 + 32), f32at(m, 0x2000_9074 + 36), ekf_velz,
+    );
+    eprintln!(
+        "[DIAG-BOOT] SENSOR_FRAME@0x20009018 前96B: {}",
+        fr.iter().enumerate().map(|(i, b)| if i % 4 == 0 { format!("\n  +{i:02x}:") } else { String::new() } + &format!("{b:02x} ")).collect::<String>()
+    );
+    eprintln!(
+        "[DIAG-BOOT] SENSOR_SEQ={} HIL_GATES=0x{:08x} G_CMD_ARMED={}",
+        u32at(m, 0x2000_b5cc), u32at(m, 0x2000_b62c), u8at(m, 0x2000_b669)
+    );
+}
+
+/// [ARM 前收敛推进] boot 早期 RC 链路未建立：`RcInput::neutral().throttle=0` →
+/// control 首拍 `thr_off=(0-0.5)*2=-1` → `target_alt=hold_alt(0)-(-1)*2=+2.0` →
+/// `set_initial_position` 把 EKF 高度锁到 d=+2.0（错误）。若在 EKF 收敛前 ARM，
+/// `hold_alt=est.pos[2]≈1.3` 锁错 → 机体悬停在物理 d≈-3.7（距 5m 悬停点偏 ~1.3m，
+/// `vperiph_hover_sustained` 实测 |dz|=1.33 失败）。
+///
+/// 修复：ARM 前推进仿真，等 SBUS 帧到达（20Hz → RC fresh、throttle=0.5 →
+/// target_alt 回落 0）且 EKF 高度被 baro/GPS 观测拉回设计原点（|z|<tol），再 ARM。
+/// 返回推进后 EKF 高度（m，NED 向下正）供调用方打印。
+fn settle_ekf_before_arm(m: &Arc<Mutex<Machine>>, tag: &str, tol: f32) -> f32 {
+    let mut mm = m.lock().unwrap();
+    let mut z = f32::NAN;
+    for i in 0..400 {
+        mm.run(1_000_000).unwrap();
+        z = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9074 + 28, 4).unwrap().try_into().unwrap());
+        if i % 50 == 0 {
+            eprintln!("[{tag}] 收敛推进 i={i} ekf_z={z:.3}");
+        }
+        if z.abs() < tol {
+            break;
+        }
+    }
+    let fr_thr = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9018 + 0x4C, 4).unwrap().try_into().unwrap());
+    let fr_fresh = mm.cpu.mem_read(0x2000_9018 + 0x52, 1).unwrap()[0];
+    eprintln!("[{tag}] 收敛完成 ekf_z={z:.3} frame.throttle={fr_thr:.3} frame.fresh={fr_fresh}");
+    z
+}
+
+
 /// 共享的"注入 + 推进 + 读回 PWM"单步逻辑，供多个闭环测试复用。
 ///
 /// `steps` 为物理步数（每步 4ms）。`hold_thresh` 为起飞台保持的推力阈值。
@@ -159,10 +250,16 @@ fn run_closed_loop(
             traj.push((step, [s.pos[0].0, s.pos[1].0, s.pos[2].0]));
         }
         if log_every > 0 && step % log_every == 0 {
+            let ekf_z = read_ekf_z(m);
+            let dump = dump_est_state(m);
             eprintln!(
-                "[vperiph] step={step} t={:.2}s thrust={thrust:.3} m=[{:.3},{:.3},{:.3},{:.3}] pos=({:.2},{:.2},{:.2})",
+                "[vperiph] step={step} t={:.2}s thrust={thrust:.3} m=[{:.3},{:.3},{:.3},{:.3}] pos=({:.2},{:.2},{:.2}) ekf_z={ekf_z:.3}",
                 step as f64 * 0.004, motors[0], motors[1], motors[2], motors[3],
                 pos[0], pos[1], pos[2],
+            );
+            eprintln!(
+                "[vperiph]   est f32 dump: {:?}",
+                dump.iter().enumerate().map(|(i, v)| format!("{i}:{v:.3}")).collect::<Vec<_>>().join(" ")
             );
         }
     }
@@ -214,6 +311,15 @@ fn vperiph_closed_loop() {
         m.run(1_000_000).unwrap();
     }
     let m = Arc::new(Mutex::new(m));
+
+    // [DIAG] boot 后、ARM 前：转储 EKF 状态与传感器帧（定位 boot 阶段 z 漂移）
+    {
+        let mut mm = m.lock().unwrap();
+        dump_boot_state(&mut mm);
+    }
+
+    // [ARM 前收敛推进] RC 链路建立 + EKF 高度收敛（根因见 settle_ekf_before_arm 文档）
+    settle_ekf_before_arm(&m, "vperiph-closed", 0.6);
 
     // 地面站 ARM 等效注入：直接置 G_CMD_ARMED（AtomicBool）。
     // 地址随固件构建变化：`arm-none-eabi-nm app.elf | grep G_CMD_ARMED` 获取，
@@ -315,6 +421,17 @@ fn vperiph_hover_long() {
     }
     let m = Arc::new(Mutex::new(m));
 
+    // [DIAG] boot 后、ARM 前：转储 EKF 状态与传感器帧（定位 boot 阶段 z 漂移）
+    {
+        let mut mm = m.lock().unwrap();
+        dump_boot_state(&mut mm);
+    }
+
+    // [ARM 前收敛推进] RC 链路建立 + EKF 高度收敛（根因见 settle_ekf_before_arm 文档：
+    // boot 早期 RC 未建立 → target_alt=+2.0 → EKF 高度锁错 → hold_alt 锁错。
+    // 历史"侥幸通过"：300 步截断早，机体未完全落到错误高度，|dz| 恰好 <0.8）。
+    settle_ekf_before_arm(&m, "vperiph-hover", 0.6);
+
     // ARM（G_CMD_ARMED 直接置 1）
     m.lock().unwrap().cpu.mem_write(0x2000_b669, &[1u8]).unwrap();
 
@@ -368,4 +485,119 @@ fn vperiph_hover_long() {
         st.att.roll().to_degrees(), st.att.pitch().to_degrees(),
     );
     eprintln!(">>> [VPERIPH-MCUSIM] 长时悬停收敛验证通过 ✓");
+}
+
+/// [虚拟外设直通] 持续稳定悬停验证（长时间）：确认悬停收敛后能**持续保持**稳定。
+///
+/// 与 `vperiph_hover_long` 同场景，但仿真时长拉长到 12s（3000 步），分三段检查：
+/// - 早段（10%~40%）：高度应收敛（|dz|<1.5m），姿态 < 5°
+/// - 中段（40%~70%）：保持稳定，且相对早段无明显漂移（高度变化 < 1.0m）
+/// - 末段（70%~100%）：最终收敛在悬停点附近（|dz|<0.8m、水平 <0.5m）
+/// 全程位置有限、roll/pitch 不发散。
+#[test]
+fn vperiph_hover_sustained() {
+    init_log();
+    let sys = Path::new(SYS);
+    let app = Path::new(APP_REAL);
+    assert!(sys.exists(), "minimal elf 缺失");
+    assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin");
+
+    let mut m = Machine::new_m4f().unwrap();
+    m.map_stm32f407_layout().unwrap();
+
+    let state = Arc::new(Mutex::new(FlySimState::default()));
+    m.attach_flysim_sensors(state.clone());
+    m.attach_flysim_uart_slaves(state.clone());
+
+    // boot 前注入初始真值（同 vperiph_hover_long，防止 EKF 高度被污染）
+    {
+        let mut st = state.lock().unwrap();
+        st.imu_acc = [0.0, 0.0, -9.81];
+        st.imu_gyr = [0.0, 0.0, 0.0];
+        st.baro_pa = 101_325.0f32;
+        st.gps_lat = LAT0;
+        st.gps_lon = LON0;
+        st.gps_alt = ALT0 + 5.0;
+        st.gps_fix = 3.0;
+        st.rc_ch = [1500.0; 16];
+    }
+
+    m.load_elf(sys).unwrap();
+    m.load_app_partition(app).unwrap();
+    m.reset().unwrap();
+    for _ in 0..12 {
+        m.run(1_000_000).unwrap();
+    }
+    let m = Arc::new(Mutex::new(m));
+
+    // [ARM 前收敛推进] RC 链路建立 + EKF 高度收敛（见 settle_ekf_before_arm 文档，
+    // 根因：boot 早期 RC 未建立 → target_alt=+2.0 → EKF 高度锁错 → hold_alt 锁错）
+    settle_ekf_before_arm(&m, "vperiph-sustain", 0.6);
+
+    // ARM + RC 解锁
+    m.lock().unwrap().cpu.mem_write(0x2000_b669, &[1u8]).unwrap();
+    {
+        let mut st = state.lock().unwrap();
+        st.rc_ch[4] = 2000.0;
+        st.rc_ch[3] = 1500.0;
+    }
+
+    // 3000 步 = 12s 仿真：起飞台保持 → 升空 → 持续悬停
+    let (final_state, max_thrust, traj) = run_closed_loop(&m, &state, 3000, 0.05, 250);
+
+    // ---- 断言 ----
+    assert!(max_thrust > 0.05, "MCU 未输出有效推力");
+    let st = final_state.expect("物理从未推进（起飞台一直保持？）");
+
+    let n = traj.len();
+    assert!(n >= 300, "轨迹点太少：{n}");
+
+    // 三段均值：早段 10%~40%、中段 40%~70%、末段 70%~100%
+    let seg_avg = |a: usize, b: usize| -> ([f64; 3], usize) {
+        let s = &traj[n * a / 10..n * b / 10];
+        let k = s.len();
+        let mut sum = [0.0f64; 3];
+        for (_, p) in s {
+            for i in 0..3 {
+                sum[i] += p[i] as f64;
+            }
+        }
+        ([sum[0] / k as f64, sum[1] / k as f64, sum[2] / k as f64], k)
+    };
+    let (early, k0) = seg_avg(1, 4);
+    let (mid, k1) = seg_avg(4, 7);
+    let (late, k2) = seg_avg(7, 10);
+    eprintln!(
+        "[vperiph-sustain] 早段(pos=({:.3},{:.3},{:.3}) n={k0}) 中段=({:.3},{:.3},{:.3}) n={k1} 末段=({:.3},{:.3},{:.3}) n={k2}",
+        early[0], early[1], early[2], mid[0], mid[1], mid[2], late[0], late[1], late[2],
+    );
+
+    // 早段：已收敛（|dz|<1.5m），姿态 < 5°
+    let de = (early[2] - (-5.0)).abs();
+    assert!(de < 1.5, "早段未收敛到 5m 悬停点：|dz|={de:.3}（期望 <1.5m）");
+    assert!(st.att.roll().is_finite() && st.att.roll().abs() < 0.05, "roll 发散：{}", st.att.roll());
+    assert!(st.att.pitch().is_finite() && st.att.pitch().abs() < 0.05, "pitch 发散：{}", st.att.pitch());
+
+    // 中段相对早段：无明显漂移（高度变化 < 1.0m）
+    let drift = (mid[2] - early[2]).abs();
+    assert!(drift < 1.0, "中段高度漂移过大：{drift:.3}m（早段→中段变化期望 <1.0m）");
+
+    // 末段：最终收敛在悬停点附近
+    let dx = late[0].abs();
+    let dy = late[1].abs();
+    let dz = (late[2] - (-5.0)).abs();
+    assert!(dz < 0.8, "高度未收敛到 5m 悬停点：末段 |dz|={dz:.3}（期望 <0.8m）");
+    assert!(dx < 0.5 && dy < 0.5, "水平未收敛：|dx|={dx:.3} |dy|={dy:.3}（期望 <0.5m）");
+
+    // 全程位置有限
+    for v in [st.pos[0].0, st.pos[1].0, st.pos[2].0] {
+        assert!(v.is_finite() && v.abs() < 100.0, "位置发散：{v}");
+    }
+
+    eprintln!(
+        "[vperiph-sustain] 持续悬停 12s 稳定：末段 pos≈({late0:.2},{late1:.2},{late2:.2})m 姿态=({r:.2}°,{p:.2}°)",
+        late0 = late[0], late1 = late[1], late2 = late[2],
+        r = st.att.roll().to_degrees(), p = st.att.pitch().to_degrees(),
+    );
+    eprintln!(">>> [VPERIPH-MCUSIM] 持续悬停（12s）稳定验证通过 ✓");
 }
