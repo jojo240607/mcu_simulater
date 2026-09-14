@@ -23,6 +23,7 @@ pub mod config;
 pub mod core;
 pub mod events;
 pub mod fault;
+pub mod gdbstub;
 pub mod machine;
 pub mod monitor;
 pub mod peripheral;
