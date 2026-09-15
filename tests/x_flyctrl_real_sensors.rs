@@ -49,6 +49,7 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
     let mut imu_ok = false;
     let mut baro_ok = false;
     let mut gps_ok = false;
+    let mut mag_ok = false;
     let mut panic_seen = false;
     for step in 0..2000u32 {
         if t_start.elapsed().as_secs() > 300 {
@@ -80,6 +81,9 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
             if line.contains("gps=true") {
                 gps_ok = true;
             }
+            if line.contains("mag=true") {
+                mag_ok = true;
+            }
         }
         // GPS 就绪：u-blox 驱动首次有效定位（独立于 hb 采样，直接证据）
         if text.contains("fix established") {
@@ -105,7 +109,7 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
             }
             Ok(()) => {}
         }
-        if mounted && tasks && imu_ok && baro_ok && gps_ok {
+        if mounted && tasks && imu_ok && baro_ok && gps_ok && mag_ok {
             break;
         }
     }
@@ -130,7 +134,7 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
         )
     };
     eprintln!(
-        "RESULT: mounted={mounted} tasks={tasks} hb={hb} imu_ok={imu_ok} baro_ok={baro_ok} gps_ok={gps_ok} panic={panic_seen} slave_reads={cnt:?} uart_frames={ucnt:?}"
+        "RESULT: mounted={mounted} tasks={tasks} hb={hb} imu_ok={imu_ok} baro_ok={baro_ok} gps_ok={gps_ok} mag_ok={mag_ok} panic={panic_seen} slave_reads={cnt:?} uart_frames={ucnt:?}"
     );
     assert!(!panic_seen, "应用 panic（IMU/baro 构造失败？）");
     assert!(mounted, "App 分区未挂载");
@@ -139,5 +143,6 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
     assert!(imu_ok, "IMU(MPU6050) 未经 I2C 虚拟从设备读到数据（imu_ok=false）");
     assert!(baro_ok, "Baro(BMP280) 未经 I2C 虚拟从设备读到数据（baro=false）");
     assert!(gps_ok, "GPS(u-blox) 未经 UART 推流从设备读到 NMEA（gps=false）");
+    assert!(mag_ok, "Mag(QMC5883) 未经 I2C 虚拟从设备读到数据（mag=false，hb 行 mag 字段）");
     assert!(cnt.0 > 0 && cnt.1 > 0, "I2C 从设备无读取（虚拟外设未工作）");
 }
