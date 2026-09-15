@@ -20,7 +20,8 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     // 虚拟外设：3 个 I2C 传感器从设备挂到 i2c1（flyctrl real-sensors 的 i2c0 = I2C1）
-    m.attach_default_sensors();
+    // baro 高度基准与虚拟 GPS（alt=4.0）对齐，EKF 高度收敛到 4m 而非海平面 0m。
+    m.attach_default_sensors_with_baro_height(4.0);
     assert_eq!(m.i2c.lock().unwrap()[0].lock().unwrap().slave_count(), 3);
     // UART 推流从设备：gps→uart1(USART2 port2)、sbus→uart2(USART3 port3)
     m.attach_default_uart_slaves();

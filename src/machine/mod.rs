@@ -556,11 +556,20 @@ impl Machine {
     }
 
     /// 便捷装配：把默认 3 个 I2C 传感器（mpu6050/bmp280/qmc5883）挂到 i2c1。
+    /// baro 高度基准默认海平面（0m），与虚拟 GPS 高度（默认 alt=4.0）不一致时
+    /// 可用 [`attach_default_sensors_with_baro_height`] 对齐基准。
     pub fn attach_default_sensors(&self) {
+        self.attach_default_sensors_with_baro_height(0.0);
+    }
+
+    /// 同 [`attach_default_sensors`]，但指定气压计模拟高度（m，向上为正）。
+    /// 虚拟 GPS 与 baro 高度基准一致时，EKF 高度收敛到该基准（而非被海平面
+    /// 气压拉偏——历史观察：海平面 baro vs GPS alt=4m → EKF 收敛 0.17m）。
+    pub fn attach_default_sensors_with_baro_height(&self, baro_height: f32) {
         use crate::peripheral::vperiph::data_source::{StaticBaro, StaticImu, StaticMag};
         use crate::peripheral::vperiph::i2c::{bmp280, mpu6050, qmc5883};
         self.register_i2c_slave(1, Box::new(mpu6050(StaticImu::default())));
-        self.register_i2c_slave(1, Box::new(bmp280(StaticBaro::default())));
+        self.register_i2c_slave(1, Box::new(bmp280(StaticBaro::at_height(baro_height))));
         self.register_i2c_slave(1, Box::new(qmc5883(StaticMag::default())));
     }
 

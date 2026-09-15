@@ -283,6 +283,16 @@ impl Default for StaticBaro {
     }
 }
 
+impl StaticBaro {
+    /// 按指定高度（m，向上为正）构造静态气压（ISA 反解海平面公式）。
+    /// 与虚拟 GPS 高度基准对齐：baro 与 GPS 高度不一致会令 EKF 高度被
+    /// 气压观测拉偏（历史观察：海平面 baro vs GPS alt=4m → EKF 收敛 0.17m）。
+    pub fn at_height(height_m: f32) -> Self {
+        let p = 101_325.0 * (1.0 - height_m / 44330.0).powf(1.0 / 0.1903);
+        Self { pressure: p }
+    }
+}
+
 impl SensorModel for StaticBaro {
     fn name(&self) -> &str {
         "static_baro"
