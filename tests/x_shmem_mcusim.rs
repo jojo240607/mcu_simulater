@@ -94,8 +94,8 @@ fn shmem_closed_loop() {
 
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
-    m.load_elf(sys).unwrap();
-    m.load_app_partition(app).unwrap();
+    m.load_elf(&sys).unwrap();
+    m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
     for _ in 0..12 {
         m.run(1_000_000).unwrap();

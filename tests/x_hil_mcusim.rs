@@ -101,8 +101,8 @@ fn hil_mcusim_closed_loop() {
 
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
-    m.load_elf(sys).unwrap();
-    m.load_app_partition(app).unwrap();
+    m.load_elf(&sys).unwrap();
+    m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
 
     // 固件启动 + App 挂载 + 任务创建（telemetry/uplink/control/sensors）

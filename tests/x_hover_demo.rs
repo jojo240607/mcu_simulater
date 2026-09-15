@@ -5,7 +5,7 @@
 //! 用于回答"能否持续悬停"：分段统计高度/水平漂移、姿态发散、推力稳定性。
 //!
 //! 构建前置：`cd joc-base && cmake --build build_rel`（minimal elf）、
-//! `cd flyctrl && python3 build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin`。
+//! `cd flyctrl && python3 build_app.py --features real-sensors --out /tmp/flyctrl_real.bin`。
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -22,7 +22,7 @@ use mcu_simulater::machine::Machine;
 use unicorn_engine::RegisterARM;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
-const APP_REAL: &str = "/tmp/flyctrl_clean.bin";
+const APP_REAL: &str = "/tmp/flyctrl_real.bin";
 
 // TIM 基址（固件 pwm0..3 = TIM3/TIM2/TIM1/TIM4 CH1）
 const TIM3: u64 = 0x4000_0400; // pwm0
@@ -90,7 +90,7 @@ fn hover_60s_demo() {
     let sys = artifact::joc_base_elf();
     let app = Path::new(APP_REAL);
     assert!(sys.exists(), "minimal elf 缺失");
-    assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin");
+    assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/flyctrl_real.bin");
 
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
@@ -113,7 +113,7 @@ fn hover_60s_demo() {
         st.rc_ch = [1500.0; 16];
     }
 
-    m.load_elf(sys).unwrap();
+    m.load_elf(&sys).unwrap();
     m.load_app_partition(app).unwrap();
     m.reset().unwrap();
     for _ in 0..12 {
