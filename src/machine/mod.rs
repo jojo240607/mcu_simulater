@@ -2128,7 +2128,21 @@ impl Machine {
                 let _ = uc.reg_write(RegisterARM::LR, exc_return as u64);
                 let _ = uc.reg_write(RegisterARM::IPSR, 11);
                 let _ = uc.reg_write(RegisterARM::PC, (handler | 1) as u64);
+                // 与 enter_exception 对称：保存被中断现场 r4..r11（SVC 调用者现场），
+                // EXC_RETURN 返回时 pop_callee 还原——exception_return 统一要求
+                // callee 栈与异常栈同步（缺则返回报"无 callee 现场"）。
+                let callee = [
+                    uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32,
+                ];
                 nvic2.lock().unwrap().push_exception(11);
+                nvic2.lock().unwrap().push_callee(callee);
                 nvic2.lock().unwrap().set_stop_reason(StopReason::SvcEntry);
                 log::info!(
                     "SVC 进入：vector=11 handler=0x{handler:08X} EXC_RETURN=0x{exc_return:08X} sp=0x{sp:08X}"
@@ -2458,6 +2472,21 @@ impl Machine {
         let pc_saved = self.cpu.reg_read_u32(RegisterARM::PC)?;
         // xPSR 仅保留 APSR 标志位（bit31..24）；IPSR/EPSR 由本机接管
         let xpsr = self.cpu.reg_read_u32(RegisterARM::XPSR)? & 0xFF00_0000;
+        // callee-saved r4..r11：停机在块首，此刻即块首初值。异常返回要重放
+        // 被打断的块（PC 恢复为块首），必须同步还原 r4..r11——ISR 链（C 函数
+        // prologue/epilogue）虽然自身保存/恢复它们，但恢复的是"打断时刻"的
+        // 值，而打断时刻已处于块中间（块内指令改过 r4..r11），与块首初值
+        // 不一致 → 重放读到错误基址（实测 r10 变 4 → 读 0x4C fault）。
+        let callee = [
+            self.cpu.reg_read_u32(RegisterARM::R4)?,
+            self.cpu.reg_read_u32(RegisterARM::R5)?,
+            self.cpu.reg_read_u32(RegisterARM::R6)?,
+            self.cpu.reg_read_u32(RegisterARM::R7)?,
+            self.cpu.reg_read_u32(RegisterARM::R8)?,
+            self.cpu.reg_read_u32(RegisterARM::R9)?,
+            self.cpu.reg_read_u32(RegisterARM::R10)?,
+            self.cpu.reg_read_u32(RegisterARM::R11)?,
+        ];
 
         let sp = sp - 32;
         let mut frame = [0u8; 32];
@@ -2498,7 +2527,12 @@ impl Machine {
             n.clear_sys_pending(vector);
         }
         n.push_exception(vector);
-        drop(n);
+        // PendSV（vector 14）= RTOS 上下文切换：r4..r11 由 context.S 手动
+        // 保存旧任务到 TCB / 加载新任务，异常返回后必须保留切换结果，不能
+        // 用进入时的 r4..r11 覆盖（否则新任务现场损坏 → 早期启动即 fault）。
+        if vector != 14 {
+            n.push_callee(callee);
+        }
 
         log::info!(
             "中断进入：vector={vector} handler=0x{handler:08X} EXC_RETURN=0x{exc_return:08X}"
@@ -2710,6 +2744,15 @@ fn exception_return<'b>(
     if vector >= 16 {
         n.clear_active(vector - 16);
     }
+    // 还原被中断现场的 r4..r11（进入时保存的块首初值），保证重放块一致。
+    // PendSV（vector 14）除外：上下文切换后的 r4..r11 是 context.S 加载的
+    // 新任务现场，pop_callee 只会覆盖它——PendSV 进入时也未 push。
+    let callee = if vector != 14 {
+        n.pop_callee()
+            .ok_or_else(|| CoreError::Unicorn("EXC_RETURN 但无 callee 现场".into()))?
+    } else {
+        [0; 8]
+    };
 
     // 恢复寄存器
     uc.reg_write(RegisterARM::R0, frame[0] as u64)?;
@@ -2720,9 +2763,17 @@ fn exception_return<'b>(
     uc.reg_write(RegisterARM::LR, frame[5] as u64)?; // 恢复被中断现场的调用者 LR
     uc.reg_write(RegisterARM::PC, frame[6] as u64)?; // 恢复返回地址（含 Thumb 位）
     let _ = uc.reg_write(RegisterARM::XPSR, frame[7] as u64); // 尽力恢复标志
+    if vector != 14 {
+        uc.reg_write(RegisterARM::R4, callee[0] as u64)?;
+        uc.reg_write(RegisterARM::R5, callee[1] as u64)?;
+        uc.reg_write(RegisterARM::R6, callee[2] as u64)?;
+        uc.reg_write(RegisterARM::R7, callee[3] as u64)?;
+        uc.reg_write(RegisterARM::R8, callee[4] as u64)?;
+        uc.reg_write(RegisterARM::R9, callee[5] as u64)?;
+        uc.reg_write(RegisterARM::R10, callee[6] as u64)?;
+        uc.reg_write(RegisterARM::R11, callee[7] as u64)?;
+    }
     uc.reg_write(sp_reg, (sp + 32) as u64)?;
-
-    // CONTROL.SPSEL：返回线程时按 EXC_RETURN bit2 更新；返回 handler 时不改
     let control = uc.reg_read(RegisterARM::CONTROL)? as u32;
     let control = if return_to_thread {
         (control & !0x2) | if use_psp { 0x2 } else { 0x0 }

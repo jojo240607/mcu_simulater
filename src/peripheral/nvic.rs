@@ -109,11 +109,19 @@ fn irq_bits(irq: u32) -> (usize, u32) {
 /// SHPR 偏移对应的 4 个系统异常向量（None = 保留字节）：
 /// SHPR1 = MemManage(4)/BusFault(5)/UsageFault(6)；SHPR2 = SVCall(11)；
 /// SHPR3 = PendSV(14)/SysTick(15)。
+///
+/// 注意 SHPR3 采用【CMSIS 字节数组视图】（jOS 用 core_cm4.h 的
+/// `SCB->SHP[((IRQn)&0xF)-4]`，PendSV(-2)→SHP[10]→0xE000ED22，
+/// SysTick(-1)→SHP[11]→0xE000ED23），而非 ARM TRM 的寄存器视图
+///（0xE000ED21=PendSV / 0xE000ED22=SysTick）。实测固件对 PendSV/SysTick
+/// 优先级只做字节写（0xD22=0xF0、0xD23=0xF0），若按 ARM 寄存器视图映射，
+/// PendSV 优先级会写进 SysTick 字节、PendSV 残留 0（最高）→ 能抢占 ISR，
+/// context.S 在 ISR 上下文切换 → 污染任务 TCB（r10 被写坏 → 循环读 0x4C）。
 fn shpr_vectors(offset: u32) -> [Option<u32>; 4] {
     match offset {
         SHPR1_OFF => [Some(4), Some(5), Some(6), None],
         SHPR2_OFF => [Some(11), None, None, None],
-        SHPR3_OFF => [None, Some(14), Some(15), None],
+        SHPR3_OFF => [None, None, Some(14), Some(15)],
         _ => [None; 4],
     }
 }
@@ -136,6 +144,13 @@ pub struct Nvic {
     group: u8,
     /// 当前异常号栈（空 = 线程模式；栈顶 = 当前异常）
     exception_stack: Vec<u32>,
+    /// 异常嵌套时被中断现场（线程模式或低优先级异常）的 callee-saved 寄存器
+    /// r4..r11（与 exception_stack 一一对应）。模拟器在块边界停机派发中断时，
+    /// CPU 寄存器 = 块首值，ISR 返回后要"重放该块"，必须还原块首的 r4..r11
+    /// 才能与恢复的 PC（块首）一致——否则重放块读到的是 ISR 打断时刻的
+    /// 块中间值（callee-saved 被 ISR 链改过），会读出错误基址（实测 r10 变
+    /// 4 导致读 0x4C NULL+偏移 fault）。
+    callee_stack: Vec<[u32; 8]>,
     /// 仿真循环停机原因
     stop_reason: StopReason,
     /// 全局状态字（BIT_NVIC_PENDING = 是否有任一挂起中断）：Machine block hook
@@ -167,6 +182,7 @@ impl Nvic {
             sys_pri: [0; 12],
             group: 0,
             exception_stack: Vec::new(),
+            callee_stack: Vec::new(),
             stop_reason: StopReason::None,
             pending_any,
         }
@@ -376,6 +392,17 @@ impl Nvic {
         self.exception_stack.push(vector);
     }
 
+    /// 与 push_exception 配对：保存被中断现场 r4..r11（块首值），
+    /// 供异常返回后"重放被打断块"时还原寄存器初值。
+    pub fn push_callee(&mut self, callee: [u32; 8]) {
+        self.callee_stack.push(callee);
+    }
+
+    /// 与 pop_exception 配对：弹出并返回被中断现场 r4..r11。
+    pub fn pop_callee(&mut self) -> Option<[u32; 8]> {
+        self.callee_stack.pop()
+    }
+
     pub fn pop_exception(&mut self) -> Option<u32> {
         self.exception_stack.pop()
     }
@@ -437,6 +464,38 @@ impl Nvic {
     }
 
     pub fn write(&mut self, offset: u32, size: u32, value: u32) -> Result<(), BusError> {
+        // IPR 区字节写：CMSIS NVIC_SetPriority 用 `NVIC->IP[irq] = prio`
+        //（uint8_t 数组，每个 IRQ 一字节，地址 0xE000E400+irq）做 8 位访问，
+        // 且优先级左移 (8-NVIC_PRIO_BITS)=4 位存【高 4 位】（0x50 = prio 5）。
+        // 32 位对齐检查（off%4==0）会拒绝字节写 → 固件设的优先级静默丢失
+        //（复位 0），与 SysTick 同抢占级 → IRQ 永不抢占（ISR 饿死）。
+        if (NVIC_WIN_START..NVIC_WIN_END).contains(&offset) && size == 1 {
+            let off = offset - NVIC_WIN_START;
+            let ipr_words = NVIC_IRQ_COUNT.div_ceil(4); // 82 → 21 字
+            if (0x300..0x300 + 4 * ipr_words as u32).contains(&off) {
+                let word = (off - 0x300) / 4;
+                let byte = (off - 0x300) % 4;
+                let irq = word * 4 + byte;
+                if irq < NVIC_IRQ_COUNT as u32 {
+                    self.priority[irq as usize] = ((value as u8) >> 4) & 0xF;
+                }
+                return Ok(());
+            }
+        }
+        // SHPR1-3 区字节写：CMSIS NVIC_SetPriority 对系统异常（负数 IRQn）
+        // 走 `SCB->SHPR[n] = prio`（uint8_t 数组，地址 0xE000ED18+n，n=0..11）
+        // 的 8 位访问，同样左移 4 位存【高 4 位】。字节写被拒 → PendSV/SysTick
+        // 优先级残留 0（最高）→ PendSV 能抢占 ISR，context.S 在 ISR 上下文里
+        // 切换（PSP 仍指被中断任务栈）→ 污染任务 TCB（实测 control 的 r10
+        // 被写成 ISR 的 4 → 重放循环读 0x4C fault）。
+        if (SHPR1_OFF..SHPR_END).contains(&offset) && size == 1 {
+            let word_offset = offset & !3;
+            let byte = (offset & 3) as usize;
+            if let Some(vec) = shpr_vectors(word_offset)[byte] {
+                self.sys_pri[(vec - 4) as usize] = ((value as u8) >> 4) & 0xF;
+            }
+            return Ok(());
+        }
         if size != 4 {
             return Err(BusError::NotImplemented);
         }
@@ -634,9 +693,11 @@ mod tests {
         assert_eq!(n.select_pending(false, 0), Some(0));
         n.pop_exception();
 
-        // SHPR3：byte1=PendSV(14)、byte2=SysTick(15) 读写
-        n.write(SHPR3_OFF, 4, (0x07 << 16) | (0x03 << 8)).unwrap();
-        assert_eq!(n.read(SHPR3_OFF, 4).unwrap(), (0x07 << 16) | (0x03 << 8));
+        // SHPR3（CMSIS 字节视图）：byte2=PendSV(14)、byte3=SysTick(15) 读写
+        //（固件 core_cm4.h 的 `SCB->SHP[((IRQn)&0xF)-4]` 把 PendSV 写在
+        //  0xE000ED22、SysTick 写在 0xE000ED23，模拟器按此映射。）
+        n.write(SHPR3_OFF, 4, (0x07 << 24) | (0x03 << 16)).unwrap();
+        assert_eq!(n.read(SHPR3_OFF, 4).unwrap(), (0x07 << 24) | (0x03 << 16));
         // HardFault 固定优先级 -1：即使 SHPR 配置较高也不能被外部抢占
         n.push_exception(3);
         assert_eq!(n.select_pending(false, 0), None);

@@ -95,6 +95,8 @@ const GUSBCFG_PHYSEL: u32 = 1 << 6;
 const GAHBCFG_GINT: u32 = 1 << 0;
 /// GRSTCTL：核心软复位（写 1 触发，仿真器立即完成）
 const GRSTCTL_CSRST: u32 = 1 << 0;
+const GRSTCTL_RXFFLSH: u32 = 1 << 4; // 接收 FIFO flush（仿真立即完成）
+const GRSTCTL_TXFFLSH: u32 = 1 << 5; // 发送 FIFO flush（仿真立即完成）
 const GRSTCTL_AHBIDL: u32 = 1 << 31;
 /// GINTSTS/GINTMSK（设备模式相关位；SOF/挂起等简化未实现）
 const GINT_RXFLVL: u32 = 1 << 4; // 接收 FIFO 非空
@@ -486,6 +488,12 @@ impl Peripheral for UsbOtg {
                     if self.rx_status.is_empty() {
                         // 接收 FIFO 空 → 清 RXFLVL
                         self.regs[(OFF_GINTSTS >> 2) as usize] &= !GINT_RXFLVL;
+                    } else {
+                        // 状态队列仍有残留（SETUP 注入为 DATA+COMP 两个状态字，
+                        // 固件 ISR 一次 GRXSTSP 读只弹 1 个）→ 保持 RXFLVL 并
+                        // 重新 pulse，让 IRQ67 再次触发处理剩余状态字。
+                        self.set_gint(GINT_RXFLVL);
+                        self.pulse();
                     }
                     if pktsts == PKTSTS_SETUP_COMP {
                         // SETUP 数据已被固件完整读走 → 置 DOEPINT0.STUP + OEPINT
@@ -569,7 +577,13 @@ impl Peripheral for UsbOtg {
                 if value & GRSTCTL_CSRST != 0 {
                     self.regs[(OFF_GRSTCTL >> 2) as usize] = GRSTCTL_AHBIDL;
                 } else {
-                    self.regs[(OFF_GRSTCTL >> 2) as usize] = value;
+                    // 非软复位写（txfflsh/rxfflsh FIFO flush 请求）：硬件在
+                    // flush 完成后自动清 txfflsh(bit5)/rxfflsh(bit4)，此处模拟
+                    // 立即完成，否则固件 FlushTxFifo/FlushRxFifo 的
+                    // `do { } while (txfflsh)` 循环要空转 200000 次拖死 ISR
+                    //（实测 USB ISR 卡在 0x08010228 未返回 → 后续 SETUP 不处理）。
+                    let flushed = value & !(GRSTCTL_TXFFLSH | GRSTCTL_RXFFLSH);
+                    self.regs[(OFF_GRSTCTL >> 2) as usize] = flushed;
                 }
                 Ok(())
             }
