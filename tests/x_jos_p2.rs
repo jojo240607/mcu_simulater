@@ -5,15 +5,15 @@
 //! 0xED4A 的合法条件分支因 env 残留 IT 状态被判 unallocated。
 //! 通过判据：READY 达成 && 全程无 INSN_INVALID && 执行越过 0xED4A（code hook 观察到
 //! pc >= 0xED4C）。风暴护栏（Machine::run 单调用迭代上限）保证本探针必然返回/可终止。
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 
 #[test]
 fn p2() {
-    let elf = Path::new(r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf");
+    let elf = artifact::joc_base_elf();
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     m.load_elf(&elf).unwrap();

@@ -1,21 +1,18 @@
 //! 第二段验收：icount 节拍下，应用分区周期任务能否真正被周期唤醒并打出
 //! `hb seq=`（flyctrl）/ `alive seq=`（demo-app）心跳；同时应无 [SCHED_ASSERT]。
 //! （PendSV 高密度风暴修复后该链路已打通，见 CONTRIBUTING-run.md §二.4）
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
-
-const SYS: &str = r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
-const APP: &str = r"/home/ubuntu/work/joc-rtos-app-sdk/app.bin";
 
 #[test]
 fn hb_periodic() {
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
-    m.load_elf(&Path::new(SYS)).unwrap();
-    m.load_app_partition(&Path::new(APP)).unwrap();
+    m.load_elf(&artifact::joc_base_elf()).unwrap();
+    m.load_app_partition(&artifact::sdk_app_bin()).unwrap();
     m.reset().unwrap();
 
     let inv = Arc::new(AtomicBool::new(false));

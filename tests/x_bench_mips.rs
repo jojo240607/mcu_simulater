@@ -3,21 +3,18 @@
 //! 口径：退役指令数按 Thumb 字节计数（≈2 字节/指令）→ MIPS = Δretired/2/1e6/墙钟秒。
 //! 跑真实负载（固件启动 + 用例调度），不含任何测试断言。
 
-use std::path::Path;
 use std::time::Instant;
 
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
-
-const SYS: &str = "/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
-const APP: &str = "/home/ubuntu/work/joc-drvtest-app/app.bin";
 
 #[test]
 #[ignore]
 fn flight_controller_throughput() {
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
-    m.load_elf(Path::new(SYS)).unwrap();
-    m.load_app_partition(Path::new(APP)).unwrap();
+    m.load_elf(&artifact::joc_base_elf()).unwrap();
+    m.load_app_partition(&artifact::drvtest_app_bin()).unwrap();
     m.reset().unwrap();
 
     // 预热（跳过启动峰值：复位/内存清零段）
@@ -52,7 +49,7 @@ fn flight_controller_throughput() {
 fn kernel_only_throughput() {
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
-    m.load_elf(Path::new(SYS)).unwrap();
+    m.load_elf(&artifact::joc_base_elf()).unwrap();
     m.reset().unwrap();
 
     for _ in 0..50 {

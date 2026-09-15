@@ -10,16 +10,16 @@
 //! 断言到 hb：周期心跳依赖「任务睡眠后 SysTick 唤醒推进」——该能力随
 //! PendSV 高密度风暴修复（joc-base rtos_yield 空切防护 + 本仓库 run() 预算递减）
 //! 已打通，故 hb 从加分项升级为必需判据（回归守卫）。
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 
 #[test]
 fn app_partition_boot() {
-    let elf = Path::new(r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf");
-    let app = Path::new(r"/home/ubuntu/work/joc-rtos-app-sdk/app.bin");
+    let elf = artifact::joc_base_elf();
+    let app = artifact::sdk_app_bin();
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     m.load_elf(&elf).unwrap();

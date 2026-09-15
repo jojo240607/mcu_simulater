@@ -16,7 +16,9 @@
 //! - [`trace`]：总线事务嗅探器（调试平台 P0-1）
 //! - [`telemetry`]：遥测时间线导出（调试平台 P2-1）
 //! - [`checkpoint`]：快照/恢复（调试平台 P2-2）
+//! - [`artifact`]：联调产物路径解析（消除机器硬编码路径）
 
+pub mod artifact;
 pub mod bus;
 pub mod checkpoint;
 pub mod config;

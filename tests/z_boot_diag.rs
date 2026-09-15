@@ -1,8 +1,6 @@
 //! 临时诊断：SYS-only boot 是否卡在 usb0 open（定位 HIL 联调 boot 卡点）。
-use std::path::Path;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
-
-const SYS: &str = "/home/ubuntu/work/joc-base/build_hil/stm32f407_minimal.elf";
 
 fn dump(m: &Machine, label: &str) {
     let out = m.console.lock().unwrap().output().to_vec();
@@ -16,7 +14,7 @@ fn dump(m: &Machine, label: &str) {
 fn boot_diag_sys_only() {
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
-    m.load_elf(Path::new(SYS)).unwrap();
+    m.load_elf(&artifact::joc_base_elf()).unwrap();
     m.reset().unwrap();
     for i in 0..30u32 {
         let r = m.run(1_000_000);

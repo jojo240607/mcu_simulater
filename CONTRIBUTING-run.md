@@ -10,7 +10,7 @@
 Windows PowerShell（必须先设 libclang；跑测试务必 `--release`，debug 约 2–3 MIPS 太慢）：
 
 ```powershell
-cd D:\project\mcu\oop\mcu_simulater
+cd <你的 mcu_simulater 目录>   # fc-umbrella 壳工程内：mcu_simulater/
 $env:LIBCLANG_PATH = "D:\soft\llvm\bin"
 
 # 全量 / 单个
@@ -20,7 +20,9 @@ cargo test --release --offline --test x_drvtest      # 系统 + drvtest app 分�
 cargo test --release --offline --test x_jos_app      # 系统 + joc-app(flyctrl) → 任务拉起（当前到首轮）
 ```
 
-把任意测试的 `load_elf(&Path)`（+`load_app_partition(&app.bin)`）路径换成你自己的固件即可；
+固件/应用产物路径由 `mcu_simulater::artifact` 解析（环境变量 `JOC_BASE_ELF` /
+`JOC_APP_FLYCTRL` / `JOC_APP_DRVTEST` / `JOC_APP_SDK` → 壳工程规范布局 →
+历史开发机路径兜底）；一键联调 `scripts/integrate.sh` 会先构建并导出这些变量。
 控制台输出在 `m.console.lock().output()`。
 
 要“交互式看串口/发命令”：`src/bin/repl.rs`（见下 REPL 段）。

@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use unicorn_engine::RegisterARM;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 use mcu_simulater::peripheral::vperiph::data_source::StaticImu;
 use mcu_simulater::peripheral::vperiph::esc::{Esc, EscConfig, EscMotor};
@@ -23,8 +24,8 @@ use mcu_simulater::peripheral::vperiph::spi::{Bmi088, Pwm3901, SpiFlash, StaticF
 
 #[test]
 fn drvtest_all_drivers_pass() {
-    let elf = Path::new(r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf");
-    let app = Path::new(r"/home/ubuntu/work/joc-drvtest-app/app.bin");
+    let elf = artifact::joc_base_elf();
+    let app = artifact::drvtest_app_bin();
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     m.load_elf(&elf).unwrap();

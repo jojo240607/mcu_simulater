@@ -1,19 +1,16 @@
 //! 校准判据：量"正常启动段（DRVTEST REPORT 之前，非风暴）里每 SysTick 平均退休指令数”。
 //! 供对齐 QEMU 周期口径（真机 vs 每块×3 幻数）。(只读诊断探针)
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
-
-const SYS: &str = r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
-const APP: &str = r"/home/ubuntu/work/joc-drvtest-app/app.bin";
 
 #[test]
 fn sys_retire_calib() {
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
-    m.load_elf(&Path::new(SYS)).unwrap();
-    m.load_app_partition(&Path::new(APP)).unwrap();
+    m.load_elf(&artifact::joc_base_elf()).unwrap();
+    m.load_app_partition(&artifact::drvtest_app_bin()).unwrap();
     m.reset().unwrap();
 
     // 全局每指令计数器（code hook）。仅用于校准，运行较短段可接受。

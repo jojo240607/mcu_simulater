@@ -30,10 +30,8 @@ use fly_sim_core::sim::SimLoop;
 use fly_sim_hil::hil_link::{HilLink, HilPort};
 use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::vehicle::{ActuatorCmd, ImuSample};
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
-
-const SYS: &str = "/home/ubuntu/work/joc-base/build_hil/stm32f407_minimal.elf";
-const APP: &str = "/home/ubuntu/work/flyctrl/app.bin";
 
 /// 虚拟 USB-CDC 口（HilPort 后端）：EP1 OUT = PC→MCU 上行，EP1 IN = MCU→PC 下行。
 /// 与固件 usb0（CDC 数据端点 0x81/0x01）一致。
@@ -96,8 +94,8 @@ fn usb_enumerate(m: &Arc<Mutex<Machine>>) {
 #[test]
 fn hil_mcusim_closed_loop() {
     init_log();
-    let sys = Path::new(SYS);
-    let app = Path::new(APP);
+    let sys = artifact::joc_base_elf();
+    let app = artifact::flyctrl_app_bin();
     assert!(sys.exists(), "minimal elf 缺失：先 cd joc-base && cmake -S . -B build_hil -DMCU_SIM=ON -DRTOS_SELFTEST=OFF && cmake --build build_hil");
     assert!(app.exists(), "flyctrl-app 缺失：先 cd flyctrl && python3 build_app.py --features hil");
 

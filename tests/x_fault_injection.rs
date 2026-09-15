@@ -17,6 +17,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 
 /// 读取从设备成功读计数（i2c1: 0=mpu6050, 1=bmp280, 2=qmc5883）。
@@ -28,7 +29,7 @@ fn i2c1_read_counts(m: &Machine) -> (u64, u64, u64) {
 }
 
 fn setup_with_nack(nack_mpu: bool) -> (Machine, Arc<AtomicBool>, Arc<AtomicU32>) {
-    let elf = Path::new(r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf");
+    let elf = artifact::joc_base_elf();
     let app = Path::new(r"/tmp/flyctrl_real.bin");
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();

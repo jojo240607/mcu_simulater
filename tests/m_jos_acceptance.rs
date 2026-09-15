@@ -1,11 +1,11 @@
 //! jOS 自研 RTOS 验收测试：加载 joc-base 发布的 jOS 固件并在本模拟器中运行。
 //!
-//! 固件位于 d:\project\mcu\oop\joc-base\build_rel\stm32f407_minimal.elf
-//! （RTOS_SELFTEST=OFF 发布版，USART1@115200 为控制台，TX 走 DMA2_Stream7_CH4）。
+//! 固件路径经 `mcu_simulater::artifact::joc_base_elf()` 解析（环境变量
+//! `JOC_BASE_ELF` / 壳工程规范布局 / 历史开发机路径兜底）；
+//! 构建见 docs/integration.md §0（RTOS_SELFTEST=OFF 发布版，
+//! USART1@115200 为控制台，TX 走 DMA2_Stream7_CH4）。
 //!
 //! 目标：观察 jOS 能否启动到控制台（打印 jOS RTOS ready / READY. Commands: ...）。
-
-use std::path::Path;
 
 use object::Object;
 use object::ObjectSymbol;
@@ -13,11 +13,14 @@ use unicorn_engine::RegisterARM;
 
 use mcu_simulater::machine::Machine;
 
-const JOS_ELF: &str = r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
+/// joc-base minimal ELF（jOS 固件），路径解析见 `mcu_simulater::artifact`。
+fn jos_elf() -> std::path::PathBuf {
+    mcu_simulater::artifact::joc_base_elf()
+}
 
 fn load_jos() -> Machine {
-    let elf = Path::new(JOS_ELF);
-    assert!(elf.exists(), "jOS 固件未编译：{JOS_ELF}");
+    let elf = jos_elf();
+    assert!(elf.exists(), "jOS 固件未编译：{}", elf.display());
 
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
@@ -174,7 +177,7 @@ fn m_jos_board_init_trace() {
     let mut m = load_jos();
 
     // 从 ELF 动态解析 release build 符号地址
-    let elf_data = std::fs::read(JOS_ELF).unwrap();
+    let elf_data = std::fs::read(jos_elf()).unwrap();
     let elf = object::read::elf::ElfFile32::<object::Endianness>::parse(elf_data.as_slice()).unwrap();
 
     fn lookup<Elf: object::read::elf::FileHeader>(
@@ -328,7 +331,7 @@ fn m_jos_board_init_trace() {
 fn m_jos_malloc_loop_trace() {
     let mut m = load_jos();
 
-    let elf_data = std::fs::read(JOS_ELF).unwrap();
+    let elf_data = std::fs::read(jos_elf()).unwrap();
     let elf = object::read::elf::ElfFile32::<object::Endianness>::parse(elf_data.as_slice()).unwrap();
 
     fn lookup<Elf: object::read::elf::FileHeader>(

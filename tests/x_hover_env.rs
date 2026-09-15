@@ -32,11 +32,11 @@ use fly_sim_core::sim::SimLoop;
 use fly_sim_core::wind::{WindConfig, WindField};
 use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::vehicle::ActuatorCmd;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 use unicorn_engine::RegisterARM;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
-const SYS: &str = "/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
 const APP_REAL: &str = "/tmp/flyctrl_clean.bin";
 
 // TIM 基址（固件 pwm0..3 = TIM3/TIM2/TIM1/TIM4 CH1）
@@ -102,7 +102,7 @@ fn settle_ekf_before_arm(m: &Arc<Mutex<Machine>>) -> f32 {
 #[test]
 fn hover_60s_env() {
     init_log();
-    let sys = Path::new(SYS);
+    let sys = artifact::joc_base_elf();
     let app = Path::new(APP_REAL);
     assert!(sys.exists(), "minimal elf 缺失");
     assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin");

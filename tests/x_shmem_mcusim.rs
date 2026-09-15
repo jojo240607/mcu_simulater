@@ -21,10 +21,8 @@ use fly_sim_core::sensor::SensorConfig;
 use fly_sim_core::sim::SimLoop;
 use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::vehicle::{ActuatorCmd, ImuSample};
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
-
-const SYS: &str = "/home/ubuntu/work/joc-base/build_hil/stm32f407_minimal.elf";
-const APP: &str = "/home/ubuntu/work/flyctrl/app.bin";
 
 const SHM: u64 = 0x2002_0000;
 const MAGIC: u32 = 0x4849_4C31;
@@ -89,8 +87,8 @@ fn hover_imu() -> ImuSample {
 #[test]
 fn shmem_closed_loop() {
     init_log();
-    let sys = Path::new(SYS);
-    let app = Path::new(APP);
+    let sys = artifact::joc_base_elf();
+    let app = artifact::flyctrl_app_bin();
     assert!(sys.exists(), "minimal elf 缺失：先 cmake --build build_hil");
     assert!(app.exists(), "flyctrl-app 缺失：先 build_app.py --features hil");
 

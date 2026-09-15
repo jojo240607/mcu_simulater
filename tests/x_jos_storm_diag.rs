@@ -2,8 +2,8 @@
 //! 采样每步被抢占进入的向量分布、被抢 PC、SysTick/PendSV 挂起与异常栈。
 //! 用于归因"任务睡下后由 SysTick 周期唤醒推进停滞"是哪个环节断了
 //! (SysTick 没触发 / handler 没推进 tick / PendSV 没切回 / 或其它中断霸占)。
-use std::path::Path;
 use unicorn_engine::RegisterARM;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 
 fn vecname(v: u32) -> String {
@@ -28,8 +28,8 @@ fn vecname(v: u32) -> String {
 
 #[test]
 fn storm_diag() {
-    let elf = Path::new(r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf");
-    let app = Path::new(r"/home/ubuntu/work/joc-rtos-app-sdk/app.bin");
+    let elf = artifact::joc_base_elf();
+    let app = artifact::sdk_app_bin();
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     m.load_elf(&elf).unwrap();

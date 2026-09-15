@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 use mcu_simulater::peripheral::vperiph::data_source::{StaticSbus, StaticGps};
 use mcu_simulater::peripheral::vperiph::uart::Sbus;
@@ -17,7 +18,7 @@ use mcu_simulater::peripheral::vperiph::uart::NmeaGps;
 
 #[test]
 fn unlock_and_fly_over_virtual_peripherals() {
-    let elf = Path::new(r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf");
+    let elf = artifact::joc_base_elf();
     let app = Path::new(r"/tmp/flyctrl_real.bin");
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();

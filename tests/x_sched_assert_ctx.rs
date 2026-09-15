@@ -1,14 +1,12 @@
 //! 第一次 ready_add 双挂出现时，把 g_sched_bad_tcb(其 sched_next/prev !=0)的字段、
 //! g_sleep_head、以及被错误残留的链归属 dump 出来，判断它是"误以为在睡眠链"还是
 //! "重复挂在就绪链"。
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 
-const SYS: &str = r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
-const APP: &str = r"/home/ubuntu/work/joc-drvtest-app/app.bin";
 const CCM_POOL_LO: u32 = 0x1000_6000;
 const CCM_POOL_HI: u32 = 0x1000_8b00;
 
@@ -56,8 +54,8 @@ fn inpool(p: u32) -> bool {
 fn first_double_add_snapshot() {
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
-    m.load_elf(&Path::new(SYS)).unwrap();
-    m.load_app_partition(&Path::new(APP)).unwrap();
+    m.load_elf(&artifact::joc_base_elf()).unwrap();
+    m.load_app_partition(&artifact::drvtest_app_bin()).unwrap();
     m.reset().unwrap();
 
     // 每次进入 rtos_sched_assert_fail(0x800e644) 置 marks，供判定"首次"位置

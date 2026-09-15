@@ -1,11 +1,11 @@
 //! jOS release 固件启动验收：分步跑到控制台 READY（含 mounting app layer）。
-use std::path::Path;
 use unicorn_engine::RegisterARM;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 
 #[test]
 fn plain_boot() {
-    let elf = Path::new(r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf");
+    let elf = artifact::joc_base_elf();
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     m.load_elf(&elf).unwrap();

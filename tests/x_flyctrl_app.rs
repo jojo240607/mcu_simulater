@@ -8,16 +8,16 @@
 //!   tasks    = 任一 "task started"       （ctrl/sensor/telem/uplink 业务任务被调度）
 //!   hb       = "hb seq="                 （control 4ms 周期、每 250 拍一条心跳 ≈ 1s）
 //! 断言到 hb：周期心跳依赖 SysTick 唤醒推进（PendSV 风暴修复后已打通）。
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
+use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 
 #[test]
 fn flyctrl_app_boot() {
-    let elf = Path::new(r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf");
-    let app = Path::new(r"/home/ubuntu/work/flyctrl/app.bin");
+    let elf = artifact::joc_base_elf();
+    let app = artifact::flyctrl_app_bin();
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     m.load_elf(&elf).unwrap();

@@ -8,7 +8,6 @@
 //!   uart_create            = 0x0800_3BB4
 
 use std::io::Write;
-use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -16,8 +15,15 @@ use unicorn_engine::RegisterARM;
 
 use mcu_simulater::machine::Machine;
 
-const JOS_ELF: &str = r"/home/ubuntu/work/joc-base/build_rel/stm32f407_minimal.elf";
-const OUT: &str = r"/home/ubuntu/work/joc-base/build_rel/jos_diag_out.txt";
+/// joc-base minimal ELF（jOS 固件），路径解析见 `mcu_simulater::artifact`。
+fn jos_elf() -> std::path::PathBuf {
+    mcu_simulater::artifact::joc_base_elf()
+}
+
+/// 诊断输出文件：写到所用 ELF 同目录（历史为 build_rel/jos_diag_out.txt）。
+fn diag_out() -> std::path::PathBuf {
+    mcu_simulater::artifact::joc_base_build_dir().join("jos_diag_out.txt")
+}
 
 const ADDR_SBRK: u64 = 0x0800_151C; // _sbrk 本体入口: R0 = incr
 const ADDR_SBRK_FAIL: u64 = 0x0800_1542; // _sbrk 失败返回点 (R0=0xFFFFFFFF)
@@ -50,8 +56,8 @@ const ADDR_UART_HAL_FAIL: u64 = 0x0800_3C1A;
 const ADDR_BOARD_INIT_CBZ: u64 = 0x0800_9B2C;
 
 fn load_jos() -> Machine {
-    let elf = Path::new(JOS_ELF);
-    assert!(elf.exists(), "jOS 固件未编译：{JOS_ELF}");
+    let elf = jos_elf();
+    assert!(elf.exists(), "jOS 固件未编译：{}", elf.display());
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     m.load_elf(&elf).unwrap();
@@ -62,7 +68,7 @@ fn load_jos() -> Machine {
 #[test]
 fn diag_sbrk_flood() {
     let mut m = load_jos();
-    let f = Arc::new(std::sync::Mutex::new(std::fs::File::create(OUT).unwrap()));
+    let f = Arc::new(std::sync::Mutex::new(std::fs::File::create(diag_out()).unwrap()));
 
     // 计数
     let n_sbrk = Arc::new(AtomicU32::new(0));
@@ -904,5 +910,5 @@ fn diag_sbrk_flood() {
 
     // 显式 flush 确保文件完整落盘
     f.lock().unwrap().flush().ok();
-    println!("diag 完成 -> {OUT}");
+    println!("diag 完成 -> {}", diag_out().display());
 }

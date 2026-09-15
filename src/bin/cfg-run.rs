@@ -1,11 +1,19 @@
 //! 配置文件驱动的运行入口：把加载固件等写进一个 `.cfg`，一条命令直达，流式打印串口。
 //!
 //! 格式（极简、无第三方依赖；`#` 注释，`key = value`，可带引号）例 `run.cfg`：
-//!   elf       = D:\project\mcu\oop\joc-base\build_rel\stm32f407_minimal.elf
-//!   app       = /home/ubuntu/work/joc-drvtest-app/app.bin   ; 可选
+//!   elf       = ../joc-base/build_hil/stm32f407_minimal.elf
+//!   app       = ../joc-rtos-app-sdk/app.bin   ; 可选
 //!   n         = 400000      ; 每步预算
 //!   max_steps = 0           ; 0=直到 quit/EOF
 //!   rx_port   = 1           ; stdin 注入用的 USART 口（尽力）
+//!
+//! 路径解析规则（elf/app）：
+//!   - 以 `${VAR}` / `$VAR` 开头 → 取环境变量值（如 `elf = ${JOC_BASE_ELF}`，
+//!     由 scripts/integrate.sh 导出；与 tests/x_*.rs 的 `mcu_simulater::artifact`
+//!     同源约定）；
+//!   - 相对路径 → 先按当前目录解析，不存在再相对 `.cfg` 所在目录
+//!     （故 `../joc-base/...` 在 fc-umbrella 壳工程布局下直接可用）；
+//!   - 绝对路径 → 原样使用。
 //!
 //! 用法：cargo run --release --bin cfg-run -- --cfg run.cfg
 //!   或　.\run.ps1 [-cfg run.cfg]
@@ -64,6 +72,17 @@ fn main() {
     let rx_port: u8 = cfg.get("rx_port").and_then(|s| s.parse().ok()).unwrap_or(1);
 
     let resolve = |p: &str| -> PathBuf {
+        // 支持 `${VAR}` / `$VAR` 环境变量展开（与 tests/x_*.rs 的 artifact 同源约定）。
+        let p = if let Some(v) = p
+            .strip_prefix("${")
+            .and_then(|s| s.strip_suffix('}'))
+            .or_else(|| p.strip_prefix('$'))
+        {
+            std::env::var(v)
+                .unwrap_or_else(|_| panic!("cfg 引用了未设置的环境变量 ${v}（见 {v} 说明）"))
+        } else {
+            p.to_string()
+        };
         let b = PathBuf::from(p);
         if b.exists() || b.is_absolute() {
             b
