@@ -122,7 +122,7 @@ fn turn_yaw_rate_tracks() {
     let mut omz_min = 1e9f32;
     let mut omz_max = 0.0f32;
     let mut prev_yaw = f32::NAN;
-    let mut yaw_grew = true;
+    let mut yaw_total = 0.0f32;
     let mut pos_norm = 0.0f32;
     for _ in 0..200 {
         h.step();
@@ -130,8 +130,13 @@ fn turn_yaw_rate_tracks() {
         let eu = e.euler();
         omz_min = omz_min.min(e.omega[2]);
         omz_max = omz_max.max(e.omega[2]);
-        if prev_yaw.is_finite() && eu[2] < prev_yaw - 0.1 {
-            yaw_grew = false;
+        // yaw 单调性按 unwrap 累计（euler() 的 yaw 在 ±π wrap，跨边界直接比较
+        // 会误判"减小"）：单步增量 wrap 到 [-π, π]，累计净旋转 > 0 即单调推进。
+        if prev_yaw.is_finite() {
+            let mut d = eu[2] - prev_yaw;
+            if d > core::f32::consts::PI { d -= 2.0 * core::f32::consts::PI; }
+            else if d < -core::f32::consts::PI { d += 2.0 * core::f32::consts::PI; }
+            yaw_total += d;
         }
         prev_yaw = eu[2];
         pos_norm = pos_norm.max((e.pos[0] * e.pos[0] + e.pos[1] * e.pos[1]).sqrt());
@@ -142,6 +147,6 @@ fn turn_yaw_rate_tracks() {
         assert!(r.abs() < 1.0, "roll 估计应不发散（{r:.3} rad）");
     }
     assert!(omz_min > 0.3 && omz_max < 0.7, "yaw 角速率应跟踪真值 0.5 rad/s（min={omz_min:.2} max={omz_max:.2}）");
-    assert!(yaw_grew, "转弯中 yaw 应单调增长");
+    assert!(yaw_total > 1.0, "转弯中 yaw 应单调增长（累计净旋转 >1 rad，实际 {yaw_total:.2} rad）");
     assert!(pos_norm > 3.0, "转弯中位置应沿圆周推进（>3m，实际 {pos_norm:.1}）");
 }

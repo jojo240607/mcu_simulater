@@ -88,8 +88,20 @@ impl VirtualClock {
 ///
 /// `dt = Δretired / VIRTUAL_INSNS_PER_SEC`（由 `machine::Machine::run` 使用）。
 ///
-/// **唯一权威常量**：SBUS/GPS 等 UART/I2C 虚拟从设备的推流节拍均以它为基准，
-/// 与 CPU 侧虚拟时钟（访客字节 = 周期）**独立校准**，二者比值 ~0.65-0.76，
-/// 属已知可接受偏差（见本模块头注释）。调整本值会改变所有推流外设的
-/// 相对节拍，须同步复核 `x_vperiph_mcusim` / `x_hil_mcusim` 闭环测试。
-pub const VIRTUAL_INSNS_PER_SEC: f32 = 30.0e6;
+/// **唯一权威常量**：SBUS/GPS 等 UART/I2C 虚拟从设备的推流节拍均以它为基准。
+///
+/// # 2026-09 校准（虚拟时钟保真度）
+///
+/// `retired_count()` 实为 **TB 字节数**（block hook `fetch_add(size)`，Thumb
+/// 下 ≈2×指令数）。旧值 30e6 是"指令数"口径残留（size 改字节后未更新），
+/// 导致**场景/推流时间比 CPU 侧虚拟时钟（SysTick）慢 5.7 倍**：
+/// - 实测校准：sensor 任务 msleep(2ms) 周期 ↔ 每拍 344K 字节 →
+///   172M 字节/虚拟秒（= ~86M 指令/虚拟秒，与真实 MCU ~100-150MIPS 同量级）；
+/// - 校准前控制拍速 46.7Hz（场景口径）vs 名义 250Hz → EKF 时间积分
+///   比场景慢 ~5.7 倍（虚拟直接模拟实测 yaw 慢 5.4 倍、爬升/巡航动态全滞后）；
+/// - 校准后控制拍速 ≈178Hz（场景口径），yaw 速率与场景真值匹配（±15%）。
+///
+/// 剩余 ~1.4 倍为**固件固有**（EKF 每拍执行超 4ms 预算，真实 MCU 同量级），
+/// 非模拟器时钟失真。调整本值会改变所有推流外设的相对节拍，须同步复核
+/// `x_vperiph_mcusim` / `x_hil_mcusim` 闭环测试。
+pub const VIRTUAL_INSNS_PER_SEC: f32 = 172.0e6;

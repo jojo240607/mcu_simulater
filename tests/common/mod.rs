@@ -16,11 +16,17 @@ use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
 /// 单步虚拟时间（s）：run(STEP_INSNS) ≈ STEP_DT。
 ///
-/// 400K ≈ 13.3ms 虚拟时间：过小的 run 预算（200K）会让固件 u-blox GPS probe
-/// 窗口（300ms）内读到的 NMEA 字节不足 / 推流帧数与固件读节奏失配，fix 建立
-/// 缓慢或失败（对照：400K 时 boot 后 ~10 步即 fix established）。
-pub const STEP_INSNS: usize = 400_000;
-pub const STEP_DT: f32 = STEP_INSNS as f32 / 30.0e6;
+/// 每步执行预算（TB 字节）。2.3M ≈ 13.3ms 场景时间（=固件时间，VIRTUAL=172M
+/// 校准后，见 timing.rs 头注释）。历史教训：400K（2.3ms/步）会让 UART 推流
+/// 字节率过低（33B/run < GPS 帧 131B）→ 固件 NMEA 解析抖动（gps false↔true）、
+/// GPS 位置观测稀疏（实测 baro 阶跃不被吸收、pos 漂移 14m）；2.3M → 191B/run
+/// > 帧长，固件一次 read 收整帧。校准前 400K@30M 也是 13.3ms/步，但两套时钟
+/// 口径不一致（推流 30M vs SysTick 172M），场景时间与固件时间错配 5.7 倍。
+pub const STEP_INSNS: usize = 2_300_000;
+// 场景时间基准跟随全局校准（VIRTUAL_INSNS_PER_SEC=172M 字节/虚拟秒，
+// 与 SysTick 折算一致）。校准后场景时间 = 固件虚拟时间。
+pub const STEP_DT: f32 =
+    STEP_INSNS as f32 / mcu_simulater::sim::timing::VIRTUAL_INSNS_PER_SEC;
 
 /// 固件 EST_STATE 地址（app.elf 符号，布局见 [`EstReadout`]）。
 pub const EST_STATE: u32 = 0x2000_9084;
