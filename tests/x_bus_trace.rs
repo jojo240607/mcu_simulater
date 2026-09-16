@@ -101,7 +101,9 @@ fn i2c_nack_traced() {
     let mut m = machine_with_sensors();
     let trace = Arc::new(Mutex::new(BusTrace::new(256)));
     m.attach_bus_trace(trace.clone());
-    // 故障注入：mpu6050 NACK → 读方向 on_read → None → AF
+    // 故障注入：mpu6050 NACK → 读方向地址阶段无 ACK → AF（matched=false，无数据阶段）。
+    // 语义见 x_fault_injection::midrun_nack：旧"匹配置 ADDR、数据阶段 on_read 才
+    // None→AF"会让固件 POLL 驱动在半开事务上超时、AF 残留卡死后续 0x76 事务。
     assert!(m.inject_i2c_nack(1, 0x68, true), "NACK 注入应命中 mpu6050");
 
     let i2c1 = m.i2c.lock().unwrap()[0].clone();
@@ -113,11 +115,11 @@ fn i2c_nack_traced() {
         i.write(OFF_CR1, 4, CR1_PE | CR1_STOP).unwrap();
     }
     let entries = trace.lock().unwrap().drain();
-    assert!(entries.iter().any(|e| matches!(e.kind, TraceKind::I2cRead { byte: None })),
-        "NACK 应记录 I2cRead{{None}}：\n{}",
+    assert!(entries.iter().any(|e| matches!(e.kind, TraceKind::I2cStart { matched: false, read: true, .. })),
+        "NACK 从设备读方向应在地址阶段即 AF（matched=false）：\n{}",
         entries.iter().map(|e| e.format()).collect::<Vec<_>>().join("\n"));
-    assert!(entries.iter().any(|e| matches!(e.kind, TraceKind::I2cStart { matched: true, .. })),
-        "地址仍应命中（NACK 是数据阶段）");
+    assert!(!entries.iter().any(|e| matches!(e.kind, TraceKind::I2cRead { .. })),
+        "地址阶段 NACK 后不应进入数据阶段（无 I2cRead）");
 }
 
 #[test]

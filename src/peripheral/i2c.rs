@@ -153,6 +153,7 @@ impl I2c {
     }
 
     /// 地址阶段匹配：按 addr7 找从设备（返回索引）。
+
     fn match_slave(&self, addr7: u8) -> Option<usize> {
         self.slaves
             .iter()
@@ -169,6 +170,25 @@ impl I2c {
         self.read_dir = rw == 1;
         if let Some(idx) = self.match_slave(addr7) {
             self.cur_slave = Some(idx);
+            // 故障注入的断线从设备：读方向地址阶段无 ACK → AF（真实硬件语义）。
+            // 此前"匹配置 ADDR、数据阶段 on_read 才返回 None 置 AF"会让固件 POLL
+            // 驱动（i2c_hal_master_read 轮询 RxNE）在半开事务上超时，且 AF 残留
+            // 使后续 0x76（bmp280）数据阶段全停（见 x_fault_injection::midrun_nack）。
+            // 地址阶段即 NACK → 固件读 SR1 判 AF 立即失败返回，总线状态干净。
+            // 注意仅读方向：写方向（唤醒/配置写）保持原语义——real-sensors 固件
+            // 启动探测用 `expect`（写失败直接 panic），写方向 NACK 会触发固件
+            // panic（真实缺陷，见 docs/integration.md 已知问题；收窄以兼容）。
+            if rw == 1 && self.slaves[idx].nack() {
+                self.cur_slave = None; // 无事务：清路由，避免读 SR2 预取残留 on_read
+                self.regs[5] &= !SR1_ADDR;
+                self.regs[5] |= SR1_AF;
+                self.trace_record(crate::trace::TraceKind::I2cStart {
+                    addr7,
+                    read: true,
+                    matched: false,
+                });
+                return;
+            }
             // 通知从设备事务开始（方向）
             self.slaves[idx].on_start(if rw == 1 { I2cDir::Read } else { I2cDir::Write });
             self.regs[5] |= SR1_ADDR; // 地址匹配 → ADDR（读 SR2 清）

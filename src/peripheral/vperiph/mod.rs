@@ -87,6 +87,13 @@ pub trait VirtualI2cSlave: Send + Sync {
         0
     }
 
+    /// 是否处于断线/无应答状态（故障注入）：地址阶段即 NACK（真实硬件无 ACK），
+    /// 而非"匹配后数据阶段才 NACK"——后者的地址阶段 ADDR 会把固件驱动留在
+    /// 半开事务里（POLL 模式卡死后续总线事务，见 x_fault_injection::midrun_nack）。
+    fn nack(&self) -> bool {
+        false
+    }
+
     /// 故障注入：手动 NACK（模拟断线/无响应 → 固件 healthy=false → FDIR 降级）。
     /// 默认无操作；`RegFileSlave` 实现按 `nack` 字段生效。
     fn set_nack(&mut self, _nack: bool) {}
@@ -231,6 +238,10 @@ impl VirtualI2cSlave for RegFileSlave {
 
     fn read_count(&self) -> u64 {
         self.n_reads
+    }
+
+    fn nack(&self) -> bool {
+        self.nack
     }
 
     fn on_read(&mut self) -> Option<u8> {
