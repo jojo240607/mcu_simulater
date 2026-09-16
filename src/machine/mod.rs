@@ -537,11 +537,13 @@ impl Machine {
     /// **一致性不变量**：`FlySimState` 只能在两次 `run()` 之间写入（run 期间冻结），
     /// 见 `FlySimState` 文档与 `docs/virtual_direct_mode.md` §8.1。
     pub fn attach_flysim_sensors(&self, st: std::sync::Arc<std::sync::Mutex<crate::peripheral::vperiph::data_source::FlySimState>>) {
-        use crate::peripheral::vperiph::data_source::{FlySimKind, FlySimSource, StaticMag};
+        use crate::peripheral::vperiph::data_source::{FlySimKind, FlySimSource};
         use crate::peripheral::vperiph::i2c::{bmp280, mpu6050, qmc5883};
         self.register_i2c_slave(1, Box::new(mpu6050(FlySimSource::new(st.clone(), FlySimKind::Imu))));
         self.register_i2c_slave(1, Box::new(bmp280(FlySimSource::new(st.clone(), FlySimKind::Baro))));
-        self.register_i2c_slave(1, Box::new(qmc5883(StaticMag::default())));
+        // 磁力计用 FlySimSource(Mag)：世界系恒定地磁场随姿态旋转到机体（真机模型），
+        // 取代 StaticMag 固定机体磁场（yaw 观测恒定 → 磁锚定拉回航向）。
+        self.register_i2c_slave(1, Box::new(qmc5883(FlySimSource::new(st, FlySimKind::Mag))));
     }
 
     /// [HIL 虚拟外设直通] 用 fly_sim 共享状态装配 UART 推流（gps/sbus）。

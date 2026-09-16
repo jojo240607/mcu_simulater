@@ -450,6 +450,11 @@ pub struct FlySimState {
     pub gps_vel: [f32; 3],
     /// SBUS 通道 0..15（1000..2000；ch3=油门）
     pub rc_ch: [f32; 16],
+    /// 世界系→机体姿态四元数（w,x,y,z）。由场景 write_state 写入，供磁力计
+    /// 模型把**世界系恒定地磁场**旋转到机体（真机磁场世界系恒定、机体测量 =
+    /// R·磁场世界；StaticMag 固定机体磁场不随姿态转 → 固件 yaw 观测错误，
+    /// 磁锚定把 yaw 拉回固定航向，实测转弯 yaw 积分慢 5.5 倍）。
+    pub att: [f32; 4],
 }
 
 /// FlySimSource 的数据角色（决定 value() 解析哪些通道）。
@@ -459,6 +464,7 @@ pub enum FlySimKind {
     Baro,
     Gps,
     Sbus,
+    Mag,
 }
 
 /// 直通注入源：value() 从共享 FlySimState 读取。
@@ -480,6 +486,7 @@ impl SensorModel for FlySimSource {
             FlySimKind::Baro => "flysim_baro",
             FlySimKind::Gps => "flysim_gps",
             FlySimKind::Sbus => "flysim_sbus",
+            FlySimKind::Mag => "flysim_mag",
         }
     }
     fn step(&mut self, _dt: f32) {}
@@ -502,23 +509,15 @@ impl SensorModel for FlySimSource {
                     0.0
                 }
             }
-            FlySimKind::Gps => {
-                use std::sync::atomic::{AtomicU32, Ordering as AOrd};
-                static CNT: AtomicU32 = AtomicU32::new(0);
-                let v = match field {
-                    "lat" => st.gps_lat,
-                    "lon" => st.gps_lon,
-                    "alt" => st.gps_alt,
-                    "fix" => st.gps_fix,
-                    "vel_n" => st.gps_vel[0],
-                    "vel_e" => st.gps_vel[1],
-                    "vel_d" => st.gps_vel[2],
-                    _ => 0.0,
-                };
-                if CNT.fetch_add(1, AOrd::Relaxed) < 30 {
-                    eprintln!("[FlySimGps] value({field}) = {v}");
-                }
-                v
+            FlySimKind::Gps => match field {
+                "lat" => st.gps_lat,
+                "lon" => st.gps_lon,
+                "alt" => st.gps_alt,
+                "fix" => st.gps_fix,
+                "vel_n" => st.gps_vel[0],
+                "vel_e" => st.gps_vel[1],
+                "vel_d" => st.gps_vel[2],
+                _ => 0.0,
             }
             FlySimKind::Sbus => {
                 let idx: usize = field.strip_prefix("ch").and_then(|n| n.parse().ok()).unwrap_or(16);
@@ -526,6 +525,27 @@ impl SensorModel for FlySimSource {
                     st.rc_ch[idx]
                 } else {
                     0.0
+                }
+            }
+            // 磁力计：世界系恒定地磁场（北 0.2G、下 0.4G）随姿态旋转到机体。
+            // 真机磁场方向世界系恒定，机体测量随姿态变化 → yaw 可观测。
+            // （StaticMag 固定机体磁场是错误模型：yaw 观测恒定，磁锚定拉回航向，
+            // 实测转弯 yaw 积分慢 5.5 倍。）
+            FlySimKind::Mag => {
+                let [w, x, y, z] = st.att;
+                let n = (w * w + x * x + y * y + z * z).sqrt();
+                let q = if n > 1e-6 {
+                    [w / n, x / n, y / n, z / n]
+                } else {
+                    [1.0, 0.0, 0.0, 0.0]
+                };
+                let m_world = [0.2f32, 0.0, 0.4];
+                let m_b = rotate_by_quat_conj(&q, m_world);
+                match field {
+                    "mag.x" => m_b[0],
+                    "mag.y" => m_b[1],
+                    "mag.z" => m_b[2],
+                    _ => 0.0,
                 }
             }
         }
@@ -680,4 +700,23 @@ impl SensorModel for SharedStatic {
     fn value(&self, field: &str) -> f32 {
         self.state.lock().unwrap().get(field).copied().unwrap_or(0.0)
     }
+}
+
+/// 用四元数共轭旋转向量（世界→机体；q 为世界→机体姿态 w,x,y,z）。
+fn rotate_by_quat_conj(q: &[f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let (w, x, y, z) = (q[0], q[1], q[2], q[3]);
+    // v' = q^* ⊗ v ⊗ q（共轭 = 逆，单位四元数）
+    // 计算 t = q^* ⊗ v
+    let t = [
+        -x * v[0] - y * v[1] - z * v[2],
+        w * v[0] + y * v[2] - z * v[1],
+        w * v[1] + z * v[0] - x * v[2],
+        w * v[2] + x * v[1] - y * v[0],
+    ];
+    // v' = t ⊗ q（取向量部分）
+    [
+        w * t[1] - t[2] * z + t[3] * y - t[0] * x,
+        w * t[2] + t[1] * z - t[3] * x - t[0] * y,
+        w * t[3] - t[1] * y + t[2] * x - t[0] * z,
+    ]
 }

@@ -392,6 +392,15 @@ impl EnvScenario {
         }
         st.imu_acc = accel;
         st.imu_gyr = gyro;
+        // 姿态四元数（w,x,y,z，ZYX 欧拉 → 四元数；供磁力计模型旋转世界地磁场）
+        let (sr2, cr2) = (roll * 0.5).sin_cos();
+        let (sp2, cp2) = (pitch * 0.5).sin_cos();
+        let (sy2, cy2) = (yaw * 0.5).sin_cos();
+        let qw = cr2 * cp2 * cy2 + sr2 * sp2 * sy2;
+        let qx = sr2 * cp2 * cy2 - cr2 * sp2 * sy2;
+        let qy = cr2 * sp2 * cy2 + sr2 * cp2 * sy2;
+        let qz = cr2 * cp2 * sy2 - sr2 * sp2 * cy2;
+        st.att = [qw, qx, qy, qz];
 
         // ---- 气压计（观测高度 = 参考高度 + 相对位移 + 漂移 + 阶跃 + 噪声；冻结保持最后值） ----
         let alt_up = self.alt_ref - tr.pos[2]; // NED pos[2] 向下 → 高度 = 参考 - pos[2]
@@ -459,15 +468,18 @@ impl EnvScenario {
         // 基础通道：ch3=油门中位（1550 微调偏置）、ch4=解锁（1500 未解锁）。
         let mut ch = [1500.0; 16];
         ch[3] = 1550.0 + self.perturb.rc_throttle_bias;
-        // RC 故障
+        // RC 故障：失联（RcDrop）优先于卡滞（RcStuck）——失联时接收机无输出，
+        // 卡滞值不适用（真实语义；曾先置 1500 再被 RcStuck 覆盖 → 掉链后解锁位
+        // 不恢复，虚拟外设实测 rc_drop_disarms 失败）。
         if self.t < self.fstate.rc_drop_until {
             for c in ch.iter_mut() {
                 *c = 1500.0;
             }
-        }
-        for (c, raw, until) in self.rc_stuck.iter() {
-            if self.t < *until {
-                ch[*c] = *raw;
+        } else {
+            for (c, raw, until) in self.rc_stuck.iter() {
+                if self.t < *until {
+                    ch[*c] = *raw;
+                }
             }
         }
         self.rc = ch;

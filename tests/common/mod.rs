@@ -191,8 +191,12 @@ impl EnvHarness {
         for k in 0..3 {
             e.accel_bias[k] = rf(&mut self.m, EST_STATE + 60 + 4 * k as u32);
         }
-        e.health = rd(&mut self.m, EST_STATE + 72);
-        e.armed = self.m.cpu.mem_read((EST_STATE + 76) as u64, 1).ok().map(|b| b[0]).unwrap_or(0);
+        // 【实测布局】EstState(repr(C)) = VehicleState(72B) + Health + bool(armed)，
+        // 但编译后 Health 实际占 1B（mem 实证：hb 行 armed=true 时 EST+73=1、EST+76=0；
+        // repr(C) enum 未标判别值在 ARM 上编译为 1B，而非 C int 4B）。
+        // → health@72(1B)、armed@73(1B)。
+        e.health = self.m.cpu.mem_read((EST_STATE + 72) as u64, 1).ok().map(|b| b[0] as u32).unwrap_or(0);
+        e.armed = self.m.cpu.mem_read((EST_STATE + 73) as u64, 1).ok().map(|b| b[0]).unwrap_or(0);
         e
     }
 

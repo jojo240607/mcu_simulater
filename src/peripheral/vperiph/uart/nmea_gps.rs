@@ -79,6 +79,9 @@ impl NmeaGps {
     /// 速度来源：数据源的 `vel_n`/`vel_e`（NED 北/东向 m/s）。固件 `GpsUblox`
     /// 解析 RMC 得 Doppler 速度 → `PosSample::with_vel` → EKF `update_vel`，
     /// 约束水平速度估计（无此约束时长时间悬停水平速度纯积分漂移失稳）。
+    /// status 随 fix：fix=0（失锁）→ 'V'（Void），与真实 NMEA 一致。曾硬编码 'A'
+    /// → GpsDrop 时 GGA quality=0 置无效、但 RMC 仍有效，固件 drain 取最后一行
+    /// 为有效 → gps 恒 Some → FDIR 永不降级（虚拟外设实测 gps_drop 测试不触发）。
     fn build_rmc(&self, v: &dyn SensorModel) -> Vec<u8> {
         let lat = v.value("lat"); // 度（北正）
         let lon = v.value("lon"); // 度（东正）
@@ -95,9 +98,11 @@ impl NmeaGps {
         // NED 北/东速度 → 地速（节）+ 航向（真北顺时针）
         let speed_knots = (vn * vn + ve * ve).sqrt() * 1.943_84;
         let course_deg = ve.atan2(vn).to_degrees().rem_euclid(360.0);
+        let fix = v.value("fix");
+        let status = if fix > 0.0 { 'A' } else { 'V' };
         let body = format!(
-            "GNRMC,{:06},A,{:02}{:07.4},{},{:03}{:07.4},{},{:.1},{:.1},010100,,,D",
-            120000u32,
+            "GNRMC,{:06},{},{:02}{:07.4},{},{:03}{:07.4},{},{:.1},{:.1},010100,,,D",
+            120000u32, status,
             lat_deg,
             lat_min,
             ns,
