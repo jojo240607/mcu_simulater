@@ -455,6 +455,9 @@ pub struct FlySimState {
     /// R·磁场世界；StaticMag 固定机体磁场不随姿态转 → 固件 yaw 观测错误，
     /// 磁锚定把 yaw 拉回固定航向，实测转弯 yaw 积分慢 5.5 倍）。
     pub att: [f32; 4],
+    /// 磁力计机体系输出覆盖（G）。`Some` 时优先于 att 推导（场景故障注入：
+    /// 硬铁偏置/冻结），`None` 时由 `FlySimKind::Mag` 按 att 推导真机模型。
+    pub mag: Option<[f32; 3]>,
 }
 
 /// FlySimSource 的数据角色（决定 value() 解析哪些通道）。
@@ -539,8 +542,10 @@ impl SensorModel for FlySimSource {
                 } else {
                     [1.0, 0.0, 0.0, 0.0]
                 };
-                let m_world = [0.2f32, 0.0, 0.4];
-                let m_b = rotate_by_quat_conj(&q, m_world);
+                let m_b = match st.mag {
+                    Some(m) => m, // 场景故障注入覆盖（硬铁偏置/冻结）
+                    None => rotate_by_quat_conj(&q, [0.2f32, 0.0, 0.4]),
+                };
                 match field {
                     "mag.x" => m_b[0],
                     "mag.y" => m_b[1],
@@ -703,7 +708,7 @@ impl SensorModel for SharedStatic {
 }
 
 /// 用四元数共轭旋转向量（世界→机体；q 为世界→机体姿态 w,x,y,z）。
-fn rotate_by_quat_conj(q: &[f32; 4], v: [f32; 3]) -> [f32; 3] {
+pub(crate) fn rotate_by_quat_conj(q: &[f32; 4], v: [f32; 3]) -> [f32; 3] {
     let (w, x, y, z) = (q[0], q[1], q[2], q[3]);
     // v' = q^* ⊗ v ⊗ q（共轭 = 逆，单位四元数）
     // 计算 t = q^* ⊗ v

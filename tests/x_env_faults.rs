@@ -170,3 +170,64 @@ fn baro_freeze_no_false_positive() {
         assert!(e.health == 0, "气压计冻结（有读数）不应触发 FDIR，health={}", e.health);
     }
 }
+
+#[test]
+fn mag_disturb_keeps_attitude() {
+    // 磁干扰（硬铁偏置与地磁场同量级 [0.2,0.2,0.1]G）：数据持续"正常"（有读数）
+    // → FDIR 不误报（mag 冻结/异常按可用性判据不置位）；EKF 磁观测被拉偏（yaw），
+    // 但 roll/pitch 由 IMU+GPS 主导——验证姿态不发散（真机磁干扰最常见故障）。
+    let scn = EnvScenario::new(
+        Motion::Hover,
+        Perturb::clean(),
+        vec![FaultEvent::MagDisturb { t: 2.0, bias: [0.2, 0.2, 0.1] }],
+    );
+    let mut h = EnvHarness::new(scn, true);
+    h.run_steps(120); // 预热 1.6s（fault t=2.0 前，EKF 收敛）
+    let mut max_rp = 0.0f32;
+    let mut health_ok = true;
+    for _ in 0..250 {
+        h.step();
+        let e = h.read_est();
+        let rp = e.euler();
+        max_rp = max_rp.max(rp[0].abs()).max(rp[1].abs());
+        if e.health == 2 {
+            health_ok = false;
+        }
+    }
+    assert!(health_ok, "磁干扰（有读数）不应触发 FDIR Critical（health=2）");
+    assert!(
+        max_rp.to_degrees() < 15.0,
+        "磁干扰下 roll/pitch 应保持有界（稳定性），max={:.1}°",
+        max_rp.to_degrees()
+    );
+}
+
+#[test]
+fn mag_freeze_keeps_attitude() {
+    // 磁力计冻结（数据恒定）：与 baro 冻结同理 FDIR 不误报；yaw 转陀螺积分，
+    // roll/pitch 不受影响——姿态稳定不发散。
+    let scn = EnvScenario::new(
+        Motion::Hover,
+        Perturb::clean(),
+        vec![FaultEvent::MagFreeze { t: 2.0 }],
+    );
+    let mut h = EnvHarness::new(scn, true);
+    h.run_steps(120);
+    let mut max_rp = 0.0f32;
+    let mut health_ok = true;
+    for _ in 0..250 {
+        h.step();
+        let e = h.read_est();
+        let rp = e.euler();
+        max_rp = max_rp.max(rp[0].abs()).max(rp[1].abs());
+        if e.health == 2 {
+            health_ok = false;
+        }
+    }
+    assert!(health_ok, "磁力计冻结不应触发 FDIR Critical，health={}", if health_ok { 0 } else { 2 });
+    assert!(
+        max_rp.to_degrees() < 15.0,
+        "磁力计冻结下 roll/pitch 应保持有界，max={:.1}°",
+        max_rp.to_degrees()
+    );
+}

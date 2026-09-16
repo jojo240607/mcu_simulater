@@ -27,6 +27,7 @@
 //! （yaw→pitch→roll）；静止水平时加速度计比力 = [0,0,-9.81]（m/s²）。
 
 use crate::peripheral::vperiph::data_source::FlySimState;
+use crate::peripheral::vperiph::data_source::rotate_by_quat_conj;
 
 /// 场景真值（世界系 NED + 姿态）。
 #[derive(Debug, Clone, Copy, Default)]
@@ -127,6 +128,11 @@ pub enum FaultEvent {
     RcDrop { t: f32, dur: f32 },
     /// t 秒起 SBUS 通道 ch 强置 raw 值 dur 秒（模拟卡滞/抖动）。
     RcStuck { t: f32, ch: usize, raw: f32, dur: f32 },
+    /// t 秒后磁力计冻结（保持最后值；数据仍有读数 → FDIR 不误报，靠姿态稳定验证）。
+    MagFreeze { t: f32 },
+    /// t 秒时注入磁干扰（硬铁偏置 bias，机体系 G；数据持续"正常" → 验证 EKF
+    /// 磁观测抗偏 + 姿态不发散）。
+    MagDisturb { t: f32, bias: [f32; 3] },
 }
 
 /// 传感器故障状态（由 FaultEvent 触发后置位）。
@@ -139,6 +145,8 @@ struct FaultState {
     gps_drop_until: f32,
     gps_jump_done: bool,
     rc_drop_until: f32,
+    mag_frozen: bool,
+    mag_disturb: Option<[f32; 3]>,
 }
 
 /// 环境场景：运动 + 扰动 + 故障 → 传感器输出（写入 FlySimState）。
@@ -160,6 +168,7 @@ pub struct EnvScenario {
     last_accel: [f32; 3],
     last_gyro: [f32; 3],
     last_baro_h: f32,
+    last_mag: [f32; 3],
     rc_stuck: Vec<(usize, f32, f32)>, // (ch, raw, until)
     fstate: FaultState,
     /// 简单伪随机（xorshift）种子。
@@ -183,6 +192,7 @@ impl EnvScenario {
             last_accel: [0.0, 0.0, -9.81],
             last_gyro: [0.0; 3],
             last_baro_h: 0.0,
+            last_mag: [0.0; 3],
             rc_stuck: Vec::new(),
             fstate: FaultState::default(),
             rng: 0x9E3779B97F4A7C15,
@@ -317,6 +327,14 @@ impl EnvScenario {
                     self.rc_stuck.push((*ch, *raw, t + *dur));
                     self.last_fired[i] = true;
                 }
+                FaultEvent::MagFreeze { t: ft } if t >= *ft => {
+                    self.fstate.mag_frozen = true;
+                    self.last_fired[i] = true;
+                }
+                FaultEvent::MagDisturb { t: ft, bias } if t >= *ft => {
+                    self.fstate.mag_disturb = Some(*bias);
+                    self.last_fired[i] = true;
+                }
                 _ => {}
             }
         }
@@ -401,6 +419,28 @@ impl EnvScenario {
         let qy = cr2 * sp2 * cy2 + sr2 * cp2 * sy2;
         let qz = cr2 * cp2 * sy2 - sr2 * sp2 * cy2;
         st.att = [qw, qx, qy, qz];
+
+        // ---- 磁力计（世界系恒定地磁场随姿态旋转；故障：硬铁偏置/冻结）----
+        // 正常时 st.mag=None → 虚拟外设 FlySimKind::Mag 按 att 推导（与
+        // data_source.rs 同一公式）；故障时写 Some 覆盖（数据持续"正常"，FDIR
+        // 不误报——按可用性判据有读数即 healthy，姿态稳定性由本场景验证）。
+        if self.fstate.mag_disturb.is_some() || self.fstate.mag_frozen {
+            let mut mag = rotate_by_quat_conj(&[qw, qx, qy, qz], [0.2f32, 0.0, 0.4]);
+            if let Some(b) = self.fstate.mag_disturb {
+                for k in 0..3 {
+                    mag[k] += b[k];
+                }
+            }
+            if self.fstate.mag_frozen {
+                mag = self.last_mag;
+            } else {
+                self.last_mag = mag;
+            }
+            st.mag = Some(mag);
+        } else {
+            st.mag = None;
+            self.last_mag = rotate_by_quat_conj(&[qw, qx, qy, qz], [0.2f32, 0.0, 0.4]);
+        }
 
         // ---- 气压计（观测高度 = 参考高度 + 相对位移 + 漂移 + 阶跃 + 噪声；冻结保持最后值） ----
         let alt_up = self.alt_ref - tr.pos[2]; // NED pos[2] 向下 → 高度 = 参考 - pos[2]
