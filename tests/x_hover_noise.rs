@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use fly_sim_core::controller::ControllerKind;
-use fly_sim_core::physics::ToyWorld;
+use fly_sim_core::physics::PhySdkWorld;
 use fly_sim_core::sensor::SensorConfig;
 use fly_sim_core::sim::SimLoop;
 use flyctrl_core::config::VehicleConfig;
@@ -142,7 +142,7 @@ fn hover_60s_noisy() {
     // 0.05 m/√s 慢漂移。注入用 SimLoop 的噪声化读数（last_imu/last_gps/last_baro_alt），
     // 固件收到的与 SIL 控制律同源。
     let mut sim = SimLoop::new(
-        ToyWorld::new(9.81),
+        PhySdkWorld::create_empty(),
         &VehicleConfig::default_quad(),
         0.004,
         None,

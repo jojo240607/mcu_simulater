@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use fly_sim_core::controller::ControllerKind;
-use fly_sim_core::physics::ToyWorld;
+use fly_sim_core::physics::PhySdkWorld;
 use fly_sim_core::sensor::{SensorConfig, SensorFault};
 use fly_sim_core::sim::SimLoop;
 use fly_sim_core::wind::{WindConfig, WindField};
@@ -174,7 +174,7 @@ fn hover_60s_env() {
         ..WindConfig::default()
     });
     let mut sim = SimLoop::new(
-        ToyWorld::new(9.81),
+        PhySdkWorld::create_empty(),
         &VehicleConfig::default_quad(),
         0.004,
         Some(wind),
