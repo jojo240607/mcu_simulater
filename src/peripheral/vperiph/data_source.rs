@@ -502,16 +502,24 @@ impl SensorModel for FlySimSource {
                     0.0
                 }
             }
-            FlySimKind::Gps => match field {
-                "lat" => st.gps_lat,
-                "lon" => st.gps_lon,
-                "alt" => st.gps_alt,
-                "fix" => st.gps_fix,
-                "vel_n" => st.gps_vel[0],
-                "vel_e" => st.gps_vel[1],
-                "vel_d" => st.gps_vel[2],
-                _ => 0.0,
-            },
+            FlySimKind::Gps => {
+                use std::sync::atomic::{AtomicU32, Ordering as AOrd};
+                static CNT: AtomicU32 = AtomicU32::new(0);
+                let v = match field {
+                    "lat" => st.gps_lat,
+                    "lon" => st.gps_lon,
+                    "alt" => st.gps_alt,
+                    "fix" => st.gps_fix,
+                    "vel_n" => st.gps_vel[0],
+                    "vel_e" => st.gps_vel[1],
+                    "vel_d" => st.gps_vel[2],
+                    _ => 0.0,
+                };
+                if CNT.fetch_add(1, AOrd::Relaxed) < 30 {
+                    eprintln!("[FlySimGps] value({field}) = {v}");
+                }
+                v
+            }
             FlySimKind::Sbus => {
                 let idx: usize = field.strip_prefix("ch").and_then(|n| n.parse().ok()).unwrap_or(16);
                 if idx < 16 {
