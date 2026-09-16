@@ -200,7 +200,12 @@ fn hover_60s_demo() {
             st.rc_ch[4] = 2000.0;
         }
 
-        m.lock().unwrap().run(300_000).unwrap();
+        // 每循环固件推进量 = 物理步 4ms（VIRTUAL=172M 字节/虚拟秒：688K 字节）。
+        // 历史教训：300K@172M=1.74ms < 4ms 物理步 → 固件控制率仅 ~108Hz（物理
+        // 250Hz），SIL 闭环姿态/位置发散（roll 40°、高度持续上升）；校准前
+        // 300K@30M=10ms 又让固件超前物理 2.5 步（传感器帧陈旧）。688K 使
+        // control 拍（4ms）与物理步 1:1 对齐。
+        m.lock().unwrap().run(688_000).unwrap();
 
         if step % 1000 == 0 {
             let ekf_z = read_ekf_z(&m);
