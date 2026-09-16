@@ -7,9 +7,12 @@
 //!
 //! 共享区布局见 flyctrl/app/src/flyctrl/hil_shmem.rs（双方硬编码一致）。
 //!
-//! 构建前置：`cd joc-base && cmake -S . -B build_hil -DMCU_SIM=ON -DRTOS_SELFTEST=OFF
-//! && cmake --build build_hil`（minimal elf）、
-//! `cd flyctrl && python3 build_app.py --features hil`（app.bin）。
+//! 构建前置：`cd joc-base && cmake -S . -B build_hil -DMCU_SIM=ON -RTOS_SELFTEST=OFF
+//! && cmake --build build_hil`（minimal elf）；固件必须为 **hil feature** 构建
+//! （共享内存契约仅在 hil 固件内编译）：
+//! `cd flyctrl && python3 build_app.py --features hil --out /tmp/flyctrl_hil.bin`，
+//! 并以 `JOC_APP_FLYCTRL=/tmp/flyctrl_hil.bin` 指向（一键联调：`./scripts/integrate.sh shmem`）。
+//! 本测试启动后会校验固件确实为 hil 构建（见 `hil` 固件校验），否则给出可操作指引。
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -100,6 +103,25 @@ fn shmem_closed_loop() {
     for _ in 0..12 {
         m.run(1_000_000).unwrap();
     }
+
+    // 【hil 固件校验】共享内存契约仅在 hil feature 固件内编译（uplink 轮询共享区）；
+    // 若加载的是默认/real-sensors 固件（sensors 任务日志 `hil=0`），本测试必然
+    // "物理从未推进"——此时给出可操作的产物指引，而非误导性的断言失败。
+    {
+        let out = m.console.lock().unwrap().output().to_vec();
+        let t = String::from_utf8_lossy(&out);
+        if !t.contains("hil=1") {
+            panic!(
+                "加载的 app 非 hil 构建（未发现传感器任务日志 'hil=1'，实际加载: {}）。\n\
+                 共享内存契约仅在 hil 固件内编译。请：\n\
+                 cd flyctrl && python3 build_app.py --features hil --out /tmp/flyctrl_hil.bin\n\
+                 JOC_APP_FLYCTRL=/tmp/flyctrl_hil.bin cargo test --release --test x_shmem_mcusim\n\
+                 （或直接 ./scripts/integrate.sh shmem 一键联调）",
+                app.display()
+            );
+        }
+    }
+
     let m = Arc::new(Mutex::new(m));
     shm_init(&m);
 

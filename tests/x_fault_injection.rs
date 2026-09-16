@@ -167,18 +167,21 @@ fn nack_from_boot_fdir_critical() {
 /// 场景 2：运行中注入 NACK → 仅该从设备读计数冻结，healthy 从设备继续。
 #[test]
 fn midrun_nack_isolates_slave() {
-    let (mut m, got_invalid, _bad) = setup_with_nack(false);
+    let (mut m, got_invalid, bad_pc) = setup_with_nack(false);
     // 阶段 1：正常运行，确认 mpu6050 有成功读
-    assert!(
-        run_until(&mut m, &got_invalid, |t| {
-            if let Some(idx) = t.rfind("hb seq=") {
-                t[idx..].lines().next().unwrap_or("").contains("crit=false")
-            } else {
-                false
-            }
-        }, 700),
-        "基线 hb 未出现（USB init mDelay 需 ~240 步，700 步应足够）"
-    );
+    let ok = run_until(&mut m, &got_invalid, |t| {
+        if let Some(idx) = t.rfind("hb seq=") {
+            t[idx..].lines().next().unwrap_or("").contains("crit=false")
+        } else {
+            false
+        }
+    }, 700);
+    if !ok {
+        let out = m.console.lock().unwrap().output().to_vec();
+        eprintln!("=== console ({:?}B) ===\n{}\n=== end ===", out.len(), String::from_utf8_lossy(&out));
+        eprintln!("invalid_insn={} bad_pc=0x{:08X}", got_invalid.load(Ordering::Relaxed), bad_pc.load(Ordering::Relaxed));
+    }
+    assert!(ok, "基线 hb 未出现（USB init mDelay 需 ~240 步，700 步应足够）");
     let before = i2c1_read_counts(&m);
     assert!(before.0 > 0, "基线 mpu6050 应已有成功读，得 {before:?}");
 
