@@ -109,6 +109,12 @@ impl Bmi088 {
         s
     }
 
+    /// 替换数据源（装配期：默认 StaticImu → FlySimSource 等实时模型）。
+    pub fn with_source(mut self, imu: impl SensorModel + 'static) -> Self {
+        self.source = Some(DataSource::Math(Box::new(imu)));
+        self
+    }
+
     /// 写寄存器文件（模型初始化用；WHO_AM_I 等只读区由驱动写保护忽略）。
     pub fn poke(&mut self, chip: Chip, reg: u8, value: u8) {
         let regs = self.regs_mut(chip);

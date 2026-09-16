@@ -539,6 +539,10 @@ impl Machine {
     pub fn attach_flysim_sensors(&self, st: std::sync::Arc<std::sync::Mutex<crate::peripheral::vperiph::data_source::FlySimState>>) {
         use crate::peripheral::vperiph::data_source::{FlySimKind, FlySimSource};
         use crate::peripheral::vperiph::i2c::{bmp280, mpu6050, qmc5883};
+        use crate::peripheral::vperiph::spi::default_bmi088;
+        // IMU 主源为 BMI088（SPI2，ACCEL_CS=GPIOE_7、GYRO_CS=GPIOE_8）：与固件
+        // real-sensors 的 ImuBmi088("bmi088") 对应（板级 bmi088 设备 = spi2 + 双片选）。
+        self.register_spi_slave(2, Box::new(default_bmi088((4, 7), (4, 8)).with_source(FlySimSource::new(st.clone(), FlySimKind::Imu))));
         self.register_i2c_slave(1, Box::new(mpu6050(FlySimSource::new(st.clone(), FlySimKind::Imu))));
         self.register_i2c_slave(1, Box::new(bmp280(FlySimSource::new(st.clone(), FlySimKind::Baro))));
         // 磁力计用 FlySimSource(Mag)：世界系恒定地磁场随姿态旋转到机体（真机模型），
@@ -570,6 +574,8 @@ impl Machine {
     pub fn attach_default_sensors_with_baro_height(&self, baro_height: f32) {
         use crate::peripheral::vperiph::data_source::{StaticBaro, StaticImu, StaticMag};
         use crate::peripheral::vperiph::i2c::{bmp280, mpu6050, qmc5883};
+        use crate::peripheral::vperiph::spi::default_bmi088;
+        self.register_spi_slave(2, Box::new(default_bmi088((4, 7), (4, 8)).with_source(StaticImu::default())));
         self.register_i2c_slave(1, Box::new(mpu6050(StaticImu::default())));
         self.register_i2c_slave(1, Box::new(bmp280(StaticBaro::at_height(baro_height))));
         self.register_i2c_slave(1, Box::new(qmc5883(StaticMag::default())));
