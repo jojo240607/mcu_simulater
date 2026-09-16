@@ -312,6 +312,9 @@ impl I2c {
     /// 供 DMA 控制器搬运调用，等价 CPU 写 DR 的发送语义。
     pub fn dma_write_dr(&mut self, value: u32) {
         self.tx(value as u8);
+        eprintln!("[dmacnt] p{} wr=0x{:02x} addr_phase={} slave={:?} tx_after_rxne={}",
+            self.port, value & 0xFF, self.addr_phase, self.cur_slave,
+            self.regs[5] & SR1_RXNE != 0);
         self.regs[5] |= SR1_TXE;
     }
 
@@ -345,6 +348,11 @@ impl crate::peripheral::dma::DmaByteIo for I2c {
 
     fn dma_write_dr(&mut self, value: u32) {
         self.dma_write_dr(value);
+    }
+
+    /// RX 缓冲非空（RxNE）→ DMA 循环搬可继续（数据阶段连续供数）。
+    fn rx_available(&self) -> bool {
+        self.regs[5] & SR1_RXNE != 0
     }
 }
 

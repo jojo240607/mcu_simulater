@@ -126,6 +126,12 @@ pub trait DmaByteIo: Send {
     fn dma_read_dr(&mut self) -> u32;
     /// 内存 → 外设（TX）：写数据寄存器（外设侧发送数据）
     fn dma_write_dr(&mut self, value: u32);
+    /// 外设是否仍有可读数据（RX 缓冲非空）。默认 true（事件驱动外设每次搬运
+    /// 前必有数据）；I2C/SPI 覆盖为接收标志（RXNE）——数据阶段连续供数，
+    /// DMA 侧据此循环搬完整个 NDTR。
+    fn rx_available(&self) -> bool {
+        true
+    }
 }
 
 /// CR 控制位
@@ -538,6 +544,7 @@ impl Dma {
             let ndtr = self.stream_reg(s, 1);
             let circ = cr & CR_CIRC != 0;
             let mut dev = dev.lock().unwrap();
+            let mut xfered: u32 = 0; // 实际搬运项数（I2C/SPI 循环搬可能 < items）
             if dir == 1 {
                 // 内存 → 外设（TX）：M0AR → 外设 DR（按 MSIZE 取宽拼 u32）。
                 // 非环形一次性传输：写 DR 不超过 NDTR（越界字节丢弃——真机 NDTR 到 0
@@ -555,15 +562,32 @@ impl Dma {
                         dst += mw as u32;
                     }
                 }
+                xfered = write_n;
             } else {
                 // 外设 → 内存（RX）：外设 DR → M0AR（按 MSIZE 取宽写内存）。
                 // 环形：M0AR 在批内跨越缓冲区末尾时立即回卷到 base（不越界写）；
                 // 非环形：最多写 NDTR 字节（真机 NDTR 到 0 停止，多余字节留外设）。
+                // I2C/SPI 特判：数据阶段连续供数（dma_read_dr 内部预取下一字节，
+                // rx_available 反映外设缓冲），一次搬运内循环搬完可用数据——
+                // 否则多字节读（mpu6050 14B/bmp280 6B）在首字节后卡 NDTR，
+                // 固件 wait_done 超时（DMA 请求仅在事件总线发布，prefetch 内
+                // on_read 不发布事件 → 后续字节无独立请求）。
                 let base = if circ { self.circ_base[s] as u64 } else { 0 };
                 let buflen = if circ { self.circ_ndtr[s] as u64 } else { 0 };
                 let mut pos = dst as u64;
-                let write_n = if circ { items } else { items.min(ndtr) };
-                for _ in 0..write_n {
+                // I2C 非环形：数据阶段由从设备连续供数（prefetch on_read 直接进 DR，
+                // 不经事件总线）——一次搬运目标是整个 NDTR（数据连续时搬完）；
+                // 其余（UART/SPI 事件驱动注入 / 环形）按登记的 items 搬运。
+                let stream_cont = !circ && matches!(target, DmaTarget::I2c(_));
+                let write_n = if stream_cont {
+                    ndtr
+                } else if circ {
+                    items
+                } else {
+                    items.min(ndtr)
+                };
+                let mut n = 0u32;
+                while n < write_n && (!stream_cont || dev.rx_available()) {
                     let value = dev.dma_read_dr().to_le_bytes();
                     let _ = mem.dma_write(pos, &value[..mw]);
                     if minc {
@@ -572,8 +596,10 @@ impl Dma {
                             pos = base; // 批内回卷：禁止越界写 idle_buf
                         }
                     }
+                    n += 1;
                 }
                 dst = pos as u32;
+                xfered = n;
             }
             drop(dev);
             // MINC 地址回写：下次搬运从续接地址开始（外设方向 PAR 固定，仅回写 M0AR）
@@ -582,7 +608,7 @@ impl Dma {
             let new_ndtr = if circ {
                 (ndtr.wrapping_sub(items)) % self.circ_ndtr[s].max(1)
             } else {
-                ndtr.saturating_sub(items)
+                ndtr.saturating_sub(xfered)
             };
             self.set_stream_reg(s, 1, new_ndtr);
             self.pending_transfer &= !(1 << s);
