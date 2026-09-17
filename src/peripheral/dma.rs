@@ -438,6 +438,20 @@ impl Dma {
         self.pending_transfer != 0
     }
 
+    /// SPI 全双工配对：指定端口的 TX（M2P）流是否仍挂起（RX 节流判定依据）。
+    fn paired_tx_pending(&self, port: u8) -> bool {
+        for s2 in 0..8 {
+            if self.pending_transfer & (1 << s2) != 0 {
+                if self.pending_target[s2] == Some(DmaTarget::Spi(port))
+                    && self.pending_dir[s2] == DmaDir::MemToPeriph.bits()
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn process<'a>(&mut self, mem: &mut (dyn DmaMem + 'a)) {
         let mut mask = self.pending_transfer;
         while mask != 0 {
@@ -575,10 +589,11 @@ impl Dma {
                 let base = if circ { self.circ_base[s] as u64 } else { 0 };
                 let buflen = if circ { self.circ_ndtr[s] as u64 } else { 0 };
                 let mut pos = dst as u64;
-                // I2C 非环形：数据阶段由从设备连续供数（prefetch on_read 直接进 DR，
-                // 不经事件总线）——一次搬运目标是整个 NDTR（数据连续时搬完）；
-                // 其余（UART/SPI 事件驱动注入 / 环形）按登记的 items 搬运。
-                let stream_cont = !circ && matches!(target, DmaTarget::I2c(_));
+                // I2C/SPI 非环形：数据阶段由从设备连续供数（I2C prefetch on_read
+                // 直接进 DR；SPI 为 DMA TX 全双工交换把回送入 RX FIFO，均不经事件
+                // 总线）——一次搬运目标是整个 NDTR（数据连续时搬完）；
+                // 其余（UART 事件驱动注入 / 环形）按登记的 items 搬运。
+                let stream_cont = !circ && matches!(target, DmaTarget::I2c(_) | DmaTarget::Spi(_));
                 let write_n = if stream_cont {
                     ndtr
                 } else if circ {
@@ -586,6 +601,25 @@ impl Dma {
                 } else {
                     items.min(ndtr)
                 };
+                // SPI RX 全双工节流：回复由 DMA TX 交换产生（每 TX 字节 1 回复入
+                // FIFO）。流号上 RX 常低于 TX（SPI3 RX=S0 < TX=S7），若 RX 先被
+                // 处理而 FIFO 仍空、配对 TX 尚挂起 → 保留 pending，下次 process
+                // （TX 已填 FIFO）再搬，避免空搬后 pending 被清导致 RX 永不完成。
+                let spi_port = match target {
+                    DmaTarget::Spi(p) => Some(p),
+                    _ => None,
+                };
+                if spi_port.is_some() {
+                }
+                if stream_cont
+                    && spi_port.is_some()
+                    && !dev.rx_available()
+                    && self.paired_tx_pending(spi_port.unwrap())
+                {
+                    drop(dev);
+                    self.pending_items[s] = items; // 保留待搬项，下次重试
+                    continue;
+                }
                 let mut n = 0u32;
                 while n < write_n && (!stream_cont || dev.rx_available()) {
                     let value = dev.dma_read_dr().to_le_bytes();

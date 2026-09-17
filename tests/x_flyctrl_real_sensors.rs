@@ -56,7 +56,10 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
     let mut gps_ok = false;
     let mut mag_ok = false;
     let mut panic_seen = false;
-    for step in 0..3200u32 {
+    // 步数预算：bmi088 走 SPI DMA 后，固件在 dma_wait_done 忙等（模拟器每
+    // 256 块量子让出搬运），传感器/控制推进较 POLL 模式慢 ~2×；心跳 seq=250
+    // 需 ~2s 仿真时间，3200 步仅覆盖 ~1.5s → 提到 6400 步（~170s 墙钟）。
+    for step in 0..6400u32 {
         if t_start.elapsed().as_secs() > 300 {
             eprintln!(">>> 超时（300s）终止");
             break;

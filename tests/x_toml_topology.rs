@@ -54,16 +54,26 @@ fn flyctrl_real_sensors_via_toml_topology() {
     let mut baro_ok = false;
     let mut gps_ok = false;
     let mut panic_seen = false;
-    for step in 0..3200u32 {
+    // bmi088 走 SPI DMA 后 boot 略慢（dma_wait_done 忙等占指令预算），
+    // 心跳 seq=250 需 ~2s 仿真时间 → 3200 步不够，提到 6400。
+    for step in 0..6400u32 {
         if t_start.elapsed().as_secs() > 300 {
             eprintln!(">>> 超时（300s）终止");
             break;
         }
         let r = m.run(400_000);
         let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
+        // 日志可见性 = console（已 drain 部分 + raw 直写）⊕ SDK log ring（未
+        // drain 部分）。log_task（prio 28）被 telem/uplink 等业务任务饿死时（实测
+        // ring head 冻结、tail 继续增长），应用 info! 行（hb/dbg）滞留 ring 永不
+        // 到 console——因此里程碑检测必须直接扫描 ring，不能只看 console。
+        let ring_text = scan_log_ring(&mut m);
         let text = {
             let outv = m.console.lock().unwrap().output().to_vec();
-            String::from_utf8_lossy(&outv).into_owned()
+            let mut t = String::from_utf8_lossy(&outv).into_owned();
+            t.push('\n');
+            t.push_str(&ring_text);
+            t
         };
         if text.contains("RUST app mounted") {
             mounted = true;
@@ -140,4 +150,49 @@ fn flyctrl_real_sensors_via_toml_topology() {
     assert!(gps_ok, "GPS 未经 TOML 拓扑 UART 推流定位（无 fix established）");
 
     assert!(spi_cnt > 0, "SPI 从设备无读取（bmi088）");
+}
+
+/// 直接读取 App SDK 日志 ring（LOG_RING=0x2000_add0，2048B，head/tail 见下），
+/// 解出其中尚未被 log_task drain 的行。条目格式：[len][level][payload]，
+/// payload = "R/{level} {tick} {tag}: {msg}\n"。
+/// 地址来自 `arm-none-eabi-nm app.elf | grep -E 'LOG_(RING|HEAD|TAIL)'`：
+///   LOG_RING=0x2000_add0 LOG_HEAD=0x2000_b5e8 LOG_TAIL=0x2000_b5ec
+/// （与 EST_STATE/SENSOR_FRAME 等约定一致：App 重建后需同步更新。）
+fn scan_log_ring(m: &mut mcu_simulater::machine::Machine) -> String {
+    const RING_ADDR: u64 = 0x2000_add0;
+    const HEAD_ADDR: u64 = 0x2000_b5e8;
+    const TAIL_ADDR: u64 = 0x2000_b5ec;
+    const RING_SIZE: usize = 2048;
+    let mut hb = [0u8; 4];
+    let mut tb = [0u8; 4];
+    let _ = m.cpu.raw().mem_read(HEAD_ADDR, &mut hb);
+    let _ = m.cpu.raw().mem_read(TAIL_ADDR, &mut tb);
+    let head = u32::from_le_bytes(hb) as usize % RING_SIZE;
+    let tail = u32::from_le_bytes(tb) as usize % RING_SIZE;
+    let mut ring = [0u8; RING_SIZE];
+    let _ = m.cpu.raw().mem_read(RING_ADDR, &mut ring);
+    let n = if tail >= head { tail - head } else { RING_SIZE - head + tail };
+    if n == 0 || n > RING_SIZE {
+        return String::new();
+    }
+    // 展平为 head→tail 的线性视图，再按 [len][level][payload] 解条目。
+    let mut buf = Vec::with_capacity(n);
+    for k in 0..n {
+        buf.push(ring[(head + k) % RING_SIZE]);
+    }
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < buf.len() {
+        let len = buf[i] as usize;
+        // len 不含 len 字节、含 level 字节；防御越界/损坏（半写条目）。
+        if len < 1 || len > 250 || i + 1 + len > buf.len() {
+            break;
+        }
+        if let Ok(s) = std::str::from_utf8(&buf[i + 2..i + 1 + len]) {
+            out.push_str(s);
+            out.push('\n');
+        }
+        i += 1 + len;
+    }
+    out
 }

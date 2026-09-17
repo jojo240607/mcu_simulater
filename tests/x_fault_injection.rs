@@ -71,10 +71,7 @@ fn run_until<F: Fn(&str) -> bool>(
 ) -> bool {
     for _ in 0..max_steps {
         let r = m.run(400_000);
-        let text = {
-            let outv = m.console.lock().unwrap().output().to_vec();
-            String::from_utf8_lossy(&outv).into_owned()
-        };
+        let text = merged_log(m);
         if cond(&text) {
             return true;
         }
@@ -106,10 +103,7 @@ fn spi_fault_from_boot_fdir_critical() {
             break;
         }
         let r = m.run(400_000);
-        let text = {
-            let outv = m.console.lock().unwrap().output().to_vec();
-            String::from_utf8_lossy(&outv).into_owned()
-        };
+        let text = merged_log(&mut m);
         if text.contains("RUST app mounted") {
             mounted = true;
         }
@@ -185,13 +179,13 @@ fn midrun_nack_isolates_slave() {
         } else {
             false
         }
-    }, 3200);
+    }, 6400);
     if !ok {
         let out = m.console.lock().unwrap().output().to_vec();
         eprintln!("=== console ({:?}B) ===\n{}\n=== end ===", out.len(), String::from_utf8_lossy(&out));
         eprintln!("invalid_insn={} bad_pc=0x{:08X}", got_invalid.load(Ordering::Relaxed), bad_pc.load(Ordering::Relaxed));
     }
-    assert!(ok, "基线 hb 未出现（I2C DMA 下 sensors 读略慢，3200 步应足够）");
+    assert!(ok, "基线 hb 未出现（SPI DMA 下 sensors 读略慢，6400 步应足够）");
     let before = i2c1_read_counts(&m);
     // 固件 imu 已切换 BMI088(SPI)：I2C1 上固件实际读取的是 baro(0x76)/mag(0x0D)，
     // mpu6050(0x68) 从设备保留但不再被读（读计数恒 0）。隔离验证改用 mag。
@@ -224,4 +218,57 @@ fn midrun_nack_isolates_slave() {
     );
     assert_eq!(before.2, after.2, "注入后 qmc5883 不应再成功读（NACK 未隔离）");
     assert!(after.1 > before.1, "bmp280 读计数应继续增长（同总线被波及其他从设备）");
+}
+
+/// console（已 drain + raw 直写）⊕ SDK log ring（未 drain 部分）。
+/// log_task（prio 28）被业务任务饿死时应用 info! 行滞留 ring 永不到 console，
+/// 因此里程碑检测必须合并 ring 内容（见 x_toml_topology.rs 同款说明）。
+fn merged_log(m: &mut Machine) -> String {
+    let outv = m.console.lock().unwrap().output().to_vec();
+    let mut t = String::from_utf8_lossy(&outv).into_owned();
+    t.push('\n');
+    t.push_str(&scan_log_ring(m));
+    t
+}
+
+/// 直接读取 App SDK 日志 ring（LOG_RING=0x2000_add0，2048B）。条目格式：
+/// [len][level][payload]，payload = "R/{level} {tick} {tag}: {msg}\n"。
+/// 地址来自 `arm-none-eabi-nm app.elf | grep -E 'LOG_(RING|HEAD|TAIL)'`：
+///   LOG_RING=0x2000_add0 LOG_HEAD=0x2000_b5e8 LOG_TAIL=0x2000_b5ec
+/// （App 重建后需按 nm 同步更新。）
+fn scan_log_ring(m: &mut Machine) -> String {
+    const RING_ADDR: u64 = 0x2000_add0;
+    const HEAD_ADDR: u64 = 0x2000_b5e8;
+    const TAIL_ADDR: u64 = 0x2000_b5ec;
+    const RING_SIZE: usize = 2048;
+    let mut hb = [0u8; 4];
+    let mut tb = [0u8; 4];
+    let _ = m.cpu.raw().mem_read(HEAD_ADDR, &mut hb);
+    let _ = m.cpu.raw().mem_read(TAIL_ADDR, &mut tb);
+    let head = u32::from_le_bytes(hb) as usize % RING_SIZE;
+    let tail = u32::from_le_bytes(tb) as usize % RING_SIZE;
+    let mut ring = [0u8; RING_SIZE];
+    let _ = m.cpu.raw().mem_read(RING_ADDR, &mut ring);
+    let n = if tail >= head { tail - head } else { RING_SIZE - head + tail };
+    if n == 0 || n > RING_SIZE {
+        return String::new();
+    }
+    let mut buf = Vec::with_capacity(n);
+    for k in 0..n {
+        buf.push(ring[(head + k) % RING_SIZE]);
+    }
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < buf.len() {
+        let len = buf[i] as usize;
+        if len < 1 || len > 250 || i + 1 + len > buf.len() {
+            break;
+        }
+        if let Ok(s) = std::str::from_utf8(&buf[i + 2..i + 1 + len]) {
+            out.push_str(s);
+            out.push('\n');
+        }
+        i += 1 + len;
+    }
+    out
 }

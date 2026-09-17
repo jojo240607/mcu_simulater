@@ -16,6 +16,7 @@
 //! - CR1 0x00 / CR2 0x04 / SR 0x08 / DR 0x0C / CRCPR 0x10 / RXCRCR 0x14 /
 //!   TXCRCR 0x18 / I2SCFGR 0x1C / I2SPR 0x20
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::events::{Event, EventBus};
@@ -65,6 +66,10 @@ pub struct Spi {
     regs: [u32; REG_COUNT],
     /// 最近接收字节（读 DR 返回）
     rx_byte: u8,
+    /// DMA RX FIFO：DMA TX 全双工交换的从机回送（每 TX 字节 1 回复）与 feed_rx
+    /// 注入都入队；DMA RX 逐字节弹出。避免单字节 rx_byte 被下一次 TX 交换覆盖
+    /// （bmi088 连续读 6/12 字节依赖此缓冲）。
+    rx_fifo: VecDeque<u8>,
     /// 事件总线（发布 SpiByte）
     bus: Arc<Mutex<EventBus>>,
     /// NVIC（RXNE/TXE → 挂起 SPI IRQ）
@@ -83,6 +88,7 @@ impl Spi {
             irq,
             regs: [0; REG_COUNT],
             rx_byte: 0,
+            rx_fifo: VecDeque::new(),
             bus,
             nvic,
             slaves: Vec::new(),
@@ -221,10 +227,8 @@ impl Spi {
         if self.regs[0] & CR1_SPE == 0 {
             return; // 未使能，字节丢弃
         }
-        if self.regs[2] & SR_RXNE != 0 {
-            self.regs[2] |= SR_OVR; // 上次数据未读走 → 过载（仿真简化：覆盖）
-        }
         self.rx_byte = byte;
+        self.rx_fifo.push_back(byte); // DMA RX 消费；CPU 读 DR 走 rx_byte
         self.regs[2] |= SR_RXNE;
         self.set_pending_if_irq();
         // 注意：不在 feed_rx 内发布 SpiDma——feed_rx 可能在事件分发回调中被调用，
@@ -240,6 +244,11 @@ impl Spi {
         (self.regs[1] & CR2_RXDMAEN != 0) && (self.regs[2] & SR_RXNE != 0)
     }
 
+    /// DMA 侧接收数据可用（RX FIFO 非空）。DMA process 据此决定是否/继续搬运。
+    pub fn dma_rx_available(&self) -> bool {
+        !self.rx_fifo.is_empty()
+    }
+
     /// 发送数据寄存器是否空（固件轮询 TXE）
     pub fn tx_ready(&self) -> bool {
         self.regs[2] & SR_TXE != 0
@@ -249,19 +258,38 @@ impl Spi {
     ///
     /// 与 CPU 读 DR 同语义（读清 RXNE），供 DMA 控制器搬运调用。
     pub fn dma_read_dr(&mut self) -> u32 {
-        let byte = self.rx_byte;
-        self.regs[2] &= !SR_RXNE;
+        let byte = self.rx_fifo.pop_front().unwrap_or(self.rx_byte);
+        if self.rx_fifo.is_empty() {
+            self.regs[2] &= !SR_RXNE;
+        }
         byte as u32
     }
 
-    /// DMA 写 DR（内存→外设方向）：发送一字节并置 TXE。
+    /// DMA 写 DR（内存→外设方向）：全双工交换并置 TXE。
     ///
-    /// 供 DMA 控制器搬运调用，等价 CPU 写 DR 的发送语义。注意此处只发送、
-    /// 不锁存 RX：DMA TX 的虚拟从机回送会额外置 RXNE，干扰独立注入的
-    /// RX DMA 数据（m5_spi_dma 的 RX 由测试 SpiRx 注入，TX 阶段不得抢占）。
-    /// 虚拟从机的全双工回送只发生在 CPU 写 DR（固件 spi_hal_transfer POLL 路径）。
+    /// 供 DMA 控制器搬运调用，等价 CPU 写 DR 的发送语义：选中从机 on_byte 回送
+    /// 入 RX FIFO（置 RXNE）。无选中从机时回送 0xFF 但**不入 FIFO**——m5_spi_dma
+    /// 的 RX 由测试 SpiRx 独立注入，TX 阶段的 0xFF 不得抢占注入数据。bmi088 等
+    /// 连续读（DMA TX 命令/哑字节驱动从机）依赖本交换把每字节回复都缓冲起来，
+    /// 供后续 DMA RX 逐字节弹出。
     pub fn dma_write_dr(&mut self, value: u32) {
-        self.tx(value as u8);
+        let byte = (value & 0xFF) as u8;
+        // 全双工：选中从机按帧协议回送；未选中 0xFF（MISO 默认高，不入 FIFO）
+        let mut reply = 0xFFu8;
+        let mut slave_hit = false;
+        for sl in self.slaves.iter_mut() {
+            if sl.selected() {
+                reply = sl.on_byte(byte);
+                slave_hit = true;
+                break;
+            }
+        }
+        if slave_hit {
+            self.rx_fifo.push_back(reply);
+            self.regs[2] |= SR_RXNE;
+        }
+        self.trace_record(crate::trace::TraceKind::SpiByte { tx: byte, rx: reply });
+        self.tx(byte);
         self.regs[2] |= SR_TXE;
     }
 
@@ -295,6 +323,11 @@ impl crate::peripheral::dma::DmaByteIo for Spi {
 
     fn dma_write_dr(&mut self, value: u32) {
         self.dma_write_dr(value);
+    }
+
+    /// RX FIFO 非空才算有数据（DMA TX 全双工交换才产生回复）。
+    fn rx_available(&self) -> bool {
+        self.dma_rx_available()
     }
 }
 
@@ -379,6 +412,7 @@ impl Peripheral for Spi {
     fn reset(&mut self) {
         self.regs = [0; REG_COUNT];
         self.rx_byte = 0;
+        self.rx_fifo.clear();
     }
 }
 

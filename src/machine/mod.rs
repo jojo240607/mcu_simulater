@@ -1833,6 +1833,21 @@ impl Machine {
                     ctrl.lock()
                         .unwrap()
                         .service_stream(stream, channel, *dir, crate::peripheral::dma::DmaTarget::Spi(*port));
+                    // SPI 主全双工：固件 spi_dma_xfer 同时 arm TX+RX 双流。TX 请求
+                    // 到达时把配对 RX 流也登记上（DMA RX 回复由 TX 交换入 FIFO 后
+                    // 搬运；流号 RX< TX 时 process 先遇空 FIFO → 节流保留，见
+                    // [`Dma::process`] 的 paired_tx_pending 判定）。
+                    if *dir == DmaDir::MemToPeriph {
+                        let (rctrl, rstream, rchannel) = match *port {
+                            1 => (dma2.clone(), 0, 3), // SPI1_RX: DMA2_Stream0_Channel3
+                            2 => (dma1.clone(), 3, 0), // SPI2_RX: DMA1_Stream3_Channel0
+                            3 => (dma1.clone(), 0, 0), // SPI3_RX: DMA1_Stream0_Channel0
+                            _ => return,
+                        };
+                        rctrl.lock()
+                            .unwrap()
+                            .service_stream(rstream, rchannel, DmaDir::PeriphToMem, crate::peripheral::dma::DmaTarget::Spi(*port));
+                    }
                 }
             },
         )));
