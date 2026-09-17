@@ -167,6 +167,8 @@ pub struct Machine {
     last_virt_retired: std::cell::Cell<u64>,
     /// 异常入场计数（按向量号，诊中断暴风/唤醒停滞用；Switch 停机每进一次加 1）
     vec_entries: std::cell::RefCell<Vec<u64>>,
+    /// `run_ms` 的累计目标（固件 SysTick 拍数）：过冲跨调用携带，长期无漂移
+    run_ms_target: u64,
     /// 最近一次异常抢占前的 PC（= 被中断块的 PC，诊在何处不停被抢）
     last_switch_pc: std::cell::Cell<u32>,
     /// 时间轴故障剧本（P1-1）：run() 按虚拟时间触发到期动作（NACK/丢帧/观察点）
@@ -281,6 +283,7 @@ impl Machine {
             retired_insts: Arc::new(AtomicU64::new(0)),
             last_virt_retired: std::cell::Cell::new(0),
             vec_entries: std::cell::RefCell::new(vec![0u64; 97]),
+            run_ms_target: 0,
             last_switch_pc: std::cell::Cell::new(0),
             fault: None,
             uart_drop: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -2087,6 +2090,15 @@ impl Machine {
             //（SDIO DATAEND / DMA 完成信号量）时 emu_start 不返回 → run() 循环的
             // process 永不执行 → DMA 请求饿死。此处停机让 run() 返回后搬运（真机
             // DMA 与 CPU 并行，模拟器以此对齐）。无 pending 时快速返回，热路径可忽略。
+            //
+            // 间隔 256 为实测选定值：曾怀疑"本间隔决定 dma_wait_done 自旋量 →
+            // 限制 sensors 采样率"，故试过 16 与 4。用 `tests/x_sensor_rate.rs`
+            // 以 880ms 场景窗口实测（固件时钟与场景 1:1 对齐后）：
+            //   间隔 256 → 采样 254.5Hz、retired/step 405145
+            //   间隔 16  → 采样 254.5Hz、retired/step 409072
+            // 采样率与 retired 均无差异（<1%，噪声级）——采样率上限由 CPU 总负载
+            // （5 路驱动状态机 + control 任务 EKF 在同核抢占）决定，而非本间隔；
+            // 故保持 256（检查频次低、热路径开销小）。
             if cold.dma_ticks.fetch_add(1, Ordering::Relaxed) & 0xFF == 0 {
                 let p1 = cold.dma1.lock().unwrap().has_pending();
                 let p2 = cold.dma2.lock().unwrap().has_pending();
@@ -2306,6 +2318,47 @@ impl Machine {
     /// 退役指令数（Thumb 字节计数；≈2 字节/指令）。性能观测：Δretired/墙钟 = 吞吐。
     pub fn retired_count(&self) -> u64 {
         self.retired_insts.load(Ordering::Relaxed)
+    }
+
+    /// 按**固件自身虚拟时钟**推进 `ms` 毫秒。
+    ///
+    /// 物理闭环测试（每步推进 `dt` 秒物理）应当用本方法而非裸 `run(count)`：
+    /// 让固件侧推进与物理步长一致，避免固件任务周期/固件内固定 `dt` 相对物理
+    /// 步长系统性失配（根因与实测见 [`crate::sim::timing::RETIRED_BYTES_PER_MS`]）。
+    ///
+    /// 判据用**固件自己的 SysTick 计数**（vector 15，1ms/拍）而不是"预算×换算
+    /// 常量"：实测"退休字节/SysTick"随代码块混合比浮动 ±4%，用常量换算无法精确
+    /// 对齐；按 SysTick 计数推进则天然精确，且把量化过冲（≤1 拍）通过**累计目标**
+    /// 带到下一次调用，长期无累积漂移（均值恰为 1ms 固件时间 / 1ms 物理时间）。
+    pub fn run_ms(&mut self, ms: f32) -> Result<()> {
+        let add = ms.max(0.0).round() as u64;
+        if add == 0 {
+            return Ok(());
+        }
+        let now = self.systick_ticks();
+        if self.run_ms_target == 0 {
+            self.run_ms_target = now; // 首次调用：以当前拍为基准
+        }
+        self.run_ms_target += add;
+        // 小步推进（约 0.5ms 预算）：单次过冲更小；累计目标自动补偿残余。
+        let step = (crate::sim::timing::RETIRED_BYTES_PER_MS / 2).max(1);
+        // 迭代护栏：SysTick 未推进时（异常停机/时钟被关）不得自旋。
+        for _ in 0..64 {
+            if self.systick_ticks() >= self.run_ms_target {
+                break;
+            }
+            self.run(step)?;
+        }
+        Ok(())
+    }
+
+    /// 固件 SysTick 已发生的次数（= 固件自身时钟推进的毫秒数）。
+    fn systick_ticks(&self) -> u64 {
+        self.vec_entries
+            .borrow()
+            .get(15)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn nvic_pending(&self) -> bool {

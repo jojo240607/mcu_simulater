@@ -250,7 +250,12 @@ fn run_closed_loop(
         }
 
         // ---- MCU 推进（sensors 2ms 采样 + control 4ms + PWM 输出）----
-        let run_res = { m.lock().unwrap().run(300_000) };
+        // 按固件自身虚拟时钟推进 4ms（= 物理步长），而非裸 run(300_000)：
+        // run(300_000) 实测仅 ≈3.26ms 固件时钟（92K 字节/ms，见 x_sys_retire_calib），
+        // 与 4ms 物理步长失配 1.23× → 固件内固定 dt=4ms 的 EKF 加速度积分少算，
+        // 垂向速度估计滞后 → 定高环阻尼相位偏移、悬停慢漂。详见
+        // `mcu_simulater::sim::timing::RETIRED_BYTES_PER_MS`。
+        let run_res = { m.lock().unwrap().run_ms(4.0) };
         if let Err(e) = run_res {
             let mut mm = m.lock().unwrap();
             let pc = mm.cpu.reg_read_u32(RegisterARM::PC).unwrap_or(0);

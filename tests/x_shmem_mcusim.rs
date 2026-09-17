@@ -205,7 +205,9 @@ fn shmem_closed_loop() {
         wr_f32(&m, O_SP_YAW, yaw);
 
         // ---- MCU 推进（uplink 1ms poll 检测 pc_seq + control + telemetry）----
-        m.lock().unwrap().run(300_000).unwrap();
+        // 按固件自身虚拟时钟推进 4ms（= 物理步长）：裸 run(300_000) 实测仅
+        // ≈3.26ms 固件时钟，与物理步长失配 1.23×（见 timing::RETIRED_BYTES_PER_MS）。
+        m.lock().unwrap().run_ms(4.0).unwrap();
 
         if step % 100 == 0 {
             if step == 100 {
