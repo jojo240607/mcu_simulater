@@ -112,6 +112,16 @@ impl Spi {
         self.slaves.len()
     }
 
+    /// 从设备列表（观测/断言）
+    pub fn slaves(&self) -> &[Box<dyn VirtualSpiSlave>] {
+        &self.slaves
+    }
+
+    /// 从设备列表（可变；故障注入/测试）
+    pub fn slaves_mut(&mut self) -> &mut [Box<dyn VirtualSpiSlave>] {
+        &mut self.slaves
+    }
+
     /// 片选引脚变化转发给全部虚拟从设备（GPIO 事件；从机自行过滤关注的引脚）。
     pub fn route_cs(&mut self, port: u8, pin: u8, level: bool) {
         self.trace_record(crate::trace::TraceKind::SpiCs { pin, level });

@@ -62,6 +62,11 @@ pub trait VirtualSpiSlave: Send + Sync {
         0
     }
 
+    /// 类型擦除下行转换（故障注入/测试；未实现返回 None）。
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+
     /// 仿真时间推进（Math 数据源步进；由 Machine 的 step_virtual_slaves 驱动）。
     fn step(&mut self, _dt: f32) {}
 

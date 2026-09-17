@@ -309,13 +309,19 @@ impl I2c {
 
     /// DMA 写 DR（内存→外设方向）：发送一字节并置 TxE。
     ///
-    /// 供 DMA 控制器搬运调用，等价 CPU 写 DR 的发送语义。
+    /// 供 DMA 控制器搬运调用，等价 CPU 写 DR 的发送语义：发布 I2cByte 事件
+    /// （观测/测试），并按当前阶段路由（地址阶段→地址匹配；数据阶段→从设备
+    /// on_write，RegFileSlave 借此复位寄存器指针——此前仅发布事件不路由，
+    /// 寄存器选择字节丢失，指针单调递增越过寄存器文件末尾后 on_read 返回
+    /// None → DMA 搬运截断 → wait_done 超时 → 传感器 healthy=false）。
     pub fn dma_write_dr(&mut self, value: u32) {
         self.tx(value as u8);
-        eprintln!("[dmacnt] p{} wr=0x{:02x} addr_phase={} slave={:?} tx_after_rxne={}",
-            self.port, value & 0xFF, self.addr_phase, self.cur_slave,
-            self.regs[5] & SR1_RXNE != 0);
-        self.regs[5] |= SR1_TXE;
+        let byte = (value & 0xFF) as u8;
+        if self.addr_phase {
+            self.handle_addr_byte(byte);
+        } else {
+            self.handle_data_write(byte);
+        }
     }
 
     /// 检查并发布 DMA 请求（CR2.DMAEN 使能且对应标志置位时）。

@@ -320,6 +320,31 @@ impl Machine {
         false
     }
 
+    /// 故障注入：按从设备名对 SPI 从设备设置故障态（模拟芯片断线/无响应——
+    /// 故障态下对一切访问回 0xFF，WHO_AM_I 校验失败 → 固件 healthy=false）。
+    ///
+    /// 返回是否命中从设备。SPI 从设备需实现 `set_fault(bool)`（如 [`Bmi088`]）。
+    pub fn inject_spi_fault(&self, port: u8, name: &str, on: bool) -> bool {
+        let idx = (port as usize).saturating_sub(1);
+        if let Some(s) = self.spi.lock().unwrap().get(idx) {
+            let mut s = s.lock().unwrap();
+            let mut hit = false;
+            for sl in s.slaves_mut().iter_mut() {
+                if sl.name() == name {
+                    if let Some(f) = sl
+                        .as_any_mut()
+                        .and_then(|a| a.downcast_mut::<crate::peripheral::vperiph::spi::Bmi088>())
+                    {
+                        f.set_fault(on);
+                        hit = true;
+                    }
+                }
+            }
+            return hit;
+        }
+        false
+    }
+
     /// SD 卡映像写回指定文件（保存用途检查点：固件写块后落盘可跨 run 存活）。
     pub fn persist_sd_card(&self, path: &std::path::Path) {
         self.sdio.lock().unwrap().persist_to(path);
@@ -540,14 +565,17 @@ impl Machine {
         use crate::peripheral::vperiph::data_source::{FlySimKind, FlySimSource};
         use crate::peripheral::vperiph::i2c::{bmp280, mpu6050, qmc5883};
         use crate::peripheral::vperiph::spi::default_bmi088;
-        // IMU 主源为 BMI088（SPI2，ACCEL_CS=GPIOE_7、GYRO_CS=GPIOE_8）：与固件
-        // real-sensors 的 ImuBmi088("bmi088") 对应（板级 bmi088 设备 = spi2 + 双片选）。
-        self.register_spi_slave(2, Box::new(default_bmi088((4, 7), (4, 8)).with_source(FlySimSource::new(st.clone(), FlySimKind::Imu))));
-        self.register_i2c_slave(1, Box::new(mpu6050(FlySimSource::new(st.clone(), FlySimKind::Imu))));
-        self.register_i2c_slave(1, Box::new(bmp280(FlySimSource::new(st.clone(), FlySimKind::Baro))));
+        // IMU 主源为 BMI088（SPI3，ACCEL_CS=GPIOE_7、GYRO_CS=GPIOE_8）：与固件
+        // real-sensors 的 ImuBmi088("bmi088") 对应——注意板级设备名 "spi2" 实际是
+        // SPI3 外设（g_spi2），故从设备必须挂在 SPI 端口 3（x_drvtest 同此约定）。
+        self.register_spi_slave(3, Box::new(default_bmi088((4, 7), (4, 8)).with_source(FlySimSource::new(st.clone(), FlySimKind::Imu))));
+        // I2C 总线：固件 baro/mag 走 i2c2(I2C3)——I2C1 的 DMA1_Stream6 与 uart1(USART2)
+        // TX 冲突（固件 dma_acquire 流级互斥），I2C3 用 Stream4/2 空闲。
+        self.register_i2c_slave(3, Box::new(mpu6050(FlySimSource::new(st.clone(), FlySimKind::Imu))));
+        self.register_i2c_slave(3, Box::new(bmp280(FlySimSource::new(st.clone(), FlySimKind::Baro))));
         // 磁力计用 FlySimSource(Mag)：世界系恒定地磁场随姿态旋转到机体（真机模型），
         // 取代 StaticMag 固定机体磁场（yaw 观测恒定 → 磁锚定拉回航向）。
-        self.register_i2c_slave(1, Box::new(qmc5883(FlySimSource::new(st, FlySimKind::Mag))));
+        self.register_i2c_slave(3, Box::new(qmc5883(FlySimSource::new(st, FlySimKind::Mag))));
     }
 
     /// [HIL 虚拟外设直通] 用 fly_sim 共享状态装配 UART 推流（gps/sbus）。
@@ -561,9 +589,10 @@ impl Machine {
         self.register_uart_slave(3, Box::new(Sbus::new(FlySimSource::new(st.clone(), FlySimKind::Sbus))));
     }
 
-    /// 便捷装配：把默认 3 个 I2C 传感器（mpu6050/bmp280/qmc5883）挂到 i2c1。
-    /// baro 高度基准默认海平面（0m），与虚拟 GPS 高度（默认 alt=4.0）不一致时
-    /// 可用 [`attach_default_sensors_with_baro_height`] 对齐基准。
+    /// 便捷装配：默认传感器挂载——IMU=BMI088 挂 SPI3（port 3），
+    /// baro/mag（mpu6050 保留挂载）挂 I2C3（port 3）。baro 高度基准默认
+    /// 海平面（0m），与虚拟 GPS 高度（默认 alt=4.0）不一致时可用
+    /// [`attach_default_sensors_with_baro_height`] 对齐基准。
     pub fn attach_default_sensors(&self) {
         self.attach_default_sensors_with_baro_height(0.0);
     }
@@ -575,10 +604,11 @@ impl Machine {
         use crate::peripheral::vperiph::data_source::{StaticBaro, StaticImu, StaticMag};
         use crate::peripheral::vperiph::i2c::{bmp280, mpu6050, qmc5883};
         use crate::peripheral::vperiph::spi::default_bmi088;
-        self.register_spi_slave(2, Box::new(default_bmi088((4, 7), (4, 8)).with_source(StaticImu::default())));
-        self.register_i2c_slave(1, Box::new(mpu6050(StaticImu::default())));
-        self.register_i2c_slave(1, Box::new(bmp280(StaticBaro::at_height(baro_height))));
-        self.register_i2c_slave(1, Box::new(qmc5883(StaticMag::default())));
+        self.register_spi_slave(3, Box::new(default_bmi088((4, 7), (4, 8)).with_source(StaticImu::default())));
+        // I2C 从设备挂 I2C3（port 3）：见 attach_flysim_sensors 的 DMA 冲突说明
+        self.register_i2c_slave(3, Box::new(mpu6050(StaticImu::default())));
+        self.register_i2c_slave(3, Box::new(bmp280(StaticBaro::at_height(baro_height))));
+        self.register_i2c_slave(3, Box::new(qmc5883(StaticMag::default())));
     }
 
     /// 装配总线事务嗅探器（调试平台 P0-1）：把同一嗅探器注入到全部已挂载

@@ -1,5 +1,5 @@
 //! 虚拟外设拓扑（TOML）驱动验收：flyctrl real-sensors 经拓扑文件装配的虚拟
-//! 从设备读到数据——IMU/Baro（I2C）+ GPS（UART 推流）。
+//! 从设备读到数据——IMU（SPI3 bmi088）+ Baro/Mag（I2C3）+ GPS（UART 推流）。
 //!
 //! 与 `x_flyctrl_real_sensors.rs`（代码侧 `attach_default_sensors/attach_default_uart_slaves`）
 //! 等价，但从设备由 `config::apply_topology` 按 `examples/topology_flyctrl.toml` 装配——
@@ -21,9 +21,10 @@ fn flyctrl_real_sensors_via_toml_topology() {
     // 从设备由 TOML 拓扑装配（而非代码侧 attach_default_*）
     let toml = include_str!("../examples/topology_flyctrl.toml");
     let nodes = mcu_simulater::config::apply_topology(&m, toml).expect("拓扑装配失败");
-    assert_eq!(nodes.len(), 5, "拓扑应有 5 个从设备（3 I2C + 2 UART）");
-    // 验证装配结果：i2c1 挂 3 个、usart2/usart3 各挂 1 个
-    assert_eq!(m.i2c.lock().unwrap()[0].lock().unwrap().slave_count(), 3);
+    assert_eq!(nodes.len(), 6, "拓扑应有 6 个从设备（1 SPI + 3 I2C + 2 UART）");
+    // 验证装配结果：spi3 挂 1（bmi088）、i2c3 挂 3、usart2/usart3 各挂 1
+    assert_eq!(m.spi.lock().unwrap()[2].lock().unwrap().slaves().len(), 1); // bmi088
+    assert_eq!(m.i2c.lock().unwrap()[2].lock().unwrap().slave_count(), 3);
     assert_eq!(m.usart.lock().unwrap()[1].lock().unwrap().slaves().len(), 1); // gps
     assert_eq!(m.usart.lock().unwrap()[2].lock().unwrap().slaves().len(), 1); // sbus
 
@@ -53,7 +54,7 @@ fn flyctrl_real_sensors_via_toml_topology() {
     let mut baro_ok = false;
     let mut gps_ok = false;
     let mut panic_seen = false;
-    for step in 0..2000u32 {
+    for step in 0..3200u32 {
         if t_start.elapsed().as_secs() > 300 {
             eprintln!(">>> 超时（300s）终止");
             break;
@@ -118,9 +119,14 @@ fn flyctrl_real_sensors_via_toml_topology() {
 
     let cnt = {
         let i2c_vec = m.i2c.lock().unwrap();
-        let i = i2c_vec[0].lock().unwrap();
+        let i = i2c_vec[2].lock().unwrap(); // I2C3（i2c2）：bmp280/qmc5883 所在
         let sl = i.slaves();
         (sl[0].read_count(), sl[1].read_count(), sl[2].read_count())
+    };
+    let spi_cnt = {
+        let spi_vec = m.spi.lock().unwrap();
+        let s = spi_vec[2].lock().unwrap(); // SPI3（"spi2" 设备）：bmi088
+        s.slaves().iter().map(|sl| sl.access_count()).sum::<u64>()
     };
     eprintln!(
         "RESULT: mounted={mounted} tasks={tasks} hb={hb} imu_ok={imu_ok} baro_ok={baro_ok} gps_ok={gps_ok} panic={panic_seen} slave_reads={cnt:?}"
@@ -132,5 +138,6 @@ fn flyctrl_real_sensors_via_toml_topology() {
     assert!(imu_ok, "IMU 未经 TOML 拓扑虚拟从设备读到数据");
     assert!(baro_ok, "Baro 未经 TOML 拓扑虚拟从设备读到数据");
     assert!(gps_ok, "GPS 未经 TOML 拓扑 UART 推流定位（无 fix established）");
-    assert!(cnt.0 > 0 && cnt.1 > 0, "I2C 从设备无读取");
+
+    assert!(spi_cnt > 0, "SPI 从设备无读取（bmi088）");
 }

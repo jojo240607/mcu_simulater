@@ -192,9 +192,9 @@ fn parse_value(s: &str) -> Result<TomlValue, String> {
 /// 拓扑节点：一条虚拟从设备装配指令。
 #[derive(Debug, Clone)]
 pub struct TopologyNode {
-    /// 总线类型：`i2c` / `uart`（spi 预留）
+    /// 总线类型：`i2c` / `uart` / `spi`
     pub bus: String,
-    /// 端口（1 基；I2C 1..3、USART 1..6）
+    /// 端口（1 基；I2C 1..3、SPI 1..3、USART 1..6）
     pub port: u8,
     /// 从设备名（观测/断言）
     pub name: String,
@@ -202,7 +202,7 @@ pub struct TopologyNode {
     pub model: String,
     /// 数据源名（工厂分派）
     pub source: String,
-    /// I2C 从设备地址（7bit；uart 忽略）
+    /// I2C 从设备地址（7bit；uart/spi 忽略）
     pub addr: Option<u8>,
 }
 
@@ -246,9 +246,25 @@ pub fn apply_topology(m: &Machine, toml_src: &str) -> Result<Vec<TopologyNode>, 
                 m.register_uart_slave(node.port, slave);
                 nodes.push(node);
             }
+            "spi_slave" => {
+                let node = TopologyNode {
+                    bus: "spi".into(),
+                    port: sec.port_or(1),
+                    name: sec.str_or("name", "spi_slave"),
+                    model: sec.str_or("model", ""),
+                    source: sec.str_or("source", ""),
+                    addr: None,
+                };
+                if node.model.is_empty() || node.source.is_empty() {
+                    return Err(format!("[spi_slave] `{}` 缺 model/source", node.name));
+                }
+                let slave = build_spi_slave(&node)?;
+                m.register_spi_slave(node.port, slave);
+                nodes.push(node);
+            }
             other => {
                 return Err(format!(
-                    "未知段 `[{other}]`（支持 i2c_slave / uart_slave；spi_slave 预留）"
+                    "未知段 `[{other}]`（支持 i2c_slave / uart_slave / spi_slave）"
                 ));
             }
         }
@@ -275,6 +291,30 @@ fn build_i2c_slave(
         (m, s) => {
             return Err(format!(
                 "[i2c_slave] `{}` 不支持的 model/source 组合: ({m}, {s})（支持 mpu6050/imu、bmp280/baro、qmc5883/mag）",
+                node.name
+            ))
+        }
+    };
+    Ok(boxed)
+}
+
+/// SPI 从设备模型工厂（model + source → VirtualSpiSlave）。
+///
+/// bmi088 的片选固定为板级 GPIOE_7(ACCEL_CS)/GPIOE_8(GYRO_CS)（4,7）/(4,8)，
+/// 与固件 bmi088 设备（"spi2"=SPI3 外设 + 双片选）一致。
+fn build_spi_slave(
+    node: &TopologyNode,
+) -> Result<Box<dyn crate::peripheral::vperiph::spi::VirtualSpiSlave>, String> {
+    use crate::peripheral::vperiph::data_source::StaticImu;
+    use crate::peripheral::vperiph::spi::default_bmi088;
+    let boxed: Box<dyn crate::peripheral::vperiph::spi::VirtualSpiSlave> = match (
+        node.model.as_str(),
+        node.source.as_str(),
+    ) {
+        ("bmi088", "imu") => Box::new(default_bmi088((4, 7), (4, 8)).with_source(StaticImu::default())),
+        (m, s) => {
+            return Err(format!(
+                "[spi_slave] `{}` 不支持的 model/source 组合: ({m}, {s})（支持 bmi088/imu）",
                 node.name
             ))
         }

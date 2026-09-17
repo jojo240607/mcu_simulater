@@ -87,6 +87,21 @@ pub struct Bmi088 {
     pub n_writes: u64,
     /// 寄存器读次数（观测）
     pub n_reads: u64,
+    /// 故障注入：置位后 MISO 恒高（0xFF），帧状态机不推进——模拟芯片断线/
+    /// 无响应（固件侧 WHO_AM_I 校验失败 → healthy=false → 读零值 → FDIR 冻结）。
+    faulted: bool,
+}
+
+impl Bmi088 {
+    /// 故障注入开关：`on=true` 使该从设备对一切访问回 0xFF（总线像悬空一样）。
+    pub fn set_fault(&mut self, on: bool) {
+        self.faulted = on;
+    }
+
+    /// 是否处于故障态（观测/断言）。
+    pub fn faulted(&self) -> bool {
+        self.faulted
+    }
 }
 
 impl Bmi088 {
@@ -103,6 +118,7 @@ impl Bmi088 {
             access: 0,
             n_writes: 0,
             n_reads: 0,
+            faulted: false,
         };
         s.poke(Chip::Accel, 0x00, ACCEL_WHO_AM_I);
         s.poke(Chip::Gyro, 0x00, GYRO_WHO_AM_I);
@@ -227,6 +243,9 @@ impl VirtualSpiSlave for Bmi088 {
     }
 
     fn on_byte(&mut self, byte: u8) -> u8 {
+        if self.faulted {
+            return 0xFF; // 故障态：MISO 恒高，帧状态机不推进
+        }
         let Some(chip) = self.selected else {
             return 0xFF; // 未选中：MISO 默认高
         };
@@ -261,6 +280,10 @@ impl VirtualSpiSlave for Bmi088 {
 
     fn access_count(&self) -> u64 {
         self.access
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 
     fn step(&mut self, dt: f32) {

@@ -1,11 +1,12 @@
 //! 虚拟外设总线协议级验证：flyctrl real-sensors（真实传感器驱动）经模拟器
-//! I2C 虚拟从设备（mpu6050/bmp280/qmc5883 挂在 i2c1）读到数据。
+//! 虚拟从设备读到数据——IMU=BMI088 挂 SPI3（板级 "spi2" 设备=SPI3）、
+//! baro/mag 挂 I2C3（固件 i2c2，DMA 引擎搬运）。
 //!
 //! 里程碑（控制台日志）：
 //!   mounted  = "RUST app mounted"
 //!   tasks    = 任一 "task started"
 //!   real     = sensor 任务日志 "real=1"（real-sensors feature 生效）
-//!   hb       = "hb seq=" 且 imu_ok=true baro=true（真实驱动经 I2C 虚拟从设备读到数据）
+//!   hb       = "hb seq=" 且 imu_ok=true baro=true mag=true（真实驱动经虚拟从设备读到数据）
 //!   gps      = "fix established"（u-blox 驱动首次有效定位；UART 推流 NMEA → 固件解析定位）
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -20,10 +21,12 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
     let app = Path::new(r"/tmp/flyctrl_real.bin");
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
-    // 虚拟外设：3 个 I2C 传感器从设备挂到 i2c1（flyctrl real-sensors 的 i2c0 = I2C1）
-    // baro 高度基准与虚拟 GPS（alt=4.0）对齐，EKF 高度收敛到 4m 而非海平面 0m。
+    // 虚拟外设：IMU=BMI088 挂 SPI3（port 3），baro/mag 挂 I2C3（port 3，
+    // 固件 i2c2 走 DMA）；baro 高度基准与虚拟 GPS（alt=4.0）对齐，
+    // EKF 高度收敛到 4m 而非海平面 0m。
     m.attach_default_sensors_with_baro_height(4.0);
-    assert_eq!(m.i2c.lock().unwrap()[0].lock().unwrap().slave_count(), 3);
+    assert_eq!(m.spi.lock().unwrap()[2].lock().unwrap().slaves().len(), 1); // bmi088
+    assert_eq!(m.i2c.lock().unwrap()[2].lock().unwrap().slave_count(), 3); // I2C3
     // UART 推流从设备：gps→uart1(USART2 port2)、sbus→uart2(USART3 port3)
     m.attach_default_uart_slaves();
     m.load_elf(&elf).unwrap();
@@ -53,7 +56,7 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
     let mut gps_ok = false;
     let mut mag_ok = false;
     let mut panic_seen = false;
-    for step in 0..2000u32 {
+    for step in 0..3200u32 {
         if t_start.elapsed().as_secs() > 300 {
             eprintln!(">>> 超时（300s）终止");
             break;
@@ -120,9 +123,14 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
     println!("=== end ===");
     let cnt = {
         let i2c_vec = m.i2c.lock().unwrap();
-        let i = i2c_vec[0].lock().unwrap();
+        let i = i2c_vec[2].lock().unwrap(); // I2C3：bmp280(1)/qmc5883(2) 被固件读取（mpu6050(0) 保留不读）
         let sl = i.slaves();
         (sl[0].read_count(), sl[1].read_count(), sl[2].read_count())
+    };
+    let spi_cnt = {
+        let spi_vec = m.spi.lock().unwrap();
+        let s = spi_vec[2].lock().unwrap(); // SPI3：bmi088
+        s.slaves().iter().map(|sl| sl.access_count()).sum::<u64>()
     };
     let ucnt = {
         let uv = m.usart.lock().unwrap();
@@ -136,15 +144,16 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
         )
     };
     eprintln!(
-        "RESULT: mounted={mounted} tasks={tasks} hb={hb} imu_ok={imu_ok} baro_ok={baro_ok} gps_ok={gps_ok} mag_ok={mag_ok} panic={panic_seen} slave_reads={cnt:?} uart_frames={ucnt:?}"
+        "RESULT: mounted={mounted} tasks={tasks} hb={hb} imu_ok={imu_ok} baro_ok={baro_ok} gps_ok={gps_ok} mag_ok={mag_ok} panic={panic_seen} slave_reads={cnt:?} spi_access={spi_cnt} uart_frames={ucnt:?}"
     );
     assert!(!panic_seen, "应用 panic（IMU/baro 构造失败？）");
     assert!(mounted, "App 分区未挂载");
     assert!(tasks, "业务任务未启动");
     assert!(hb, "未出现周期心跳");
-    assert!(imu_ok, "IMU(MPU6050) 未经 I2C 虚拟从设备读到数据（imu_ok=false）");
-    assert!(baro_ok, "Baro(BMP280) 未经 I2C 虚拟从设备读到数据（baro=false）");
+    assert!(imu_ok, "IMU(BMI088) 未经 SPI3 虚拟从设备读到数据（imu_ok=false）");
+    assert!(baro_ok, "Baro(BMP280) 未经 I2C3 虚拟从设备读到数据（baro=false）");
     assert!(gps_ok, "GPS(u-blox) 未经 UART 推流从设备读到 NMEA（gps=false）");
-    assert!(mag_ok, "Mag(QMC5883) 未经 I2C 虚拟从设备读到数据（mag=false，hb 行 mag 字段）");
-    assert!(cnt.0 > 0 && cnt.1 > 0, "I2C 从设备无读取（虚拟外设未工作）");
+    assert!(mag_ok, "Mag(QMC5883) 未经 I2C3 虚拟从设备读到数据（mag=false，hb 行 mag 字段）");
+    assert!(cnt.1 > 0 && cnt.2 > 0, "I2C3 从设备无读取（bmp280(1)/qmc5883(2)，DMA 引擎未工作？）");
+    assert!(spi_cnt > 0, "SPI3 从设备无读取（bmi088 未工作）");
 }

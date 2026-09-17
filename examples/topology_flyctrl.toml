@@ -9,27 +9,36 @@
 # 字段：
 #   [[i2c_slave]]  port=I2C 端口(1..3)  name=观测名  addr=7bit 地址
 #                  model=从设备模型  source=物理模型（数据源）
+#   [[spi_slave]]  port=SPI 端口(1..3)  name=观测名
+#                  model=从设备模型  source=物理模型（数据源）
 #   [[uart_slave]] port=USART 端口(1..6)  name=观测名
 #                  model=推流模型  source=物理模型
 # ============================================================================
 
-# ---- I2C（flyctrl real-sensors 的 i2c0 = I2C1, port=1）----
+# ---- SPI（IMU 主源：BMI088 挂在板级 "spi2" 设备 = SPI3 外设, port=3）----
+[[spi_slave]]
+port = 3
+name = "bmi088"
+model = "bmi088"       # 寄存器级（WHO_AM_I + accel/gyro 数据区）
+source = "imu"         # StaticImu：悬停 accel=[0,0,9.81] gyro=0
+
+# ---- I2C（flyctrl real-sensors 的 baro/mag 走 i2c2 = I2C3, port=3）----
 [[i2c_slave]]
-port = 1
+port = 3
 name = "mpu6050"
 addr = 0x68
-model = "mpu6050"      # 寄存器级（WHO_AM_I + 0x3B 起 14B 动态 BE）
+model = "mpu6050"      # 寄存器级（WHO_AM_I + 0x3B 起 14B 动态 BE；固件已不用，保留挂载）
 source = "imu"         # StaticImu：悬停 accel=[0,0,9.81] gyro=0
 
 [[i2c_slave]]
-port = 1
+port = 3
 name = "bmp280"
 addr = 0x76
 model = "bmp280"       # 寄存器级（ID 0x58 + 0xF7 起 6B 20bit 压力）
 source = "baro"        # StaticBaro：101325 Pa（海平面）
 
 [[i2c_slave]]
-port = 1
+port = 3
 name = "qmc5883"
 addr = 0x0D
 model = "qmc5883"      # 寄存器级（0x00 起 6B LE 三轴磁力）
@@ -52,6 +61,5 @@ source = "sbus"        # StaticSbus：ch0..15=1500（ch2=1000 油门最小）
 # [[spi_slave]]
 # port = 1
 # name = "lis3mdl"
-# addr = 0x00            # SPI 无地址，片选位段
 # model = "lis3mdl"
 # source = "mag"
