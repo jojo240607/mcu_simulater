@@ -3,7 +3,7 @@
 //! 无 USB / 无 MAVLink：PC 每 4ms 物理步把传感器/设定点/解锁写入 SRAM3 共享区
 //! （0x2002_0000，mcu_simulater 额外映射），固件 uplink 每 1ms 轮询 `pc_seq`
 //! 变化后全量注入 SENSOR_FRAME 唤醒 control；telemetry 每 20ms 把执行器/诊断
-//! 写回共享区，PC 读回驱动 plant（ToyWorld/SimLoop）。
+//! 写回共享区，PC 读回驱动 plant（PhySdkWorld/SimLoop）。
 //!
 //! 共享区布局见 flyctrl/app/src/flyctrl/hil_shmem.rs（双方硬编码一致）。
 //!
@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use fly_sim_core::controller::ControllerKind;
-use fly_sim_core::physics::ToyWorld;
+use fly_sim_core::physics::PhySdkWorld;
 use fly_sim_core::sensor::SensorConfig;
 use fly_sim_core::sim::SimLoop;
 use flyctrl_core::config::VehicleConfig;
@@ -126,7 +126,7 @@ fn shmem_closed_loop() {
     shm_init(&m);
 
     let mut sim = SimLoop::new(
-        ToyWorld::new(9.81),
+        PhySdkWorld::create_empty(),
         &VehicleConfig::default_quad(),
         0.004,
         None,

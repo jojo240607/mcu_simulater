@@ -1,7 +1,7 @@
 //! HIL 联调：fly-simulater（PC 物理世界）↔ mcu_simulater（飞控 MCU）闭环。
 //!
 //! 组件与数据流（与 fly-sim-server 的 HIL 场景同构，链路换成虚拟口）：
-//!   - PC 端物理世界：`fly_sim_core::sim::SimLoop`（ToyWorld 替身，`step_hil`/`last_imu`）；
+//!   - PC 端物理世界：`fly_sim_core::sim::SimLoop`（PhySdkWorld 物理引擎，`step_hil`/`last_imu`）；
 //!   - 链路：`fly_sim_hil::hil_link::HilLink`（`open_virtual` 接 [`McuSimPort`]，
 //!     MAVLink 编解码/注入节奏/心跳/ARM 与真实板 HIL 完全同一份代码）；
 //!   - MCU：mcu_simulater 跑 joc-base minimal + flyctrl-app（--features hil）：
@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use fly_sim_core::controller::ControllerKind;
-use fly_sim_core::physics::ToyWorld;
+use fly_sim_core::physics::PhySdkWorld;
 use fly_sim_core::sensor::SensorConfig;
 use fly_sim_core::sim::SimLoop;
 use fly_sim_hil::hil_link::{HilLink, HilPort};
@@ -148,7 +148,7 @@ fn hil_mcusim_closed_loop() {
     // PC 每步：读回 actuator → 推进物理 → 注入 IMU/GPS/SET_POSITION 真值
     //（nav 节流 HIL_NAV_EVERY=8 步，与 fly-sim-server 一致）。MCU 由 run 预算推进。
     let mut sim = SimLoop::new(
-        ToyWorld::new(9.81),
+        PhySdkWorld::create_empty(),
         &VehicleConfig::default_quad(),
         0.004,
         None,

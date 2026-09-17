@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use fly_sim_core::controller::ControllerKind;
-use fly_sim_core::physics::ToyWorld;
+use fly_sim_core::physics::PhySdkWorld;
 use fly_sim_core::sensor::SensorConfig;
 use fly_sim_core::sim::SimLoop;
 use flyctrl_core::config::VehicleConfig;
@@ -30,12 +30,15 @@ use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
 const APP_REAL: &str = "/tmp/flyctrl_real.bin";
 
-// TIM 基址（固件 pwm0..3 = TIM3/TIM2/TIM1/TIM4 CH1）
-const TIM3: u64 = 0x4000_0400; // pwm0
-const TIM2: u64 = 0x4000_0000; // pwm1
-const TIM1: u64 = 0x4001_0000; // pwm2
-const TIM4: u64 = 0x4000_0800; // pwm3
-const OFF_CRR1: u64 = 0x34;
+// TIM 基址（固件 pwm0..3 = TIM3/TIM2/TIM5/TIM4，pwm2 为 TIM5_CH2——板级已把
+// TIM1_CH1_PA8 让给 I2C3 SCL，pwm2 改挂 TIM5_CH2_PA1）
+const TIM3: u64 = 0x4000_0400; // pwm0  CH1
+const TIM2: u64 = 0x4000_0000; // pwm1  CH1
+const TIM5: u64 = 0x4000_0C00; // pwm2  CH2
+const TIM4: u64 = 0x4000_0800; // pwm3  CH1
+// CCR 偏移：CH1=0x34(CCR1)，pwm2 在 CH2 → 0x38(CCR2)
+const OFF_CRR_CH1: u64 = 0x34;
+const OFF_CRR_CH2: u64 = 0x38;
 const OFF_ARR: u64 = 0x2C;
 
 // 固定 GPS 原点（悬停点附近）
@@ -54,11 +57,12 @@ fn rd_u32(m: &Arc<Mutex<Machine>>, addr: u64) -> u32 {
 
 /// 读 4 路 PWM 的 CCR1/ARR → 归一化推力（m = (duty_us - 1000)/1000）。
 fn read_thrust(m: &Arc<Mutex<Machine>>) -> [f32; 4] {
-    let tims = [TIM3, TIM2, TIM1, TIM4];
+    let tims = [TIM3, TIM2, TIM5, TIM4];
     let mut out = [0f32; 4];
     for (i, &t) in tims.iter().enumerate() {
         let arr = rd_u32(m, t + OFF_ARR) as f32;
-        let ccr = rd_u32(m, t + OFF_CRR1) as f32;
+        let crr = if i == 2 { OFF_CRR_CH2 } else { OFF_CRR_CH1 }; // pwm2=TIM5_CH2
+        let ccr = rd_u32(m, t + crr) as f32;
         let duty = if arr > 0.0 { ccr / arr } else { 0.0 }; // 0..1 占空比
         let us = duty * 2500.0; // 400Hz 周期 2500us
         out[i] = ((us - 1000.0) / 1000.0).clamp(0.0, 1.0);
@@ -66,33 +70,33 @@ fn read_thrust(m: &Arc<Mutex<Machine>>) -> [f32; 4] {
     out
 }
 
-/// EST_STATE 布局（由 telemetry_entry 反汇编 + 运行期 f32 转储交叉确认）：
-///   offset 0:   VehicleState (72B)，但编译器对结构体字段做了重排（非 repr(C)）：
-///     +0   att 四元数 (16B) — dump index 0 恒为 1.0（att.w 水平悬停）
-///     +16  time_boot_ms (4B)
-///     +20  pos[0]  +24 pos[1]  +28 pos[2]  (NED, D 向下正) — dump index 5/6/7
-///     +32  vel[0]  +36 vel[1]  +40 vel[2]  — dump index 8/9/10
+/// EST_STATE 布局（当前 app.elf 实测声明序，非 repr(C)，重排随编译变化）：
+///   offset 0:   VehicleState (72B)：
+///     +0   time_boot_ms (i32)
+///     +4   pos[0]  +8  pos[1]  +12 pos[2]  (NED, D 向下正) — dump index 1/2/3
+///     +16  vel[0]  +20 vel[1]  +24 vel[2]  — dump index 4/5/6
+///     +28  att 四元数 (16B) — dump index 7..10（悬停 att.w=1.0）
 ///     +44  omega[3] +56 airspeed +60 accel_bias[3]
 ///   offset 72:  Health (1B)
 ///   offset 73:  armed (1B)
 /// 依据：telemetry_entry 0x08064128-0x08064196 把 sp+32/36/40/44/48/52（EST_STATE 拷贝
-/// 偏移 +20/+24/+28/+32/+36/+40）写入 LOCAL_POSITION_NED payload pos/vel 各分量；
+/// 偏移 +4/+8/+12/+16/+20/+24）写入 LOCAL_POSITION_NED payload pos/vel 各分量；
 /// 且运行期转储 index7 与固件控制台 est.pos[2] 数值吻合（早期 ≈1.0）。
 /// 读 EKF 估计高度 est.pos[2]（f32，NED D 向下正）。
 fn read_ekf_z(m: &Arc<Mutex<Machine>>) -> f32 {
-    let b = m.lock().unwrap().cpu.mem_read(0x2000_9074 + 28, 4).unwrap();
+    let b = m.lock().unwrap().cpu.mem_read(0x2000_9084 + 12, 4).unwrap(); // est.pos[2] (实测 index3)
     f32::from_le_bytes(b.try_into().unwrap())
 }
 
 /// [DIAG] 转储 EST_STATE 前 72B（VehicleState）为 18 个 f32，定位 est.pos[2] 实际偏移。
 fn dump_est_state(m: &Arc<Mutex<Machine>>) -> Vec<f32> {
-    let b = m.lock().unwrap().cpu.mem_read(0x2000_9074, 72).unwrap();
+    let b = m.lock().unwrap().cpu.mem_read(0x2000_9084, 72).unwrap();
     (0..18).map(|i| f32::from_le_bytes([b[i*4], b[i*4+1], b[i*4+2], b[i*4+3]])).collect()
 }
 
 /// [DIAG] boot 后、ARM 前转储 EKF 状态 + 传感器帧字段，定位 boot 阶段 EKF z 漂移。
 /// 内存布局（据 symbol 表）：
-///   EST_STATE    @0x2000_9074 (VehicleState 72B; pos[2] @ +28)
+///   EST_STATE    @0x2000_9084 (VehicleState 72B; 实测声明序：time_boot_ms@0 pos@4..16 vel@16..28 att@28..; pos[2] @ +12)
 ///   SENSOR_FRAME @0x2000_9018 (SensorFrame: imu Option(24B) + rc(24B) + gps Option(24B) + baro Option(4B)...)
 fn dump_boot_state(m: &mut Machine) {
     fn rd(m: &mut Machine, addr: u64, len: usize) -> Vec<u8> {
@@ -109,14 +113,14 @@ fn dump_boot_state(m: &mut Machine) {
     fn u8at(m: &mut Machine, addr: u64) -> u8 {
         rd(m, addr, 1).first().copied().unwrap_or(0)
     }
-    let ekf_z = f32at(m, 0x2000_9074 + 28);
-    let ekf_velz = f32at(m, 0x2000_9074 + 40);
+    let ekf_z = f32at(m, 0x2000_9084 + 12);
+    let ekf_velz = f32at(m, 0x2000_9084 + 24);
     // SENSOR_FRAME 字段（据 mod.rs SensorFrame 布局推断；不稳妥则显示原始字节）
     let fr = rd(m, 0x2000_9018, 96);
     eprintln!(
         "[DIAG-BOOT] EKF pos=({:.3},{:.3},{:.3}) vel=({:.3},{:.3},{:.3})",
-        f32at(m, 0x2000_9074 + 20), f32at(m, 0x2000_9074 + 24), ekf_z,
-        f32at(m, 0x2000_9074 + 32), f32at(m, 0x2000_9074 + 36), ekf_velz,
+        f32at(m, 0x2000_9084 + 4), f32at(m, 0x2000_9084 + 8), ekf_z,
+        f32at(m, 0x2000_9084 + 16), f32at(m, 0x2000_9084 + 20), ekf_velz,
     );
     eprintln!(
         "[DIAG-BOOT] SENSOR_FRAME@0x20009018 前96B: {}",
@@ -124,7 +128,7 @@ fn dump_boot_state(m: &mut Machine) {
     );
     eprintln!(
         "[DIAG-BOOT] SENSOR_SEQ={} HIL_GATES=0x{:08x} G_CMD_ARMED={}",
-        u32at(m, 0x2000_b5cc), u32at(m, 0x2000_b62c), u8at(m, 0x2000_b669)
+        u32at(m, 0x2000_b5dc), u32at(m, 0x2000_b63c), u8at(m, 0x2000_b679)
     );
 }
 
@@ -142,7 +146,7 @@ fn settle_ekf_before_arm(m: &Arc<Mutex<Machine>>, tag: &str, tol: f32) -> f32 {
     let mut z = f32::NAN;
     for i in 0..400 {
         mm.run(1_000_000).unwrap();
-        z = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9074 + 28, 4).unwrap().try_into().unwrap());
+        z = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9084 + 12, 4).unwrap().try_into().unwrap());
         if i % 50 == 0 {
             eprintln!("[{tag}] 收敛推进 i={i} ekf_z={z:.3}");
         }
@@ -150,8 +154,8 @@ fn settle_ekf_before_arm(m: &Arc<Mutex<Machine>>, tag: &str, tol: f32) -> f32 {
             break;
         }
     }
-    let fr_thr = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9018 + 0x4C, 4).unwrap().try_into().unwrap());
-    let fr_fresh = mm.cpu.mem_read(0x2000_9018 + 0x52, 1).unwrap()[0];
+    let fr_thr = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9018 + 0x5C, 4).unwrap().try_into().unwrap());
+    let fr_fresh = mm.cpu.mem_read(0x2000_9018 + 0x64, 1).unwrap()[0];
     eprintln!("[{tag}] 收敛完成 ekf_z={z:.3} frame.throttle={fr_thr:.3} frame.fresh={fr_fresh}");
     z
 }
@@ -170,7 +174,7 @@ fn run_closed_loop(
     log_every: u64,
 ) -> (Option<flyctrl_core::vehicle::VehicleState>, f32, Vec<(u64, [f32; 3])>) {
     let mut sim = SimLoop::new(
-        ToyWorld::new(9.81),
+        PhySdkWorld::create_empty(),
         &VehicleConfig::default_quad(),
         0.004,
         None,
@@ -324,7 +328,7 @@ fn vperiph_closed_loop() {
     // 地面站 ARM 等效注入：直接置 G_CMD_ARMED（AtomicBool）。
     // 地址随固件构建变化：`arm-none-eabi-nm app.elf | grep G_CMD_ARMED` 获取，
     // 重建固件后需同步（当前 clean 基线 = 0x2000b669）。
-    m.lock().unwrap().cpu.mem_write(0x2000_b669, &[1u8]).unwrap();
+    m.lock().unwrap().cpu.mem_write(0x2000_b679, &[1u8]).unwrap();
 
     // 解锁 RC：ch4=2000（SBUS raw 1811 > 1700 armed）、ch3=1500（油门中位 raw 992 → 0.5）
     {
@@ -346,22 +350,29 @@ fn vperiph_closed_loop() {
     }
     {
         let mut mm = m.lock().unwrap();
-        let est_armed = mm.cpu.mem_read(0x2000_9074 + 116, 1).unwrap()[0];
-        let fr_armed = mm.cpu.mem_read(0x2000_9018 + 0x58, 1).unwrap()[0];
-        let fr_fresh = mm.cpu.mem_read(0x2000_9018 + 0x52, 1).unwrap()[0];
-        let fr_thr = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9018 + 0x4C, 4).unwrap().try_into().unwrap());
-        let cmd_armed = mm.cpu.mem_read(0x2000_b669, 1).unwrap()[0];
-        let gates = u32::from_le_bytes(mm.cpu.mem_read(0x2000_b62c, 4).unwrap().try_into().unwrap());
+        let est_armed = mm.cpu.mem_read(0x2000_9084 + 73, 1).unwrap()[0]; // EstState: est(72B)+Health(1B)+armed
+        let fr_armed = mm.cpu.mem_read(0x2000_9018 + 0x68, 1).unwrap()[0]; // 实测：SensorFrame.armed @ +0x68
+        let fr_fresh = mm.cpu.mem_read(0x2000_9018 + 0x64, 1).unwrap()[0]; // 实测：fresh 标志位簇 @ +0x64（近似）
+        let fr_thr = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9018 + 0x5C, 4).unwrap().try_into().unwrap()); // rc.throttle=0.5
+        let cmd_armed = mm.cpu.mem_read(0x2000_b679, 1).unwrap()[0];
+        let gates = u32::from_le_bytes(mm.cpu.mem_read(0x2000_b63c, 4).unwrap().try_into().unwrap());
         eprintln!("[DIAG] est.armed={est_armed} G_CMD_ARMED={cmd_armed} frame.armed={fr_armed} frame.fresh={fr_fresh} frame.throttle={fr_thr}");
         eprintln!("[DIAG] HIL_GATES=0x{gates:02x} armed={} rc={} health_ok={} est={} sp={} att_i={} pos_i={}",
                   (gates>>0)&1, (gates>>1)&1, (gates>>2)&1, (gates>>3)&1, (gates>>4)&1, (gates>>5)&1, (gates>>6)&1);
         let dm: Vec<String> = (0..4).map(|k| {
-            let off = 0x2000_b61c + 4*k;
+            let off = 0x2000_b62c + 4*k; // DBG_MOTOR[0..4]
             f32::from_le_bytes(mm.cpu.mem_read(off, 4).unwrap().try_into().unwrap()).to_string()
         }).collect();
         eprintln!("[DIAG] DBG_MOTOR=[{}]", dm.join(","));
-        let pre = f32::from_le_bytes(mm.cpu.mem_read(0x2000_b660, 4).unwrap().try_into().unwrap());
-        let thr = f32::from_le_bytes(mm.cpu.mem_read(0x2000_b664, 4).unwrap().try_into().unwrap());
+        let pre = f32::from_le_bytes(mm.cpu.mem_read(0x2000_b670, 4).unwrap().try_into().unwrap());
+        let thr = f32::from_le_bytes(mm.cpu.mem_read(0x2000_b674, 4).unwrap().try_into().unwrap());
+        // [DIAG] SENSOR_FRAME 全字节（定位 fresh/throttle/armed 字段偏移；布局随编译重排）
+        let fbytes = mm.cpu.mem_read(0x2000_9018, 112).unwrap_or_default();
+        let hexs: Vec<String> = fbytes.chunks(4).enumerate().map(|(i, c)| {
+            let v = u32::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0), c.get(2).copied().unwrap_or(0), c.get(3).copied().unwrap_or(0)]);
+            format!("+{:+03x}={v:08x}", i*4)
+        }).collect();
+        eprintln!("[DIAG] SENSOR_FRAME: {}", hexs.join(" "));
         eprintln!("[DIAG] DBG_PRE={pre} DBG_THR={thr}");
     }
     assert!(max_thrust > 0.05, "MCU 未回传有效推力（PWM CCR 未通？sensors 链路未通？未解锁？）");
@@ -433,7 +444,7 @@ fn vperiph_hover_long() {
     settle_ekf_before_arm(&m, "vperiph-hover", 0.6);
 
     // ARM（G_CMD_ARMED 直接置 1）
-    m.lock().unwrap().cpu.mem_write(0x2000_b669, &[1u8]).unwrap();
+    m.lock().unwrap().cpu.mem_write(0x2000_b679, &[1u8]).unwrap();
 
     // 解锁 RC：ch4=2000（armed）、ch3=1500（油门中位）
     {
@@ -535,7 +546,7 @@ fn vperiph_hover_sustained() {
     settle_ekf_before_arm(&m, "vperiph-sustain", 0.6);
 
     // ARM + RC 解锁
-    m.lock().unwrap().cpu.mem_write(0x2000_b669, &[1u8]).unwrap();
+    m.lock().unwrap().cpu.mem_write(0x2000_b679, &[1u8]).unwrap();
     {
         let mut st = state.lock().unwrap();
         st.rc_ch[4] = 2000.0;
