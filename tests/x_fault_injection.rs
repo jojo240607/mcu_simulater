@@ -15,7 +15,6 @@
 //! `on_read → None` → 模拟器 I2C 置 SR1.AF（固件读失败）；SPI
 //! `inject_spi_fault(port, name, on)` → `Bmi088.faulted` → `on_byte` 恒回 0xFF。
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
@@ -35,7 +34,7 @@ fn i2c1_read_counts(m: &Machine) -> (u64, u64, u64) {
 /// bmi088（SPI3）注入故障态（模拟 IMU 出厂即断线）。
 fn setup(fault_spi_imu: bool) -> (Machine, Arc<AtomicBool>, Arc<AtomicU32>) {
     let elf = artifact::joc_base_elf();
-    let app = Path::new(r"/tmp/flyctrl_real.bin");
+    let app = artifact::flyctrl_real_app_bin();
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     m.attach_default_sensors();

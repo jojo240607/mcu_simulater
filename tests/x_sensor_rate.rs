@@ -15,14 +15,12 @@
 //!
 //! 注：采样率上限由 CPU 总负载（5 路驱动状态机 + control 任务 EKF 同核抢占）
 //! 决定，与 DMA 待搬运检查间隔无关（256/16/4 三档实测均 254.5Hz）。
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
-const APP_REAL: &str = "/tmp/flyctrl_real.bin";
 const SENSOR_SEQ: u64 = 0x2000_b5dc;
 
 fn systick(m: &Machine) -> u64 {
@@ -41,7 +39,7 @@ fn seq(m: &mut Machine) -> u32 {
 #[test]
 fn sensor_rate_and_fw_clock_alignment() {
     let sys = artifact::joc_base_elf();
-    let app = Path::new(APP_REAL);
+    let app = artifact::flyctrl_real_app_bin();
     assert!(sys.exists() && app.exists());
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
@@ -59,7 +57,7 @@ fn sensor_rate_and_fw_clock_alignment() {
         st.rc_ch = [1500.0; 16];
     }
     m.load_elf(&sys).unwrap();
-    m.load_app_partition(app).unwrap();
+    m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
     // boot + 收敛（与闭环测试同口径）
     for _ in 0..12 {

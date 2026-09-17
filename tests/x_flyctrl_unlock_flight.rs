@@ -6,7 +6,6 @@
 //! - 电机指令非零（hb 行 m=[...] 解析），执行器有真实输出；
 //! - EKF/控制律全程有限（无 NaN/panic），姿态稳定。
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
@@ -19,7 +18,7 @@ use mcu_simulater::peripheral::vperiph::uart::NmeaGps;
 #[test]
 fn unlock_and_fly_over_virtual_peripherals() {
     let elf = artifact::joc_base_elf();
-    let app = Path::new(r"/tmp/flyctrl_real.bin");
+    let app = artifact::flyctrl_real_app_bin();
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     // I2C 传感器 + baro 高度 4m（与 GPS 一致）

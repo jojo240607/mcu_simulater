@@ -6,13 +6,14 @@
 //! | 产物 | 产出来源 |
 //! |---|---|
 //! | joc-base minimal ELF（`stm32f407_minimal.elf`） | `joc-base` 构建（build_hil / build_rel 配置等价，见 docs） |
-//! | `flyctrl/app.bin` | `flyctrl` 构建（real-sensors / hil feature） |
+//! | `flyctrl/app.bin` | `flyctrl` 默认 feature 构建（env `JOC_APP_FLYCTRL`） |
+//! | `flyctrl` real-sensors 变体 | `./scripts/build.sh real-sensors` → `/tmp/flyctrl_real.bin`（env `JOC_APP_FLYCTRL_REAL`） |
 //! | `joc-drvtest-app/app.bin` | `joc-drvtest-app` 构建 |
 //! | `joc-rtos-app-sdk/app.bin` | `joc-rtos-app-sdk` 构建 |
 //!
 //! 解析优先级（每项产物一致）：
-//! 1. **环境变量显式指定**（`JOC_BASE_ELF` / `JOC_APP_FLYCTRL` / `JOC_APP_DRVTEST` /
-//!    `JOC_APP_SDK`）——`scripts/integrate.sh` 一键联调即导出这些变量；
+//! 1. **环境变量显式指定**（`JOC_BASE_ELF` / `JOC_APP_FLYCTRL` / `JOC_APP_FLYCTRL_REAL` /
+//!    `JOC_APP_DRVTEST` / `JOC_APP_SDK`）——`scripts/integrate.sh` 一键联调即导出这些变量；
 //! 2. **壳工程规范布局**：本仓库上一级目录即壳工程根，按 `../joc-base/build_hil/...`、
 //!    `../flyctrl/app.bin` 等相对位置查找（取首个存在的候选）；
 //! 3. **历史开发机路径** `/home/ubuntu/work/...`（仅当存在时兜底，兼容旧工作区）。
@@ -23,6 +24,8 @@ use std::path::{Path, PathBuf};
 pub const ENV_JOC_BASE_ELF: &str = "JOC_BASE_ELF";
 /// 环境变量：flyctrl app.bin。
 pub const ENV_APP_FLYCTRL: &str = "JOC_APP_FLYCTRL";
+/// 环境变量：flyctrl real-sensors feature 固件 app.bin（见 [`flyctrl_real_app_bin`]）。
+pub const ENV_APP_FLYCTRL_REAL: &str = "JOC_APP_FLYCTRL_REAL";
 /// 环境变量：joc-drvtest-app app.bin。
 pub const ENV_APP_DRVTEST: &str = "JOC_APP_DRVTEST";
 /// 环境变量：joc-rtos-app-sdk app.bin。
@@ -124,6 +127,25 @@ pub fn joc_base_build_dir() -> PathBuf {
 /// flyctrl 固件 app.bin。
 pub fn flyctrl_app_bin() -> PathBuf {
     resolve(ENV_APP_FLYCTRL, &["flyctrl/app.bin"], &["flyctrl/app.bin"])
+}
+
+/// flyctrl **real-sensors feature** 固件 app.bin。
+///
+/// real-sensors 与默认/hil 是**两个不同产物**，因此独立于 [`flyctrl_app_bin`]
+/// （后者经 `JOC_APP_FLYCTRL`，HIL 用）：
+///
+/// 解析优先级：
+/// 1. env `JOC_APP_FLYCTRL_REAL`；
+/// 2. `./scripts/build.sh real-sensors` 的约定落点 `/tmp/flyctrl_real.bin`
+///    （README / docs / `fly-sim-server` 共用的产物名）；
+/// 3. 壳工程内 `flyctrl/app_real.bin`（若产物构建进规范布局）；
+/// 4. 全不存在时返回约定落点，报错信息指向构建命令。
+pub fn flyctrl_real_app_bin() -> PathBuf {
+    resolve(
+        ENV_APP_FLYCTRL_REAL,
+        &["/tmp/flyctrl_real.bin", "flyctrl/app_real.bin"],
+        &["/tmp/flyctrl_real.bin"],
+    )
 }
 
 /// joc-drvtest-app 固件 app.bin。

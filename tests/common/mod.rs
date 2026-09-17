@@ -4,7 +4,6 @@
 //! → mcu_simulater 虚拟外设（I2C IMU/baro/mag + UART GPS/SBUS）→ real-sensors
 //! 固件真实驱动。不经 fly-simulater 物理闭环（非 SIL/HIL）。
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use unicorn_engine::RegisterARM;
@@ -95,7 +94,7 @@ impl EnvHarness {
     /// `prefill`：attach 后、固件首跑前立即写入的场景初始状态（默认 Hover 静止）。
     pub fn new(mut scn: EnvScenario, prefill: bool) -> Self {
         let elf = artifact::joc_base_elf();
-        let app = Path::new(r"/tmp/flyctrl_real.bin");
+        let app = artifact::flyctrl_real_app_bin();
         let mut m = Machine::new_m4f().unwrap();
         m.map_stm32f407_layout().unwrap();
         let st = Arc::new(Mutex::new(FlySimState::default()));

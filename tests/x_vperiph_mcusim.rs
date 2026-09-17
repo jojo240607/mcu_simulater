@@ -11,9 +11,8 @@
 //! 全程无 USB / 无 MAVLink 帧连接飞控。
 //!
 //! 构建前置：`cd joc-base && cmake --build build_rel`（minimal elf）、
-//! `cd flyctrl && python3 build_app.py --features real-sensors --out /tmp/flyctrl_real.bin`。
+//! `./scripts/build.sh real-sensors`（产出 `/tmp/flyctrl_real.bin`）。
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -27,8 +26,6 @@ use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 use unicorn_engine::RegisterARM;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
-
-const APP_REAL: &str = "/tmp/flyctrl_real.bin";
 
 // TIM 基址（固件 pwm0..3 = TIM3/TIM2/TIM5/TIM4，pwm2 为 TIM5_CH2——板级已把
 // TIM1_CH1_PA8 让给 I2C3 SCL，pwm2 改挂 TIM5_CH2_PA1）
@@ -293,9 +290,9 @@ fn run_closed_loop(
 fn vperiph_closed_loop() {
     init_log();
     let sys = artifact::joc_base_elf();
-    let app = Path::new(APP_REAL);
+    let app = artifact::flyctrl_real_app_bin();
     assert!(sys.exists(), "minimal elf 缺失");
-    assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/flyctrl_real.bin");
+    assert!(app.exists(), "real-sensors app 缺失：{} —— 先跑 ./scripts/build.sh real-sensors，或用 JOC_APP_FLYCTRL_REAL 指向产物", app.display());
 
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
@@ -323,7 +320,7 @@ fn vperiph_closed_loop() {
     }
 
     m.load_elf(&sys).unwrap();
-    m.load_app_partition(app).unwrap();
+    m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
     for _ in 0..12 {
         m.run(1_000_000).unwrap();
@@ -412,9 +409,9 @@ fn vperiph_closed_loop() {
 fn vperiph_hover_long() {
     init_log();
     let sys = artifact::joc_base_elf();
-    let app = Path::new(APP_REAL);
+    let app = artifact::flyctrl_real_app_bin();
     assert!(sys.exists(), "minimal elf 缺失");
-    assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/flyctrl_real.bin");
+    assert!(app.exists(), "real-sensors app 缺失：{} —— 先跑 ./scripts/build.sh real-sensors，或用 JOC_APP_FLYCTRL_REAL 指向产物", app.display());
 
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
@@ -439,7 +436,7 @@ fn vperiph_hover_long() {
     }
 
     m.load_elf(&sys).unwrap();
-    m.load_app_partition(app).unwrap();
+    m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
     for _ in 0..12 {
         m.run(1_000_000).unwrap();
@@ -536,9 +533,9 @@ fn vperiph_hover_long() {
 fn vperiph_hover_sustained() {
     init_log();
     let sys = artifact::joc_base_elf();
-    let app = Path::new(APP_REAL);
+    let app = artifact::flyctrl_real_app_bin();
     assert!(sys.exists(), "minimal elf 缺失");
-    assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/flyctrl_real.bin");
+    assert!(app.exists(), "real-sensors app 缺失：{} —— 先跑 ./scripts/build.sh real-sensors，或用 JOC_APP_FLYCTRL_REAL 指向产物", app.display());
 
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
@@ -561,7 +558,7 @@ fn vperiph_hover_sustained() {
     }
 
     m.load_elf(&sys).unwrap();
-    m.load_app_partition(app).unwrap();
+    m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
     for _ in 0..12 {
         m.run(1_000_000).unwrap();

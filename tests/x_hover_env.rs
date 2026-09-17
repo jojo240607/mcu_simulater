@@ -19,9 +19,8 @@
 //! 固件收到与 SIL 控制律同源的噪声化读数（`SimLoop::last_*`）。
 //!
 //! 构建前置：`cd joc-base && cmake --build build_rel`（minimal elf）、
-//! `cd flyctrl && python3 build_app.py --features real-sensors --out /tmp/flyctrl_real.bin`。
+//! `./scripts/build.sh real-sensors`（产出 `/tmp/flyctrl_real.bin`）。
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -37,14 +36,16 @@ use mcu_simulater::machine::Machine;
 use unicorn_engine::RegisterARM;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
-const APP_REAL: &str = "/tmp/flyctrl_real.bin";
-
 // TIM 基址（固件 pwm0..3 = TIM3/TIM2/TIM1/TIM4 CH1）
-const TIM3: u64 = 0x4000_0400; // pwm0
-const TIM2: u64 = 0x4000_0000; // pwm1
-const TIM1: u64 = 0x4001_0000; // pwm2
-const TIM4: u64 = 0x4000_0800; // pwm3
-const OFF_CRR1: u64 = 0x34;
+// TIM 基址（固件 pwm0..3 = TIM3/TIM2/TIM5/TIM4，pwm2 为 TIM5_CH2——板级已把
+// TIM1_CH1_PA8 让给 I2C3 SCL，pwm2 改挂 TIM5_CH2_PA1；与 x_vperiph_mcusim 同源）
+const TIM3: u64 = 0x4000_0400; // pwm0  CH1
+const TIM2: u64 = 0x4000_0000; // pwm1  CH1
+const TIM5: u64 = 0x4000_0C00; // pwm2  CH2
+const TIM4: u64 = 0x4000_0800; // pwm3  CH1
+// CCR 偏移：CH1=0x34(CCR1)，pwm2 在 CH2 → 0x38(CCR2)
+const OFF_CRR_CH1: u64 = 0x34;
+const OFF_CRR_CH2: u64 = 0x38;
 const OFF_ARR: u64 = 0x2C;
 
 // 固定 GPS 原点（悬停点附近）
@@ -62,11 +63,12 @@ fn rd_u32(m: &Arc<Mutex<Machine>>, addr: u64) -> u32 {
 
 /// 读 4 路 PWM 的 CCR1/ARR → 归一化推力（m = (duty_us - 1000)/1000）。
 fn read_thrust(m: &Arc<Mutex<Machine>>) -> [f32; 4] {
-    let tims = [TIM3, TIM2, TIM1, TIM4];
+    // (TIM 基址, CCR 偏移)：pwm2 在 TIM5 的 CH2 → CCR2
+    let tims = [(TIM3, OFF_CRR_CH1), (TIM2, OFF_CRR_CH1), (TIM5, OFF_CRR_CH2), (TIM4, OFF_CRR_CH1)];
     let mut out = [0f32; 4];
-    for (i, &t) in tims.iter().enumerate() {
+    for (i, &(t, ccr_off)) in tims.iter().enumerate() {
         let arr = rd_u32(m, t + OFF_ARR) as f32;
-        let ccr = rd_u32(m, t + OFF_CRR1) as f32;
+        let ccr = rd_u32(m, t + ccr_off) as f32;
         let duty = if arr > 0.0 { ccr / arr } else { 0.0 }; // 0..1 占空比
         let us = duty * 2500.0; // 400Hz 周期 2500us
         out[i] = ((us - 1000.0) / 1000.0).clamp(0.0, 1.0);
@@ -103,9 +105,9 @@ fn settle_ekf_before_arm(m: &Arc<Mutex<Machine>>) -> f32 {
 fn hover_60s_env() {
     init_log();
     let sys = artifact::joc_base_elf();
-    let app = Path::new(APP_REAL);
+    let app = artifact::flyctrl_real_app_bin();
     assert!(sys.exists(), "minimal elf 缺失");
-    assert!(app.exists(), "real-sensors app 缺失：build_app.py --features real-sensors --out /tmp/flyctrl_real.bin");
+    assert!(app.exists(), "real-sensors app 缺失：{} —— 先跑 ./scripts/build.sh real-sensors，或用 JOC_APP_FLYCTRL_REAL 指向产物", app.display());
 
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
@@ -129,7 +131,7 @@ fn hover_60s_env() {
     }
 
     m.load_elf(&sys).unwrap();
-    m.load_app_partition(app).unwrap();
+    m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
     for _ in 0..12 {
         m.run(1_000_000).unwrap();

@@ -8,7 +8,6 @@
 //!   real     = sensor 任务日志 "real=1"（real-sensors feature 生效）
 //!   hb       = "hb seq=" 且 imu_ok=true baro=true mag=true（真实驱动经虚拟从设备读到数据）
 //!   gps      = "fix established"（u-blox 驱动首次有效定位；UART 推流 NMEA → 固件解析定位）
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
@@ -18,7 +17,7 @@ use mcu_simulater::machine::Machine;
 #[test]
 fn flyctrl_real_sensors_over_virtual_i2c() {
     let elf = artifact::joc_base_elf();
-    let app = Path::new(r"/tmp/flyctrl_real.bin");
+    let app = artifact::flyctrl_real_app_bin();
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     // 虚拟外设：IMU=BMI088 挂 SPI3（port 3），baro/mag 挂 I2C3（port 3，

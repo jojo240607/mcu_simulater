@@ -5,7 +5,6 @@
 //! 等价，但从设备由 `config::apply_topology` 按 `examples/topology_flyctrl.toml` 装配——
 //! 验证「换场景不改代码，只改 TOML」的仿真平台机制。
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use unicorn_engine::RegisterARM;
@@ -15,7 +14,7 @@ use mcu_simulater::machine::Machine;
 #[test]
 fn flyctrl_real_sensors_via_toml_topology() {
     let elf = artifact::joc_base_elf();
-    let app = Path::new(r"/tmp/flyctrl_real.bin");
+    let app = artifact::flyctrl_real_app_bin();
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     // 从设备由 TOML 拓扑装配（而非代码侧 attach_default_*）
