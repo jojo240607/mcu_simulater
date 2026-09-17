@@ -2091,6 +2091,13 @@ impl Machine {
                 let p1 = cold.dma1.lock().unwrap().has_pending();
                 let p2 = cold.dma2.lock().unwrap().has_pending();
                 if p1 || p2 {
+                    // 必须显式写停机原因：裸 emu_stop() 会让 run() 的 take_stop_reason
+                    // 拿到 None → 误判预算耗尽 break，DMA 繁忙时 run(count) 只退休
+                    // 一小段预算（实测 ~48K/300K），固件虚拟时钟大幅慢于物理步长。
+                    cold.nvic
+                        .lock()
+                        .unwrap()
+                        .set_stop_reason(StopReason::DmaPending);
                     let _ = uc.emu_stop();
                 }
             }
@@ -2433,6 +2440,10 @@ impl Machine {
                     // MPU 已使能：懒安装数据访问 hook（含刷 TB），此后内存访问受 MPU 检查
                     self.install_data_access_hook()?;
                 }
+                // DMA 待搬运：DMA process 已在段后执行，继续消耗剩余预算（不得当作
+                // 预算耗尽 break——否则 run(count) 在 DMA 繁忙路径只退休一小段预算，
+                // 固件任务周期相对物理步长被拉长 6× 以上，见 StopReason::DmaPending）。
+                StopReason::DmaPending => {}
                 StopReason::None => budget_exhausted = true, // 达到指令数上限
                 StopReason::Breakpoint => {
                     // GDB 断点命中：置标志供调试器消费（继续命令检查）

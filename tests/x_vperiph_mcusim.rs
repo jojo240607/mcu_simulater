@@ -140,6 +140,12 @@ fn dump_boot_state(m: &mut Machine) {
 ///
 /// 修复：ARM 前推进仿真，等 SBUS 帧到达（20Hz → RC fresh、throttle=0.5 →
 /// target_alt 回落 0）且 EKF 高度被 baro/GPS 观测拉回设计原点（|z|<tol），再 ARM。
+/// 设计原点 = 起飞台（baro/GPS 均按"相对起飞台"约定注入，见 run_closed_loop 注入段）。
+///
+/// `tol` 取 0.15（原 0.6）：`hold_alt` 在 ARM 瞬间锁定为当时的 `est.pos[2]`，
+/// 故 tol 直接决定悬停点相对起飞台的静态偏差。实测 tol=0.6 → 机体停在 d≈-4.3
+/// （偏 0.7m，贴 |dz|<0.8 判据）；tol=0.15 → 收敛需 ~206 次 run(1M)（400 上限内），
+/// 机体停在 d≈-5.16（偏 ~0.16m），判据余量充足。
 /// 返回推进后 EKF 高度（m，NED 向下正）供调用方打印。
 fn settle_ekf_before_arm(m: &Arc<Mutex<Machine>>, tag: &str, tol: f32) -> f32 {
     let mut mm = m.lock().unwrap();
@@ -234,6 +240,9 @@ fn run_closed_loop(
             // 与 GPS 原点（首次定位锁定）对齐 → 起飞台 baro 读 h=0、GPS 读 d=0，
             // 消除 EKF 高度源冲突（历史根因：GPS d=0 vs baro d=-5 折中 → hold_alt
             // 锁定错误值 → 机体下沉到错误高度）。
+            // 注：固件 hil.rs 另有 `baro_ref` 机制（首次 GPS fix 时锁定 baro 绝对高度，
+            // 观测用 `alt - baro_ref`），故注入绝对高度也会被该机制抵消；本测试按
+            // "相对起飞台" 约定注入与固件设计一致。
             let h = -(d + 5.0);
             st.baro_pa = 101_325.0 * (-h / 8434.5).exp();
             // RC 保持解锁（SBUS raw 1811 > 1700）
@@ -323,7 +332,7 @@ fn vperiph_closed_loop() {
     }
 
     // [ARM 前收敛推进] RC 链路建立 + EKF 高度收敛（根因见 settle_ekf_before_arm 文档）
-    settle_ekf_before_arm(&m, "vperiph-closed", 0.6);
+    settle_ekf_before_arm(&m, "vperiph-closed", 0.15);
 
     // 地面站 ARM 等效注入：直接置 G_CMD_ARMED（AtomicBool）。
     // 地址随固件构建变化：`arm-none-eabi-nm app.elf | grep G_CMD_ARMED` 获取，
@@ -441,7 +450,7 @@ fn vperiph_hover_long() {
     // [ARM 前收敛推进] RC 链路建立 + EKF 高度收敛（根因见 settle_ekf_before_arm 文档：
     // boot 早期 RC 未建立 → target_alt=+2.0 → EKF 高度锁错 → hold_alt 锁错。
     // 历史"侥幸通过"：300 步截断早，机体未完全落到错误高度，|dz| 恰好 <0.8）。
-    settle_ekf_before_arm(&m, "vperiph-hover", 0.6);
+    settle_ekf_before_arm(&m, "vperiph-hover", 0.15);
 
     // ARM（G_CMD_ARMED 直接置 1）
     m.lock().unwrap().cpu.mem_write(0x2000_b679, &[1u8]).unwrap();
@@ -505,6 +514,19 @@ fn vperiph_hover_long() {
 /// - 中段（40%~70%）：保持稳定，且相对早段无明显漂移（高度变化 < 1.0m）
 /// - 末段（70%~100%）：最终收敛在悬停点附近（|dz|<0.8m、水平 <0.5m）
 /// 全程位置有限、roll/pitch 不发散。
+///
+/// # 历史根因（本测试长期失败的真实原因）
+///
+/// SPI/I2C 驱动切 DMA 后本测试稳定失败：机体缓慢下沉、姿态环出现增幅振荡
+/// （电机对角饱和、gyro ±6 rad/s）。根因**不在控制律**，而在 `mcu_simulater`
+/// 的 `run(count)` 预算记账：block hook 的"DMA 待搬运停机"未写 `StopReason`
+/// （裸 `emu_stop()`），`run()` 的 `take_stop_reason()` 拿到 `None` →
+/// 误判"预算耗尽"提前 break → `run(300_000)` 实际只退休 ~48K 字节（≈16%）。
+/// 于是固件 CPU 侧虚拟时钟相对物理步长慢 ~7 倍：sensors 2ms 采样实际 ~34ms、
+/// control 4ms 实际 ~30ms（实测 sensor_seq 29 Hz），EKF 拿到 ~34ms 陈旧 IMU，
+/// 姿态内环 `att_kd·est.omega` 阻尼在高频段相位反转成激励 → 增幅振荡 → 饱和掉高
+/// → 下沉。修复：新增 `StopReason::DmaPending`（block hook 显式置位、run() 继续
+/// 消耗剩余预算）后，采样率回升到 ~200Hz（场景口径），振荡消失、悬停稳定。
 #[test]
 fn vperiph_hover_sustained() {
     init_log();
@@ -543,7 +565,7 @@ fn vperiph_hover_sustained() {
 
     // [ARM 前收敛推进] RC 链路建立 + EKF 高度收敛（见 settle_ekf_before_arm 文档，
     // 根因：boot 早期 RC 未建立 → target_alt=+2.0 → EKF 高度锁错 → hold_alt 锁错）
-    settle_ekf_before_arm(&m, "vperiph-sustain", 0.6);
+    settle_ekf_before_arm(&m, "vperiph-sustain", 0.15);
 
     // ARM + RC 解锁
     m.lock().unwrap().cpu.mem_write(0x2000_b679, &[1u8]).unwrap();

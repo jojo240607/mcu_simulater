@@ -57,6 +57,11 @@ pub enum StopReason {
     /// block hook 检到 MPU 已使能但数据访问 hook 未安装：run() 懒安装 hook + 刷 TB
     /// 后继续（避免启动早期 hook helper 翻译触发 Unicorn 首指令副作用丢失缺陷）。
     MpuEnable,
+    /// block hook 检到 DMA 待搬运（外设忙等 DMA 完成信号量时 CPU 自旋，run() 须
+    /// 返回让 DMA process 执行搬运后**继续**——不能与预算耗尽（None）混同，否则
+    /// run(count) 的 count 预算在 DMA 繁忙路径下被浪费、CPU 侧虚拟时钟大幅慢于
+    /// 物理步长（实测 run(300K) 仅退休 ~48K 字节 → 传感器/控制拍速降 6× 以上）。
+    DmaPending,
     /// block hook 检到 GDB 指令级断点（PC 命中）：run() 停止供调试器接管
     Breakpoint,
 }
