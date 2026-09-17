@@ -224,9 +224,11 @@ fn hover_60s_demo() {
         if step % 250 == 0 {
             let ekf_z = read_ekf_z(&m);
             // [DIAG] USART2(port=2, GPS) 推流帧数 + FIFO 残留：判断固件是否消费完全部
-            // GGA/RMC 字节（FIFO 残留 >0 → RMC 尾滞留未消费 → 解释 gps_v=0）
-            let mm = m.lock().unwrap();
+            // GGA/RMC 字节（FIFO 残留 >0 → RMC 尾滞留未消费 → 解释 gps_v=0）。
+            // 锁必须在本块内释放：下面的 dump_est_state 会再锁 Machine，而
+            // std::sync::Mutex 不可重入——持锁再锁会自死锁（本测试曾卡在 t=0s）。
             let (gps_frames, fifo_len) = {
+                let mm = m.lock().unwrap();
                 let uv = mm.usart.lock().unwrap();
                 let u2 = uv.get(1).unwrap().lock().unwrap();
                 let frames = u2.slaves().first().map(|s| s.frames()).unwrap_or(0);
