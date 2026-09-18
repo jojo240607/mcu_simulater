@@ -27,9 +27,9 @@ pub const STEP_DT_MS: f32 = 13.0;
 pub const STEP_DT: f32 = STEP_DT_MS / 1000.0;
 
 /// 固件 EST_STATE 地址（app.elf 符号，布局见 [`EstReadout`]）。
-pub const EST_STATE: u32 = 0x2000_9084;
+pub const EST_STATE: u32 = 0x2000_A184;
 /// 固件 SENSOR_SEQ（sensors 任务推进计数，冻结即任务停滞）。
-pub const SENSOR_SEQ: u32 = 0x2000_B5DC;
+pub const SENSOR_SEQ: u32 = 0x2000_C6DC;
 
 /// 从 app.elf 读出的估计状态（VehicleState + health + armed 的内存视图）。
 #[derive(Debug, Clone, Copy, Default)]

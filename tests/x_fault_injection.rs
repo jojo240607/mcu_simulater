@@ -230,15 +230,15 @@ fn merged_log(m: &mut Machine) -> String {
     t
 }
 
-/// 直接读取 App SDK 日志 ring（LOG_RING=0x2000_add0，2048B）。条目格式：
+/// 直接读取 App SDK 日志 ring（LOG_RING=0x2000_BED0，2048B）。条目格式：
 /// [len][level][payload]，payload = "R/{level} {tick} {tag}: {msg}\n"。
 /// 地址来自 `arm-none-eabi-nm app.elf | grep -E 'LOG_(RING|HEAD|TAIL)'`：
-///   LOG_RING=0x2000_add0 LOG_HEAD=0x2000_b5e8 LOG_TAIL=0x2000_b5ec
+///   LOG_RING=0x2000_BED0 LOG_HEAD=0x2000_C6E8 LOG_TAIL=0x2000_C6EC
 /// （App 重建后需按 nm 同步更新。）
 fn scan_log_ring(m: &mut Machine) -> String {
-    const RING_ADDR: u64 = 0x2000_add0;
-    const HEAD_ADDR: u64 = 0x2000_b5e8;
-    const TAIL_ADDR: u64 = 0x2000_b5ec;
+    const RING_ADDR: u64 = 0x2000_BED0;
+    const HEAD_ADDR: u64 = 0x2000_C6E8;
+    const TAIL_ADDR: u64 = 0x2000_C6EC;
     const RING_SIZE: usize = 2048;
     let mut hb = [0u8; 4];
     let mut tb = [0u8; 4];

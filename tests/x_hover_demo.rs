@@ -61,15 +61,15 @@ fn read_thrust(m: &Arc<Mutex<Machine>>) -> [f32; 4] {
     out
 }
 
-/// 读固件 EKF 估计高度 est.pos[2]（NED 向下正，地址布局同 x_vperiph：0x2000_9084+12）。
+/// 读固件 EKF 估计高度 est.pos[2]（NED 向下正，地址布局同 x_vperiph：0x2000_A184+12）。
 fn read_ekf_z(m: &Arc<Mutex<Machine>>) -> f32 {
-    let b = m.lock().unwrap().cpu.mem_read(0x2000_9084 + 12, 4).unwrap();
+    let b = m.lock().unwrap().cpu.mem_read(0x2000_A184 + 12, 4).unwrap();
     f32::from_le_bytes(b.try_into().unwrap())
 }
 
 /// [DIAG] 转储 EST_STATE 前 72B（VehicleState）为 18 个 f32（与 x_vperiph_mcusim 同源）。
 fn dump_est_state(m: &Arc<Mutex<Machine>>) -> Vec<f32> {
-    let b = m.lock().unwrap().cpu.mem_read(0x2000_9084, 72).unwrap();
+    let b = m.lock().unwrap().cpu.mem_read(0x2000_A184, 72).unwrap();
     (0..18)
         .map(|i| f32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]))
         .collect()
@@ -82,7 +82,7 @@ fn settle_ekf_before_arm(m: &Arc<Mutex<Machine>>) -> f32 {
     let mut z = f32::NAN;
     for i in 0..400 {
         mm.run_budget(1_000_000).unwrap();
-        z = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9074 + 28, 4).unwrap().try_into().unwrap());
+        z = f32::from_le_bytes(mm.cpu.mem_read(0x2000_A174 + 28, 4).unwrap().try_into().unwrap());
         if i % 50 == 0 {
             eprintln!("[demo] 收敛推进 i={i} ekf_z={z:.3}");
         }
@@ -134,7 +134,7 @@ fn hover_60s_demo() {
     settle_ekf_before_arm(&m);
 
     // ARM + RC 解锁
-    m.lock().unwrap().cpu.mem_write(0x2000_b669, &[1u8]).unwrap();
+    m.lock().unwrap().cpu.mem_write(0x2000_C769, &[1u8]).unwrap();
     {
         let mut st = state.lock().unwrap();
         st.rc_ch[4] = 2000.0;
@@ -238,7 +238,7 @@ fn hover_60s_demo() {
                 "[demo] t={:.0}s thrust={thrust:.3} pos=({:.2},{:.2},{:.2}) vel=({:.2},{:.2},{:.2}) ekf_z={ekf_z:.2} gps_frames={gps_frames} fifo={fifo_len}",
                 step as f64 * 0.004, pos[0], pos[1], pos[2], vel[0], vel[1], vel[2]
             );
-            // [DIAG] 固件 EKF 全状态（VehicleState 72B @0x2000_9084）：
+            // [DIAG] 固件 EKF 全状态（VehicleState 72B @0x2000_A184）：
             // f32[0]=time_boot_ms, [1..4]=pos(NED), [4..7]=vel(NED), [7..11]=att quat
             let d = dump_est_state(&m);
             eprintln!(
