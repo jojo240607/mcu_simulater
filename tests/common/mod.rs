@@ -65,6 +65,8 @@ pub struct EnvHarness {
     pub got_invalid: Arc<AtomicBool>,
     pub bad_pc: Arc<AtomicU32>,
     pub steps: u64,
+    /// 固件时钟起点（SysTick ms）——用于步进对齐断言（固件时间 ≈ 步数×dt）。
+    pub step0_ms: u64,
     /// 已收集的全部 console 输出。
     pub log: String,
     /// 上次日志长度（增量解析用）。
@@ -117,6 +119,7 @@ impl EnvHarness {
         if prefill {
             scn.write_state(&mut st.lock().unwrap());
         }
+        let step0_ms = m.systick_ms();
         Self {
             m,
             st,
@@ -124,6 +127,7 @@ impl EnvHarness {
             got_invalid,
             bad_pc,
             steps: 0,
+            step0_ms,
             log: String::new(),
             log_pos: 0,
             last_hb: None,
@@ -142,6 +146,14 @@ impl EnvHarness {
         let r = self.m.advance_ms(STEP_DT_MS as f64);
         assert!(r.is_ok(), "[step {}] advance_ms 错误: {r:?}", self.steps);
         self.steps += 1;
+        // 对齐不变量：固件时间必须 ≈ 步数 × dt（run_ms 的 SysTick 收敛允许 ≤1ms 量化）。
+        // 若有人改回 run(字节预算) 表达时间，这里立刻红。
+        let elapsed = self.m.systick_ms() - self.step0_ms;
+        let expect = self.steps * STEP_DT_MS as u64;
+        assert!(
+            elapsed.abs_diff(expect) <= 1,
+            "[clock] 固件时间 {elapsed}ms != 步数×dt {expect}ms —— 场景/固件时钟失配             （时间推进一律走 McuClock/run_ms，不得用 run(字节预算)）"
+        );
         self.pump_log();
     }
 
