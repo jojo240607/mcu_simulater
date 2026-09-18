@@ -2320,6 +2320,12 @@ impl Machine {
         self.retired_insts.load(Ordering::Relaxed)
     }
 
+    /// 退休计数句柄（`Arc<AtomicU64>`，单位=TB 字节）——供测试挂内存钩子做按段剖析
+    /// （在 Unicorn 回调里读它，不经过 `Machine` 借用）。
+    pub fn retired_handle(&self) -> Arc<AtomicU64> {
+        self.retired_insts.clone()
+    }
+
     /// 按**固件自身虚拟时钟**推进 `ms` 毫秒。
     ///
     /// 物理闭环测试（每步推进 `dt` 秒物理）应当用本方法而非裸 `run(count)`：
