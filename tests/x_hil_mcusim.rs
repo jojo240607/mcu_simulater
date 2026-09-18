@@ -70,7 +70,7 @@ fn inject_setup(m: &Arc<Mutex<Machine>>, data: [u8; 8]) {
         .lock()
         .unwrap()
         .publish(&mcu_simulater::events::Event::UsbSetup { data });
-    mm.run(60_000).unwrap();
+    mm.run_budget(60_000).unwrap();
 }
 
 /// USB 总线枚举：复位 + 标准 4 个 SETUP（设备/配置描述符、地址、配置）。
@@ -78,7 +78,7 @@ fn usb_enumerate(m: &Arc<Mutex<Machine>>) {
     {
         let mut mm = m.lock().unwrap();
         mm.usb_otg.lock().unwrap().inject_usb_reset();
-        mm.run(60_000).unwrap();
+        mm.run_budget(60_000).unwrap();
     }
     // GET_DESCRIPTOR(Device, 18B)
     inject_setup(m, [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]);
@@ -88,7 +88,7 @@ fn usb_enumerate(m: &Arc<Mutex<Machine>>) {
     inject_setup(m, [0x00, 0x05, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00]);
     // SET_CONFIGURATION 1（使能 EP1 IN/OUT）
     inject_setup(m, [0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    m.lock().unwrap().run(200_000).unwrap();
+    m.lock().unwrap().run_budget(200_000).unwrap();
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn hil_mcusim_closed_loop() {
 
     // 固件启动 + App 挂载 + 任务创建（telemetry/uplink/control/sensors）
     for _ in 0..12 {
-        m.run(1_000_000).unwrap();
+        m.run_budget(1_000_000).unwrap();
     }
     let m = Arc::new(Mutex::new(m));
 
@@ -120,7 +120,7 @@ fn hil_mcusim_closed_loop() {
     // ---- 等 HIL 心跳（telemetry 20ms 周期，hil feature 下 base_mode 带 HIL flag）----
     let mut waited = 0u32;
     while !link.is_hil_ready() {
-        m.lock().unwrap().run(800_000).unwrap();
+        m.lock().unwrap().run_budget(800_000).unwrap();
         link.poll();
         waited += 1;
         if waited == 10 {
@@ -142,7 +142,7 @@ fn hil_mcusim_closed_loop() {
 
     // ---- ARM（解锁）----
     link.send_arm(true).unwrap();
-    m.lock().unwrap().run(600_000).unwrap();
+    m.lock().unwrap().run_budget(600_000).unwrap();
 
     // ---- 闭环：PC 物理步 ↔ MCU 控制拍 ----
     // PC 每步：读回 actuator → 推进物理 → 注入 IMU/GPS/SET_POSITION 真值
@@ -165,7 +165,7 @@ fn hil_mcusim_closed_loop() {
     let mut rx_frames = 0u32;
     for step in 0..300u64 {
         // MCU 侧推进（处理上行注入 + 跑控制 + 发下行遥测）
-        m.lock().unwrap().run(200_000).unwrap();
+        m.lock().unwrap().run_budget(200_000).unwrap();
         if step % 100 == 0 {
             let (d, tin, ip1, ctl1, tsiz1, tx1, tx0, daintmsk, diepmsk, int1) = {
                 let mm = m.lock().unwrap();
@@ -233,7 +233,7 @@ fn hil_mcusim_closed_loop() {
             nav,
         );
         // 注入后 run 一段让固件消费上行（uplink 1ms 轮询）
-        m.lock().unwrap().run(200_000).unwrap();
+        m.lock().unwrap().run_budget(200_000).unwrap();
         if step % 100 == 0 {
             if step == 100 {
                 let v = m.lock().unwrap().vec_entries();

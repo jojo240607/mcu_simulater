@@ -92,7 +92,7 @@ fn m_jos_boot_diagnose() {
     for step in 0..400 {
         let pc_before = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
         eprintln!("[step {step}] enter run pc=0x{pc_before:08X}");
-        let r = m.run(100_000);
+        let r = m.run_budget(100_000);
         let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
         let reason = m.nvic.lock().unwrap().take_stop_reason();
         let out = m.console.lock().unwrap().output().to_vec();
@@ -321,7 +321,7 @@ fn m_jos_board_init_trace() {
         })
         .unwrap();
 
-    let _ = m.run(2_000_000);
+    let _ = m.run_budget(2_000_000);
     eprintln!("[trace] board_init 后 PC=0x{:08X}", m.cpu.reg_read_u32(RegisterARM::PC).unwrap());
 }
 
@@ -562,7 +562,7 @@ fn m_jos_malloc_loop_trace() {
         })
         .unwrap();
 
-    let _ = m.run(2_000_000);
+    let _ = m.run_budget(2_000_000);
     let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
     eprintln!("[trace] done PC=0x{pc:08X} total_sbrk={} total_calloc={} total_malloc_r={}",
         total_sbrk.load(Ordering::Relaxed),
@@ -686,7 +686,7 @@ fn m_jos_bn_instruction_trace() {
         })
         .unwrap();
 
-    let _ = m.run(2_000_000);
+    let _ = m.run_budget(2_000_000);
     let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
     eprintln!(
         "[bn_trace] done PC=0x{pc:08X} total_insns={} bn_bugs={}",
@@ -839,7 +839,7 @@ fn m_jos_release_flow_trace() {
     // 分步运行，观察执行流
     for step in 0..500 {
         let pc_before = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
-        let r = m.run(50_000);
+        let r = m.run_budget(50_000);
         let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
         let out = m.console.lock().unwrap().output().to_vec();
 
@@ -874,7 +874,7 @@ fn m_jos_release_flow_trace() {
         if pc == pc_before {
             eprintln!("[step {step}] pc=0x{pc:08X} 未前进（可能死循环）");
             // 再给一次机会
-            let r2 = m.run(100_000);
+            let r2 = m.run_budget(100_000);
             let pc2 = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
             if pc2 == pc && r2.is_err() {
                 eprintln!("[step {step}] 确认停机");
@@ -977,7 +977,7 @@ fn m_jos_trace_sbrk_r_flow() {
         })
         .unwrap();
 
-    let _ = m.run(1_000_000);
+    let _ = m.run_budget(1_000_000);
     let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
     eprintln!(
         "[sbrk_r_trace] done PC=0x{pc:08X} total_insns_in_sbrk_r={}",

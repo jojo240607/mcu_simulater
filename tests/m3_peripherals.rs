@@ -59,7 +59,7 @@ fn m3_t1_peripherals_end_to_end() {
         },
     )));
 
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
 
     // 1) 主线完成 + 结果区
     assert_eq!(read_u32(&mut m, G_DONE), 0xAAAA_AAAA, "主线应完成（写 G_DONE）");

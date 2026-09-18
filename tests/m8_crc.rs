@@ -53,7 +53,7 @@ fn read_u32(m: &mut Machine, addr: u32) -> u32 {
 #[test]
 fn m8_crc_end_to_end() {
     let mut m = load_machine();
-    m.run(100_000).unwrap();
+    m.run_budget(100_000).unwrap();
 
     // Phase A：复位后 DR 读回初始值 0xFFFFFFFF
     assert_eq!(read_u32(&mut m, G_INIT_OK), 1, "复位后 DR 应读回 0xFFFFFFFF");

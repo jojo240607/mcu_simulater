@@ -62,7 +62,7 @@ fn unlock_and_fly_over_virtual_peripherals() {
             eprintln!(">>> 超时（300s）终止");
             break;
         }
-        let r = m.run(400_000);
+        let r = m.run_budget(400_000);
         let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
         let text = {
             let outv = m.console.lock().unwrap().output().to_vec();

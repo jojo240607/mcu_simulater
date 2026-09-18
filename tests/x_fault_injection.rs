@@ -69,7 +69,7 @@ fn run_until<F: Fn(&str) -> bool>(
     max_steps: u32,
 ) -> bool {
     for _ in 0..max_steps {
-        let r = m.run(400_000);
+        let r = m.run_budget(400_000);
         let text = merged_log(m);
         if cond(&text) {
             return true;
@@ -101,7 +101,7 @@ fn spi_fault_from_boot_fdir_critical() {
         if t_start.elapsed().as_secs() > 300 {
             break;
         }
-        let r = m.run(400_000);
+        let r = m.run_budget(400_000);
         let text = merged_log(&mut m);
         if text.contains("RUST app mounted") {
             mounted = true;
@@ -196,7 +196,7 @@ fn midrun_nack_isolates_slave() {
     let mut after = before;
     let mut stable_rounds = 0u32;
     for _ in 0..200u32 {
-        let r = m.run(400_000);
+        let r = m.run_budget(400_000);
         if let Err(e) = r {
             eprintln!("ERR {e:?}");
             break;

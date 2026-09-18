@@ -101,7 +101,7 @@ fn shmem_closed_loop() {
     m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
     for _ in 0..12 {
-        m.run(1_000_000).unwrap();
+        m.run_budget(1_000_000).unwrap();
     }
 
     // 【hil 固件校验】共享内存契约仅在 hil feature 固件内编译（uplink 轮询共享区）；

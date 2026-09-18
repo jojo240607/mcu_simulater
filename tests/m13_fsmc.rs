@@ -50,7 +50,7 @@ fn m13_fsmc_end_to_end() {
     let mut m = load_machine();
 
     // 运行直至主线完成（FSMC 全流程自包含，无外部注入）
-    m.run(5_000_000).unwrap();
+    m.run_budget(5_000_000).unwrap();
     assert_eq!(read_u32(&mut m, G_DONE), 0xAAAA_AAAA, "主线应完成（写 G_DONE）");
     assert_eq!(read_u32(&mut m, G_READ_OK), 1, "Phase A Bank1 窗口读写校验应通过");
     assert_eq!(read_u32(&mut m, G_GATE_OK), 1, "Phase B 未使能窗口访问应被忽略");

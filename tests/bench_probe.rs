@@ -45,17 +45,17 @@ fn blocks_per_ins(m: &mut Machine) -> f64 {
         })
         .unwrap();
     let warm = 2_000_000usize;
-    m.run(warm).unwrap();
+    m.run_budget(warm).unwrap();
     let budget = 5_000_000usize;
     let before = n.load(Ordering::Relaxed);
-    m.run(budget).unwrap();
+    m.run_budget(budget).unwrap();
     let after = n.load(Ordering::Relaxed);
     (after - before) as f64 / budget as f64
 }
 
 fn run_bench(name: &str, mut m: Machine) {
     // 预热后重复 3 次取最小值：抑制 CPU 频率/热漂移噪声（min-of-3）
-    m.run(2_000_000).unwrap(); // 预热
+    m.run_budget(2_000_000).unwrap(); // 预热
     let pc = m.cpu.reg_read_u32(unicorn_engine::RegisterARM::PC).unwrap();
     let ipsr = m
         .cpu
@@ -66,7 +66,7 @@ fn run_bench(name: &str, mut m: Machine) {
     let mut best = f64::MAX;
     for _ in 0..3 {
         let t0 = Instant::now();
-        m.run(budget).unwrap();
+        m.run_budget(budget).unwrap();
         let elapsed = t0.elapsed().as_secs_f64();
         best = best.min(budget as f64 / elapsed / 1e6);
     }
@@ -941,7 +941,7 @@ fn probe_hook_cost() {
         m2.reset().unwrap();
         println!("[probe] E blocks/ins={:.3}", blocks_per_ins(&mut m2));
         // 自测：min-of-3 + run 迭代计数 + 运行前后状态（定位 emu_start 提前返回）
-        m.run(2_000_000).unwrap();
+        m.run_budget(2_000_000).unwrap();
         let pc = m.cpu.reg_read_u32(unicorn_engine::RegisterARM::PC).unwrap();
         let ipsr = m.cpu.reg_read_u32(unicorn_engine::RegisterARM::IPSR).unwrap();
         println!(
@@ -954,7 +954,7 @@ fn probe_hook_cost() {
         let mut best = f64::MAX;
         for _ in 0..3 {
             let t0 = std::time::Instant::now();
-            m.run(budget).unwrap();
+            m.run_budget(budget).unwrap();
             let dt = t0.elapsed().as_secs_f64();
             best = best.min(budget as f64 / dt / 1e6);
         }

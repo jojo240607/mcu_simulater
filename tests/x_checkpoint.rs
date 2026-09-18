@@ -31,19 +31,19 @@ fn pc(m: &mut Machine) -> u32 {
 #[test]
 fn deterministic_rollback_replays_identically() {
     let mut m = machine_with_firmware();
-    m.run(20_000).unwrap(); // 配置阶段
+    m.run_budget(20_000).unwrap(); // 配置阶段
     let snap = m.snapshot().unwrap();
     let pc_a = pc(&mut m);
 
     // 路径 1：从 A 直接 run 固定量
-    m.run(30_000).unwrap();
+    m.run_budget(30_000).unwrap();
     let pc_fwd = pc(&mut m);
     let gtx_fwd = u32::from_le_bytes(m.cpu.mem_read(G_TX as u64, 4).unwrap().try_into().unwrap());
 
     // 路径 2：回滚到 A，再 run 相同量 → 应完全一致（确定性）
     m.restore(&snap).unwrap();
     assert_eq!(pc(&mut m), pc_a, "restore 后 PC 应回到保存点");
-    m.run(30_000).unwrap();
+    m.run_budget(30_000).unwrap();
     let pc_replay = pc(&mut m);
     let gtx_replay = u32::from_le_bytes(m.cpu.mem_read(G_TX as u64, 4).unwrap().try_into().unwrap());
 
@@ -55,7 +55,7 @@ fn deterministic_rollback_replays_identically() {
 #[test]
 fn restore_clears_memory_pollution() {
     let mut m = machine_with_firmware();
-    m.run(10_000).unwrap();
+    m.run_budget(10_000).unwrap();
     let snap = m.snapshot().unwrap();
     let orig = u32::from_le_bytes(m.cpu.mem_read(G_TX as u64, 4).unwrap().try_into().unwrap());
 
@@ -75,9 +75,9 @@ fn restore_clears_memory_pollution() {
 #[test]
 fn continues_running_after_restore() {
     let mut m = machine_with_firmware();
-    m.run(15_000).unwrap();
+    m.run_budget(15_000).unwrap();
     let snap = m.snapshot().unwrap();
-    m.run(5_000).unwrap(); // 推进一点
+    m.run_budget(5_000).unwrap(); // 推进一点
     m.restore(&snap).unwrap();
 
     // 恢复后继续跑：注入 RX 字节 → 固件事件中断接收链路仍工作
@@ -86,7 +86,7 @@ fn continues_running_after_restore() {
             .lock()
             .unwrap()
             .publish(&Event::I2cRx { port: 1, byte: b });
-        m.run(20_000).unwrap();
+        m.run_budget(20_000).unwrap();
     }
     let done = u32::from_le_bytes(m.cpu.mem_read(0x2000_0008, 4).unwrap().try_into().unwrap());
     assert_eq!(done, 0xAAAA_AAAA, "恢复后固件应能完成主循环（G_DONE）");

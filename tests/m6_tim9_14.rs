@@ -65,7 +65,7 @@ fn m6_tim9_14_mounted_and_tick() {
         write_u32(&mut m, base + OFF_CNT, 0);
         write_u32(&mut m, base + OFF_CR1, CR1_CEN);
     }
-    m.run(50_000).unwrap();
+    m.run_budget(50_000).unwrap();
 
     for (name, base) in [("TIM9", TIM9_BASE), ("TIM12", TIM12_BASE), ("TIM14", TIM14_BASE)] {
         let cnt = read_u32(&mut m, base + OFF_CNT);

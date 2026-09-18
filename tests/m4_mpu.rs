@@ -58,7 +58,7 @@ fn m4_mpu_overlap_high_region_restrictive_blocks() {
     setup_overlap_regions(&mut m, 0b011, 0b101);
 
     // 固件末尾写 0x20000000 应触发 DACCVIOL（region7 优先于 region0）
-    let err = m.run(200_000).expect_err("高编号只读 region 应拒绝写访问");
+    let err = m.run_budget(200_000).expect_err("高编号只读 region 应拒绝写访问");
     match err {
         CoreError::MemManageFault { addr, kind } => {
             assert_eq!(addr, 0x2000_0000, "故障地址应为被写地址");
@@ -80,7 +80,7 @@ fn m4_mpu_overlap_high_region_permissive_allows() {
     // region0=AP101(特权 ro)，region7=AP011(全 rw)：写应被 region7 放行
     setup_overlap_regions(&mut m, 0b101, 0b011);
 
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
 
     // 固件正常跑完，结果仍为 12，且无 fault 记录
     let out = m.cpu.mem_read(0x2000_0000, 4).unwrap();

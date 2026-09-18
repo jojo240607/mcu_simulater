@@ -52,7 +52,7 @@ fn read_u32(m: &mut Machine, addr: u32) -> u32 {
 #[test]
 fn m9_rng_end_to_end() {
     let mut m = load_machine();
-    m.run(100_000).unwrap();
+    m.run_budget(100_000).unwrap();
 
     // Phase A：使能后两次读取随机值不同且非零
     assert_eq!(read_u32(&mut m, G_RNG_OK), 1, "两次读取随机值应不同且非零");

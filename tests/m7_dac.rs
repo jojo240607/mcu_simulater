@@ -73,13 +73,13 @@ fn m7_dac_end_to_end() {
     )));
 
     // 阶段一：固件初始化 + Phase A 软件触发 + Phase B 定时器/DMA 配置
-    m.run(10_000).unwrap();
+    m.run_budget(10_000).unwrap();
     // 1) 软件触发：DHR→DOR 锁存回读校验通过
     assert_eq!(read_u32(&mut m, G_SW_OK), 1, "Phase A 软件触发 DOR1 回读校验应通过");
 
     // 阶段二：TIM6 溢出 → DAC 触发 DMA → run 间隙搬运 + 中断投递，直到主线写 G_DONE
     for _ in 0..10 {
-        m.run(200_000).unwrap();
+        m.run_budget(200_000).unwrap();
         if read_u32(&mut m, G_DONE) == 0xAAAA_AAAA {
             break;
         }

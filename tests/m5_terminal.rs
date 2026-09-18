@@ -56,15 +56,15 @@ fn m5_uart46_terminal_loopback_end_to_end() {
     let mut m = load_machine();
 
     // 固件使能 UART4/5/USART6 + 发问候，随后进入等待循环
-    m.run(10_000).unwrap();
+    m.run_budget(10_000).unwrap();
 
     // 经虚拟终端键盘逐字符输入：type_char 发布 UartRx → UART4 RX → 中断回显
     for &b in &RX_BYTES {
         m.terminal.lock().unwrap().type_char(4, b);
-        m.run(50_000).unwrap();
+        m.run_budget(50_000).unwrap();
     }
     // 主线退出循环，写 G_DONE
-    m.run(50_000).unwrap();
+    m.run_budget(50_000).unwrap();
 
     // 1) 结果区
     assert_eq!(read_u32(&mut m, G_DONE), 0xAAAA_AAAA, "主线应完成（写 G_DONE）");

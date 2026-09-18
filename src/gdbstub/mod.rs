@@ -144,7 +144,7 @@ impl GdbServer {
                 self.cmd_continue(target, machine)
             }
             b's' => {
-                machine.run(STEP_BUDGET).unwrap_or_default();
+                machine.run_budget(STEP_BUDGET).unwrap_or_default();
                 "S05".into()
             }
             b'Z' => {
@@ -242,7 +242,7 @@ impl GdbServer {
             let _ = m.cpu.reg_write(RegisterARM::PC, addr as u64);
         }
         // 大预算一次跑；block hook 在断点地址精确停（StopReason::Breakpoint）
-        let _ = m.run(CONTINUE_BUDGET);
+        let _ = m.run_budget(CONTINUE_BUDGET);
         if m.gdb_break_hit_take() {
             "S05".into() // 断点命中：SIGTRAP
         } else {

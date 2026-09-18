@@ -30,7 +30,7 @@ fn inject_setup(m: &Arc<Mutex<Machine>>, data: [u8; 8]) {
         .lock()
         .unwrap()
         .publish(&mcu_simulater::events::Event::UsbSetup { data });
-    if let Err(e) = mm.run(60_000) {
+    if let Err(e) = mm.run_budget(60_000) {
         panic!("inject_setup run 失败: {e:?}");
     }
 }
@@ -40,13 +40,13 @@ fn usb_enumerate(m: &Arc<Mutex<Machine>>) {
     {
         let mut mm = m.lock().unwrap();
         mm.usb_otg.lock().unwrap().inject_usb_reset();
-        mm.run(60_000).unwrap();
+        mm.run_budget(60_000).unwrap();
     }
     inject_setup(m, [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]); // GET_DESCRIPTOR(Device)
     inject_setup(m, [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x20, 0x00]); // GET_DESCRIPTOR(Config)
     inject_setup(m, [0x00, 0x05, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00]); // SET_ADDRESS
     inject_setup(m, [0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]); // SET_CONFIGURATION
-    m.lock().unwrap().run(200_000).unwrap();
+    m.lock().unwrap().run_budget(200_000).unwrap();
 }
 
 /// 经 usb0 注入一帧 MAVLink 上行（PC→MCU），并推进固件处理。
@@ -56,7 +56,7 @@ fn inject_uplink(m: &Arc<Mutex<Machine>>, buf: &[u8]) {
         let mut u = mm.usb_otg.lock().unwrap();
         u.inject_out(1, buf);
     }
-    if let Err(e) = m.lock().unwrap().run(600_000) {
+    if let Err(e) = m.lock().unwrap().run_budget(600_000) {
         let pc = m.lock().unwrap().cpu.reg_read_u32(unicorn_engine::RegisterARM::PC).unwrap();
         let sp = m.lock().unwrap().cpu.reg_read_u32(unicorn_engine::RegisterARM::SP).unwrap();
         panic!("inject_uplink run 失败: {e:?} pc=0x{pc:08X} sp=0x{sp:08X}");
@@ -86,7 +86,7 @@ fn inject_set_mode(m: &Arc<Mutex<Machine>>, custom_mode: f32) {
 /// 到不了 host 侧；OUT（PC→MCU 注入）方向工作正常。
 fn wait_console(m: &Arc<Mutex<Machine>>, needle: &str, max_steps: u32) -> bool {
     for _ in 0..max_steps {
-        m.lock().unwrap().run(400_000).unwrap();
+        m.lock().unwrap().run_budget(400_000).unwrap();
         let outv = m.lock().unwrap().console.lock().unwrap().output().to_vec();
         if String::from_utf8_lossy(&outv).contains(needle) {
             return true;
@@ -130,7 +130,7 @@ fn uplink_do_set_mode_switches_flight_modes() {
     let mut tasks = false;
     let mut hb = false;
     for step in 0..800u32 {
-        let r = m.lock().unwrap().run(400_000);
+        let r = m.lock().unwrap().run_budget(400_000);
         let text = {
             let outv = m.lock().unwrap().console.lock().unwrap().output().to_vec();
             String::from_utf8_lossy(&outv).into_owned()

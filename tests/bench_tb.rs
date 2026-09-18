@@ -40,10 +40,10 @@ fn blocks_per_ins(m: &mut Machine) -> f64 {
             n2.fetch_add(1, Ordering::Relaxed);
         })
         .unwrap();
-    m.run(2_000_000).unwrap();
+    m.run_budget(2_000_000).unwrap();
     let budget = 5_000_000usize;
     let before = n.load(Ordering::Relaxed);
-    m.run(budget).unwrap();
+    m.run_budget(budget).unwrap();
     let after = n.load(Ordering::Relaxed);
     (after - before) as f64 / budget as f64
 }

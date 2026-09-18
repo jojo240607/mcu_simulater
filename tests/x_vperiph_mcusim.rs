@@ -148,7 +148,7 @@ fn settle_ekf_before_arm(m: &Arc<Mutex<Machine>>, tag: &str, tol: f32) -> f32 {
     let mut mm = m.lock().unwrap();
     let mut z = f32::NAN;
     for i in 0..400 {
-        mm.run(1_000_000).unwrap();
+        mm.run_budget(1_000_000).unwrap();
         z = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9084 + 12, 4).unwrap().try_into().unwrap());
         if i % 50 == 0 {
             eprintln!("[{tag}] 收敛推进 i={i} ekf_z={z:.3}");
@@ -323,7 +323,7 @@ fn vperiph_closed_loop() {
     m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
     for _ in 0..12 {
-        m.run(1_000_000).unwrap();
+        m.run_budget(1_000_000).unwrap();
     }
     let m = Arc::new(Mutex::new(m));
 
@@ -439,7 +439,7 @@ fn vperiph_hover_long() {
     m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
     for _ in 0..12 {
-        m.run(1_000_000).unwrap();
+        m.run_budget(1_000_000).unwrap();
     }
     let m = Arc::new(Mutex::new(m));
 
@@ -561,7 +561,7 @@ fn vperiph_hover_sustained() {
     m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
     for _ in 0..12 {
-        m.run(1_000_000).unwrap();
+        m.run_budget(1_000_000).unwrap();
     }
     let m = Arc::new(Mutex::new(m));
 

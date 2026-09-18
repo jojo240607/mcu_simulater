@@ -78,7 +78,7 @@ fn settle_ekf_before_arm(m: &Arc<Mutex<Machine>>) -> f32 {
     let mut mm = m.lock().unwrap();
     let mut z = f32::NAN;
     for i in 0..400 {
-        mm.run(1_000_000).unwrap();
+        mm.run_budget(1_000_000).unwrap();
         z = f32::from_le_bytes(mm.cpu.mem_read(0x2000_9074 + 28, 4).unwrap().try_into().unwrap());
         if i % 50 == 0 {
             eprintln!("[noise] 收敛推进 i={i} ekf_z={z:.3}");
@@ -124,7 +124,7 @@ fn hover_60s_noisy() {
     m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
     for _ in 0..12 {
-        m.run(1_000_000).unwrap();
+        m.run_budget(1_000_000).unwrap();
     }
     let m = Arc::new(Mutex::new(m));
 

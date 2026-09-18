@@ -596,7 +596,7 @@ fn diag_sbrk_flood() {
     let mut pc_last = 0u64;
     let mut stall = 0u32;
     for step in 0..40 {
-        let r = m.run(200_000);
+        let r = m.run_budget(200_000);
         budget += 200_000;
         let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap() as u64;
         if pc == pc_last {

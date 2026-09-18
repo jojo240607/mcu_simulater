@@ -19,7 +19,7 @@ fn flight_controller_throughput() {
 
     // 预热（跳过启动峰值：复位/内存清零段）
     for _ in 0..100 {
-        let _ = m.run(400_000);
+        let _ = m.run_budget(400_000);
     }
     let r0 = m.retired_count();
     let t0 = Instant::now();
@@ -27,7 +27,7 @@ fn flight_controller_throughput() {
     // 测 5 秒稳态吞吐
     let mut n = 0u32;
     while t0.elapsed().as_secs() < 5 {
-        let _ = m.run(400_000);
+        let _ = m.run_budget(400_000);
         n += 1;
     }
     let dt = t0.elapsed().as_secs_f64();
@@ -53,13 +53,13 @@ fn kernel_only_throughput() {
     m.reset().unwrap();
 
     for _ in 0..50 {
-        let _ = m.run(400_000);
+        let _ = m.run_budget(400_000);
     }
     let r0 = m.retired_count();
     let t0 = Instant::now();
     let mut n = 0u32;
     while t0.elapsed().as_secs() < 4 {
-        let _ = m.run(400_000);
+        let _ = m.run_budget(400_000);
         n += 1;
     }
     let dt = t0.elapsed().as_secs_f64();

@@ -49,7 +49,7 @@ fn m5_usart_rx_interrupt_echo_end_to_end() {
     let mut m = load_machine();
 
     // 固件配置 USART1 + NVIC + 发问候 'U'，随后进入等待循环（run 按指令预算返回）
-    m.run(10_000).unwrap();
+    m.run_budget(10_000).unwrap();
 
     // 逐字节注入 RX：每注入 1 字节 → 运行让 IRQ37 handler 读 DR + 回显
     for &b in &RX_BYTES {
@@ -57,10 +57,10 @@ fn m5_usart_rx_interrupt_echo_end_to_end() {
             .lock()
             .unwrap()
             .publish(&Event::UartRx { port: 1, byte: b });
-        m.run(50_000).unwrap();
+        m.run_budget(50_000).unwrap();
     }
     // 主线退出循环，写 G_DONE
-    m.run(50_000).unwrap();
+    m.run_budget(50_000).unwrap();
 
     // 1) 主线完成 + 回显计数 + 无过载
     assert_eq!(read_u32(&mut m, G_DONE), 0xAAAA_AAAA, "主线应完成（写 G_DONE）");

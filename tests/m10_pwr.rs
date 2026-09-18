@@ -73,7 +73,7 @@ fn read_u32(m: &mut Machine, addr: u32) -> u32 {
 #[test]
 fn m10_pwr_end_to_end() {
     let mut m = load_machine();
-    m.run(100_000).unwrap();
+    m.run_budget(100_000).unwrap();
 
     // Phase A/B：低功耗位与 CSR 可写位写读一致
     assert_eq!(read_u32(&mut m, G_PWR_CR_OK), 1, "CR 低功耗位写读应一致");
@@ -86,7 +86,7 @@ fn m10_pwr_end_to_end() {
     m.pwr.lock().unwrap().inject_wakeup();
 
     // run() 消费复位请求 → 系统复位 → 固件再进 Reset_Handler 检测 LPWRRSTF
-    m.run(100_000).unwrap();
+    m.run_budget(100_000).unwrap();
 
     assert_eq!(read_u32(&mut m, G_PWR_WOKE), 1, "待机唤醒复位后应检测到 LPWRRSTF");
     assert_eq!(read_u32(&mut m, G_PWR_SBF), 1, "待机唤醒复位后 PWR_CSR.SBF 应保持");

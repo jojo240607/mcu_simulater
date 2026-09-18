@@ -253,7 +253,7 @@ impl Monitor {
             self.machine
                 .lock()
                 .unwrap()
-                .run(STEP_BUDGET)
+                .run_budget(STEP_BUDGET)
                 .map_err(|e| format!("step 失败: {e}"))?;
         }
         println!("  PC = {:#010x}", self.pc()?);
@@ -264,7 +264,7 @@ impl Monitor {
         self.machine
             .lock()
             .unwrap()
-            .run(budget)
+            .run_budget(budget)
             .map_err(|e| format!("run 失败: {e}"))?;
         println!(
             "  完成（{} 条退休指令），PC = {:#010x}",

@@ -60,7 +60,7 @@ fn flyctrl_real_sensors_via_toml_topology() {
             eprintln!(">>> 超时（300s）终止");
             break;
         }
-        let r = m.run(400_000);
+        let r = m.run_budget(400_000);
         let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
         // 日志可见性 = console（已 drain 部分 + raw 直写）⊕ SDK log ring（未
         // drain 部分）。log_task（prio 28）被 telem/uplink 等业务任务饿死时（实测

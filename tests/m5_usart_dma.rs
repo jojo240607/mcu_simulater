@@ -55,7 +55,7 @@ fn m5_usart_dma_tx_rx_end_to_end() {
     let mut m = load_machine();
 
     // 固件配置 USART1 + DMA2 双流 + NVIC，写 CR3 触发 TX DMA → run 搬运 TX_BUF → IRQ70
-    m.run(10_000).unwrap();
+    m.run_budget(10_000).unwrap();
 
     // 逐字节注入 RX：每注入 1 字节 → DMA2_Stream2 搬 1 字节到 RX_BUF
     for &b in RX_BYTES.iter() {
@@ -63,10 +63,10 @@ fn m5_usart_dma_tx_rx_end_to_end() {
             .lock()
             .unwrap()
             .publish(&Event::UartRx { port: 1, byte: b });
-        m.run(50_000).unwrap();
+        m.run_budget(50_000).unwrap();
     }
     // 主线退出循环，写 G_DONE
-    m.run(50_000).unwrap();
+    m.run_budget(50_000).unwrap();
 
     // 1) 主线完成 + TX/RX 完成中断各 1 次
     assert_eq!(read_u32(&mut m, G_DONE), 0xAAAA_AAAA, "主线应完成（写 G_DONE）");

@@ -114,7 +114,7 @@ fn rtc_enter_init(m: &mut Machine) {
 #[test]
 fn m11_rtc_end_to_end() {
     let mut m = load_machine();
-    m.run(1_000_000).unwrap();
+    m.run_budget(1_000_000).unwrap();
 
     assert_eq!(read_u32(&mut m, G_RTC_INIT_OK), 1, "RTC 初始化序列应完成（INITS 置位）");
     assert_eq!(read_u32(&mut m, G_BKP_NODBP), 1, "未解锁备份域时 BKP 写应被忽略");

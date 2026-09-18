@@ -37,7 +37,7 @@ fn telemetry_captures_firmware_timeline() {
     m.attach_telemetry(tel);
 
     // 推进固件：配置 I2C1 + 轮询发送问候（G_TX=1），随后进入等待循环
-    m.run(50_000).unwrap();
+    m.run_budget(50_000).unwrap();
     let rows_after_cfg = m.telemetry_rows();
     assert!(rows_after_cfg >= 5, "配置阶段应有多次采样，got {rows_after_cfg}");
 
@@ -47,7 +47,7 @@ fn telemetry_captures_firmware_timeline() {
             .lock()
             .unwrap()
             .publish(&Event::I2cRx { port: 1, byte: b });
-        m.run(20_000).unwrap();
+        m.run_budget(20_000).unwrap();
     }
     let rows_total = m.telemetry_rows();
     assert!(rows_total > rows_after_cfg, "后续执行应继续采样");
@@ -84,7 +84,7 @@ fn telemetry_csv_writable_and_parseable() {
     let mut tel = Telemetry::new(5_000);
     tel.add_watch("g_tx", G_TX, WatchType::U32);
     m.attach_telemetry(tel);
-    m.run(30_000).unwrap();
+    m.run_budget(30_000).unwrap();
 
     let csv = m.telemetry_csv();
     // 简单校验：每行固定列数、无空行

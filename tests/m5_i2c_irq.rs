@@ -61,7 +61,7 @@ fn m5_i2c_ev_irq_receive_end_to_end() {
     )));
 
     // 固件配置 I2C1 + NVIC + 轮询发问候，随后进入等待循环（run 按指令预算返回）
-    m.run(10_000).unwrap();
+    m.run_budget(10_000).unwrap();
 
     // 逐字节注入 RX：每注入 1 字节 → 运行让 EV IRQ handler 读 DR 接收
     for &b in &RX_BYTES {
@@ -69,10 +69,10 @@ fn m5_i2c_ev_irq_receive_end_to_end() {
             .lock()
             .unwrap()
             .publish(&Event::I2cRx { port: 1, byte: b });
-        m.run(50_000).unwrap();
+        m.run_budget(50_000).unwrap();
     }
     // 主线退出循环，写 G_DONE
-    m.run(50_000).unwrap();
+    m.run_budget(50_000).unwrap();
 
     // 1) 主线完成 + 发送/接收计数
     assert_eq!(read_u32(&mut m, G_DONE), 0xAAAA_AAAA, "主线应完成（写 G_DONE）");

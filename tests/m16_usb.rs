@@ -59,7 +59,7 @@ fn inject_setup(m: &mut Machine, data: [u8; 8], expect_n: u32) {
         .unwrap()
         .publish(&Event::UsbSetup { data });
     for _ in 0..200 {
-        m.run(50_000).unwrap();
+        m.run_budget(50_000).unwrap();
         if read_u32(m, G_SETUP_N) >= expect_n {
             break;
         }
@@ -72,9 +72,9 @@ fn m16_usb_end_to_end() {
     let mut m = load_machine();
 
     // 让固件完成初始化并进入主循环，随后注入总线复位。
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
     m.usb_otg.lock().unwrap().inject_usb_reset();
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
 
     // SETUP 1：GET_DESCRIPTOR(Device) → EP0 IN 回发 18 字节设备描述符
     inject_setup(&mut m, [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00], 1);
@@ -108,7 +108,7 @@ fn m16_usb_end_to_end() {
     let pattern: Vec<u8> = (0..64).map(|i| 0x55u8 + i as u8).collect();
     m.usb_otg.lock().unwrap().inject_out(1, &pattern);
     for _ in 0..200 {
-        m.run(50_000).unwrap();
+        m.run_budget(50_000).unwrap();
         if read_u32(&mut m, G_EP1_RX) == 1 {
             break;
         }

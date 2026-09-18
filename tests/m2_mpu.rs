@@ -49,7 +49,7 @@ fn m2_write_protect_sram_faults() {
     }
 
     // 固件最后写 0x20000000 应触发 DACCVIOL 并停止执行
-    let err = m.run(200_000).expect_err("写只读区域应触发 MemManage fault");
+    let err = m.run_budget(200_000).expect_err("写只读区域应触发 MemManage fault");
     match err {
         CoreError::MemManageFault { addr, kind } => {
             assert_eq!(addr, 0x2000_0000, "故障地址应为被写地址");
@@ -79,7 +79,7 @@ fn m2_xn_flash_fetch_faults() {
     }
 
     // FLASH 区被置 XN → 取指触发 IACCVIOL，执行停止
-    let err = m.run(200_000).expect_err("XN 区域取指应触发 MemManage fault");
+    let err = m.run_budget(200_000).expect_err("XN 区域取指应触发 MemManage fault");
     match err {
         CoreError::MemManageFault { addr, kind } => {
             assert_eq!(kind, MemManageKind::InstructionAccess);
@@ -105,7 +105,7 @@ fn m2_enabled_privdefena_background_allows() {
         bus.write(MPU_CTRL, 4, 0x1 | 0x4).unwrap();
     }
 
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
 
     // 固件正常跑完，结果仍为 12，且无 fault 记录
     let out = m.cpu.mem_read(0x2000_0000, 4).unwrap();
@@ -119,7 +119,7 @@ fn m2_enabled_privdefena_background_allows() {
 #[test]
 fn m2_mpu_disabled_regression() {
     let mut m = load_machine();
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
 
     // M0 回归：浮点结果正确
     let out = m.cpu.mem_read(0x2000_0000, 4).unwrap();

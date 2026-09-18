@@ -33,12 +33,12 @@ fn bench_mips_compute() {
     let mut m = load("firmware/fp_acceptance/fp_acceptance.elf");
 
     // 预热：JIT/翻译缓存 + 块 hook 建立
-    m.run(2_000_000).unwrap();
+    m.run_budget(2_000_000).unwrap();
 
     // 计时窗口：大预算连续执行（run(budget) 精确执行 budget 条指令，见校准测试）
     let budget = 100_000_000usize;
     let t0 = Instant::now();
-    m.run(budget).unwrap();
+    m.run_budget(budget).unwrap();
     let elapsed = t0.elapsed().as_secs_f64();
 
     let mips = budget as f64 / elapsed / 1e6;
@@ -70,13 +70,13 @@ fn bench_calibrate_count() {
     })
     .unwrap();
 
-    m.run(1_000_000).unwrap(); // 预热（此时已带 code hook）
+    m.run_budget(1_000_000).unwrap(); // 预热（此时已带 code hook）
     actual.store(0, Ordering::Relaxed);
     bytes.store(0, Ordering::Relaxed);
 
     let budget = 2_000_000usize;
     let c0 = m.clock.count();
-    m.run(budget).unwrap();
+    m.run_budget(budget).unwrap();
     let c1 = m.clock.count();
     let n = actual.load(Ordering::Relaxed);
     let nb = bytes.load(Ordering::Relaxed);

@@ -75,7 +75,7 @@ fn m14_sdio_end_to_end() {
     // 全流程自包含（命令 + DMA 搬运），无外部注入。DMA 搬运在 run() 间隙执行
     // （emu_start 返回后），故分多次 run() 让小预算自旋让出 CPU → 搬运完成。
     for _ in 0..200 {
-        m.run(500_000).unwrap();
+        m.run_budget(500_000).unwrap();
         if read_u32(&mut m, G_DONE) == 0xAAAA_AAAA {
             break;
         }

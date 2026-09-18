@@ -59,7 +59,7 @@ fn m4_dma_mem2mem_transfer_end_to_end() {
             .unwrap();
     }
 
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
 
     // 1) 主线完成 + 中断执行 + handler 校验
     assert_eq!(read_u32(&mut m, G_DONE), 0xAAAA_AAAA, "主线应完成（写 G_DONE）");

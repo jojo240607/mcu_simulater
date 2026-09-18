@@ -2347,7 +2347,7 @@ impl Machine {
             if self.systick_ticks() >= self.run_ms_target {
                 break;
             }
-            self.run(step)?;
+            self.run_budget(step)?;
         }
         Ok(())
     }
@@ -2359,6 +2359,11 @@ impl Machine {
             .get(15)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// 固件自身时钟（SysTick 毫秒）。供 [`crate::clock::McuClock`] 做闭环对齐断言。
+    pub fn systick_ms(&self) -> u64 {
+        self.systick_ticks()
     }
 
     pub fn nvic_pending(&self) -> bool {
@@ -2396,7 +2401,12 @@ impl Machine {
         self.last_switch_pc.get()
     }
 
-    pub fn run(&mut self, count: usize) -> Result<()> {
+    /// 按**退休字节预算**推进（性能/指令级用）。
+    ///
+    /// **不是时间语义**：`count` 是“退休字节”预算，与毫秒无固定换算关系（实测同预算的
+    /// bytes/ms 随代码块混合比浮动）。时间推进一律用 [`Machine::run_ms`] 或
+    /// [`crate::clock::McuClock`]；闭环测试不得直接调本方法。
+    pub fn run_budget(&mut self, count: usize) -> Result<()> {
         // 风暴护栏：正常时 count 预算在单次 emu_start 内耗尽即返回；但若某外设/中断
         // 持续可抢占，emu_start 每段都提前返回而 remaining 不递减，本循环会无限自旋
         //（jOS 调度器启动后即可能触发）。达上限时记诊断并提前返回（调用方继续分步）。

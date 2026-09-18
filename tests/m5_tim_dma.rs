@@ -52,7 +52,7 @@ fn m5_tim_dma_end_to_end() {
     // （每次 emu_start 返回后）执行搬运并置起 IRQ15；故分多次 run 让 process 有
     // 机会执行、中断得以投递，直到主线写 G_DONE。
     for _ in 0..10 {
-        m.run(200_000).unwrap();
+        m.run_budget(200_000).unwrap();
         if read_u32(&mut m, G_DONE) == 0xAAAA_AAAA {
             break;
         }

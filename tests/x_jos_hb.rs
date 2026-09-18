@@ -36,7 +36,7 @@ fn hb_periodic() {
             eprintln!(">>> 超时(300s) 无 hb");
             break;
         }
-        let r = m.run(400_000);
+        let r = m.run_budget(400_000);
         let text = {
             let outv = m.console.lock().unwrap().output().to_vec();
             String::from_utf8_lossy(&outv).into_owned()

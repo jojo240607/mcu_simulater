@@ -63,7 +63,7 @@ fn halt_observation_point_stops_run() {
 
     // run 大预算：应在 Halt 触发后提前返回（而非耗尽预算）
     let pc_before = m.cpu.reg_read_u32(unicorn_engine::RegisterARM::PC).unwrap();
-    m.run(20_000_000).unwrap();
+    m.run_budget(20_000_000).unwrap();
     assert!(m.halted(), "Halt 观察点应触发");
     assert!(m.fault_all_fired(), "剧本应全部触发");
     assert_eq!(pc_before, pc_before); // 无实际意义占位，避免 unused
@@ -71,7 +71,7 @@ fn halt_observation_point_stops_run() {
     // 清除后继续推进正常
     m.clear_halt();
     assert!(!m.halted());
-    m.run(10_000).unwrap();
+    m.run_budget(10_000).unwrap();
     assert!(!m.halted());
 }
 
@@ -93,7 +93,7 @@ fn scripted_i2c_nack_visible_in_trace() {
     m.attach_fault_script(script);
 
     // run 推进虚拟时间触发注入（需 ≥ 0.001s：~3 万退休指令）
-    m.run(100_000).unwrap();
+    m.run_budget(100_000).unwrap();
     assert!(m.fault_all_fired(), "剧本应已触发");
 
     // 故障后读 → 总线嗅探应记录 NACK（I2cRead{None}）
@@ -115,8 +115,8 @@ fn scripted_uart_drop_suppresses_push() {
 
     // 基线：虚拟从设备推流 dt 基于"上次 run 结束"的退休量（延迟一个 run），
     // 故先 run 一次推进（首次 dt=0），再 run 一次产生 dt=0.15s（SBUS 20Hz → 3 帧）
-    m.run(4_500_000).unwrap(); // 推进虚拟时间（本 run 的退休量为下次 dt 基准）
-    m.run(4_500_000).unwrap(); // 推流 dt=0.15s
+    m.run_budget(4_500_000).unwrap(); // 推进虚拟时间（本 run 的退休量为下次 dt 基准）
+    m.run_budget(4_500_000).unwrap(); // 推流 dt=0.15s
     let u3 = m.usart.lock().unwrap()[2].clone();
     let baseline_len = u3.lock().unwrap().rx_fifo_len();
     assert!(baseline_len > 0, "基线：SBUS 推流应入 fifo，got {baseline_len}");
@@ -126,7 +126,7 @@ fn scripted_uart_drop_suppresses_push() {
     script = script.at(0.001, FaultAction::UartDrop { port: 3, frames: u32::MAX });
     m.attach_fault_script(script);
     // 本 run：step_virtual_uart(dt=0.15) 先推流（drop 在段中才触发，本次推流仍入 fifo）
-    m.run(4_500_000).unwrap();
+    m.run_budget(4_500_000).unwrap();
     assert!(m.fault_all_fired(), "丢帧剧本应触发");
     // 清空既有 fifo（含本次已入队的），作为丢帧生效后的基线
     let u3 = m.usart.lock().unwrap()[2].clone();
@@ -138,7 +138,7 @@ fn scripted_uart_drop_suppresses_push() {
     }
     let before_len = u3.lock().unwrap().rx_fifo_len();
     // 下一个 run：dt=0.15s 的推流应被丢帧拦截 → fifo 不增长
-    m.run(4_500_000).unwrap();
+    m.run_budget(4_500_000).unwrap();
     let after_len = u3.lock().unwrap().rx_fifo_len();
     assert!(
         after_len <= before_len + 8,

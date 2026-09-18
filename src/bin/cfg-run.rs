@@ -147,7 +147,7 @@ fn main() {
         if max_steps != 0 && step >= max_steps {
             break;
         }
-        if let Err(e) = m.run(n) {
+        if let Err(e) = m.run_budget(n) {
             eprintln!("\n[run Err] {e}");
             break;
         }

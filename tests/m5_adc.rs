@@ -56,7 +56,7 @@ fn m5_adc_dma_end_to_end() {
     let mut m = load_machine();
 
     // 固件配置 ADC1 + DMA2_Stream0 + NVIC，随后进入主循环等待 DMA 完成
-    m.run(10_000).unwrap();
+    m.run_budget(10_000).unwrap();
 
     // 逐次注入采样值：每次 → feed_value 置 EOC → 路由 Stream0 → run 间隙搬 1 半字
     for &v in SAMPLES.iter() {
@@ -64,10 +64,10 @@ fn m5_adc_dma_end_to_end() {
             .lock()
             .unwrap()
             .publish(&Event::AdcValue { port: 1, channel: 0, value: v });
-        m.run(50_000).unwrap();
+        m.run_budget(50_000).unwrap();
     }
     // 主线退出循环，写 G_DONE
-    m.run(50_000).unwrap();
+    m.run_budget(50_000).unwrap();
 
     // 1) DMA 完成中断执行 1 次 + 主线完成
     assert_eq!(read_u32(&mut m, G_DMA_TC), 1, "DMA2_Stream0 完成中断应执行 1 次");

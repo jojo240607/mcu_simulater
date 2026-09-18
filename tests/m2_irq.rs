@@ -42,7 +42,7 @@ fn m2_irq_preemption_nesting_return() {
     let mut m = load_machine();
 
     // 执行至固件完成（G_DONE 写完后进入死循环，达到指令数上限自然停止）
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
 
     // 优先级配置已生效（数值小 = 优先级高）
     {

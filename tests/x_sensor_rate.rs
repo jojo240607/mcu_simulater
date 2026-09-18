@@ -61,10 +61,10 @@ fn sensor_rate_and_fw_clock_alignment() {
     m.reset().unwrap();
     // boot + 收敛（与闭环测试同口径）
     for _ in 0..12 {
-        m.run(1_000_000).unwrap();
+        m.run_budget(1_000_000).unwrap();
     }
     for _ in 0..60 {
-        m.run(1_000_000).unwrap();
+        m.run_budget(1_000_000).unwrap();
     }
 
     // 采样窗口：40 步 × 4ms = 160ms 场景

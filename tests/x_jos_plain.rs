@@ -14,7 +14,7 @@ fn plain_boot() {
     let mut reached = false;
     for step in 0..40 {
         let t0 = std::time::Instant::now();
-        let r = m.run(30_000_000);
+        let r = m.run_budget(30_000_000);
         let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
         let out = m.console.lock().unwrap().output().len();
         let text = {

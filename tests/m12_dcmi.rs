@@ -70,7 +70,7 @@ fn inject_and_run(m: &mut Machine, data: Vec<u8>, target: u32, value: u32) {
         .unwrap()
         .publish(&Event::DcmiFrame { port: 1, data });
     for _ in 0..20 {
-        m.run(200_000).unwrap();
+        m.run_budget(200_000).unwrap();
         if read_u32(m, target) == value {
             break;
         }
@@ -82,7 +82,7 @@ fn m12_dcmi_end_to_end() {
     let mut m = load_machine();
 
     // 阶段一：固件使能 DCMI 并写 G_READY_A（等待注入帧 A）
-    m.run(10_000).unwrap();
+    m.run_budget(10_000).unwrap();
     assert_eq!(read_u32(&mut m, G_READY_A), 1, "Phase A 应就绪等待帧注入");
 
     // 注入帧 A（16 字节 0x01..0x10 → 4 字）→ 固件轮询读 DR 校验 → G_POLL_OK

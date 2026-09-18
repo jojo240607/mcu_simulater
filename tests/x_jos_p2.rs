@@ -57,7 +57,7 @@ fn p2() {
                 past.load(Ordering::Relaxed), got_invalid.load(Ordering::Relaxed));
             break;
         }
-        let r = m.run(400_000);
+        let r = m.run_budget(400_000);
         let last_pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
         let out = {
             let outv = m.console.lock().unwrap().output().to_vec();

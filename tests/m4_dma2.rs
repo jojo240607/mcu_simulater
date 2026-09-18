@@ -99,7 +99,7 @@ fn m4_dma2_multi_stream_concurrent_transfer_end_to_end() {
         }
     }
 
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
 
     // 1) 主线完成 + 四条流中断各执行一次 + 各流 handler 校验位图
     assert_eq!(read_u32(&mut m, G_DONE), 0xAAAA_AAAA, "主线应完成（写 G_DONE）");

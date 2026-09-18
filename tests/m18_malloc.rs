@@ -62,7 +62,7 @@ fn m18_malloc_end_to_end() {
     // 分次运行直到固件写入完成标记（防止一次性预算不足/超时）
     let mut done = false;
     for _ in 0..60 {
-        m.run(50_000).unwrap();
+        m.run_budget(50_000).unwrap();
         if read_u32(&mut m, R_DONE) == DONE_MAGIC {
             done = true;
             break;

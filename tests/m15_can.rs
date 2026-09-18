@@ -66,7 +66,7 @@ fn m15_can_end_to_end() {
 
     // 发送在写 TIRx 时同步完成并发布/路由，单次 run 即可完成（循环仅保险）。
     for _ in 0..100 {
-        m.run(500_000).unwrap();
+        m.run_budget(500_000).unwrap();
         if read_u32(&mut m, G_DONE) == 0xAAAA_AAAA {
             break;
         }

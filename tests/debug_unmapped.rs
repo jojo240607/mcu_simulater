@@ -27,7 +27,7 @@ fn main() {
         true
     }).unwrap();
 
-    let r = m.run(100_000);
+    let r = m.run_budget(100_000);
     let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
     let lp = last_pc.load(Ordering::Relaxed);
     let la = last_addr.load(Ordering::Relaxed);

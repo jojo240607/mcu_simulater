@@ -44,7 +44,7 @@ fn read_u32(m: &mut Machine, addr: u32) -> u32 {
 #[test]
 fn m4_rcc_clock_tree_end_to_end() {
     let mut m = load_machine();
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
 
     // 1) 主线完成 + 状态位联动观察位
     assert_eq!(read_u32(&mut m, G_DONE), 0xAAAA_AAAA, "主线应完成（写 G_DONE）");

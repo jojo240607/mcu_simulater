@@ -97,7 +97,7 @@ fn first_double_add_snapshot() {
             eprintln!(">>> 超时(assert 未提前出现)");
             break;
         }
-        let _ = m.run(400_000);
+        let _ = m.run_budget(400_000);
         if af.load(Ordering::Relaxed) > 0 && step < 2 {
             let wpc = wp.load(Ordering::Relaxed);
             let wv2 = wv.load(Ordering::Relaxed);

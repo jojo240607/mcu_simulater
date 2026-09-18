@@ -39,7 +39,7 @@ fn sys_retire_calib() {
         };
         let sy0 = tick_n(&m);
         let ret0 = retire.load(Ordering::Relaxed);
-        let _ = m.run(400_000);
+        let _ = m.run_budget(400_000);
         let sy1 = tick_n(&m);
         let ret1 = retire.load(Ordering::Relaxed);
         eprintln!(

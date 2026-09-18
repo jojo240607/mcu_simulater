@@ -65,15 +65,15 @@ fn m4_exti_external_interrupt_end_to_end() {
     )));
 
     // 1) 先跑一段让固件完成 RCC/SYSCFG/EXTI/NVIC 配置并进入主循环
-    m.run(10_000).unwrap();
+    m.run_budget(10_000).unwrap();
 
     // 2) 注入 4 次 PA0 低→高脉冲（上升沿触发 EXTI0 → IRQ6），每次后运行让 handler 执行
     for _ in 0..4 {
         drive_pa0(&mut m, false); // 下降沿（FTSR 未使能，不触发），复位沿检测状态
         drive_pa0(&mut m, true); // 上升沿 → EXTI0 PR=1 → NVIC IRQ6 pending
-        m.run(50_000).unwrap(); // handler：清 PR、G_EXTI++、BSRR 翻转 PA5
+        m.run_budget(50_000).unwrap(); // handler：清 PR、G_EXTI++、BSRR 翻转 PA5
     }
-    m.run(50_000).unwrap(); // 主线退出循环，写 G_DONE
+    m.run_budget(50_000).unwrap(); // 主线退出循环，写 G_DONE
 
     // 3) 结果区
     assert_eq!(read_u32(&mut m, G_DONE), 0xAAAA_AAAA, "主线应完成（写 G_DONE）");

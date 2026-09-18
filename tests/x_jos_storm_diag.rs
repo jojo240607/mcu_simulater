@@ -44,7 +44,7 @@ fn storm_diag() {
             eprintln!(">>> 挂载阶段超时");
             break;
         }
-        let r = m.run(200_000);
+        let r = m.run_budget(200_000);
         let text = {
             let outv = m.console.lock().unwrap().output().to_vec();
             String::from_utf8_lossy(&outv).into_owned()
@@ -87,7 +87,7 @@ fn storm_diag() {
         };
         let tk0 = g_tick_r(&mut m);
         let pc0 = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
-        let r = m.run(400_000);
+        let r = m.run_budget(400_000);
         let pc = m.cpu.reg_read_u32(RegisterARM::PC).unwrap();
         let tk1 = g_tick_r(&mut m);
         let iters = m.run_iterations() - base_iter;

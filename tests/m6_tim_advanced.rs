@@ -77,7 +77,7 @@ fn m6_tim_advanced_end_to_end() {
     })));
 
     // 阶段一：执行至固件关闭更新中断（各累计 ≥4 次更新后停 UIE），run() 自然返回。
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
 
     // 1) 多定时器并跑：TIM1（IRQ25）与 TIM3（IRQ29）更新中断都应执行 ≥4 次
     let t1_uev = read_u32(&mut m, G_T1_UEV);
@@ -129,7 +129,7 @@ fn m6_tim_advanced_end_to_end() {
 
     // 阶段二：软件刹车。写 G_TRIGGER_BREAK=1 → 固件 EGR.BG → MOE 清零/BIF 置位/IRQ24。
     m.cpu.mem_write(G_TRIGGER_BREAK as u64, &1u32.to_le_bytes()).unwrap();
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
 
     // 4) 刹车结果：IRQ24 执行 1 次、MOE 清零、BIF 置位、主线完成
     assert_eq!(read_u32(&mut m, G_T1_BRK), 1, "TIM1 刹车中断应执行 1 次");

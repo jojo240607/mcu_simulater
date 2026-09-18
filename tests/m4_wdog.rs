@@ -48,7 +48,7 @@ fn read_u32(m: &mut Machine, addr: u32) -> u32 {
 fn m4_wdog_iwdg_timeout_system_reset_end_to_end() {
     let mut m = load_machine("iwdg_demo");
 
-    m.run(200_000).unwrap();
+    m.run_budget(200_000).unwrap();
 
     // 1) 两次进入 Reset_Handler（首次启动看门狗 → 超时复位 → 二次进入）
     assert_eq!(read_u32(&mut m, G_BOOT), 2, "看门狗复位后应二次进入 Reset_Handler");
@@ -63,7 +63,7 @@ fn m4_wdog_iwdg_timeout_system_reset_end_to_end() {
 fn m4_wdog_wwdg_ewi_and_timeout_system_reset_end_to_end() {
     let mut m = load_machine("wwdg_demo");
 
-    m.run(300_000).unwrap();
+    m.run_budget(300_000).unwrap();
 
     // 1) EWI 早期唤醒中断应执行 1 次（计数器跨 0x40）
     assert_eq!(read_u32(&mut m, G_EWI), 1, "WWDG EWI 中断应执行 1 次");
