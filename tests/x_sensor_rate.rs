@@ -21,7 +21,7 @@ use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
-const SENSOR_SEQ: u64 = 0x2000_C6DC;
+const SENSOR_SEQ: u64 = 0x200116DC;
 
 fn systick(m: &Machine) -> u64 {
     m.vec_entries()

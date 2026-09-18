@@ -68,7 +68,7 @@ fn read_thrust(m: &Arc<Mutex<Machine>>) -> [f32; 4] {
 
 /// 读固件 EKF 估计高度 est.pos[2]（NED 向下正，地址布局同 x_vperiph）。
 fn read_ekf_z(m: &Arc<Mutex<Machine>>) -> f32 {
-    let b = m.lock().unwrap().cpu.mem_read(0x2000_A174 + 28, 4).unwrap();
+    let b = m.lock().unwrap().cpu.mem_read(0x2000F174 + 28, 4).unwrap();
     f32::from_le_bytes(b.try_into().unwrap())
 }
 
@@ -79,7 +79,7 @@ fn settle_ekf_before_arm(m: &Arc<Mutex<Machine>>) -> f32 {
     let mut z = f32::NAN;
     for i in 0..400 {
         mm.run_budget(1_000_000).unwrap();
-        z = f32::from_le_bytes(mm.cpu.mem_read(0x2000_A174 + 28, 4).unwrap().try_into().unwrap());
+        z = f32::from_le_bytes(mm.cpu.mem_read(0x2000F174 + 28, 4).unwrap().try_into().unwrap());
         if i % 50 == 0 {
             eprintln!("[noise] 收敛推进 i={i} ekf_z={z:.3}");
         }
@@ -131,7 +131,7 @@ fn hover_60s_noisy() {
     settle_ekf_before_arm(&m);
 
     // ARM + RC 解锁
-    m.lock().unwrap().cpu.mem_write(0x2000_C769, &[1u8]).unwrap();
+    m.lock().unwrap().cpu.mem_write(0x20011769, &[1u8]).unwrap();
     {
         let mut st = state.lock().unwrap();
         st.rc_ch[4] = 2000.0;
