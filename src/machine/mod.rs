@@ -50,7 +50,7 @@ use crate::peripheral::usart::{Usart, USART1_IRQ, USART2_IRQ, USART3_IRQ, UART4_
 use crate::peripheral::wdog::{Iwdg, ResetReason, WdogResetReq, Wwdg};
 use crate::peripheral::{Peripheral};
 use crate::sim::status::{Status, BIT_ANY_ACTIVE, BIT_MPU, BIT_NVIC_PENDING, BIT_WDOG};
-use crate::sim::timing::{VirtualClock, VIRTUAL_INSNS_PER_SEC};
+use crate::sim::timing::VirtualClock;
 
 
 /// block hook 冷路径状态（MPU/NVIC/外设 tick 列表），捆进单个 Arc 以缩小闭包捕获体
@@ -2425,8 +2425,16 @@ impl Machine {
         // 段内逐段推进（旧实现每段 dt=0.001）会在中断风暴下自放大：段数膨胀 →
         // 虚拟时间膨胀 → 推流字节膨胀 → 更多中断。改为指令基准后推流速率恒定
         //（GPS 20Hz / SBUS 20Hz，period=0.05s），与中断频率无关。
+        // 虚拟从设备/外设推流时钟：必须与**固件自身时钟**同一钟。
+        // 旧实现用 `VIRTUAL_INSNS_PER_SEC`(172e6，推流标定口径)，而固件 SysTick 实测
+        // ~95.6K~104.5K 字节/ms（`retired/SysTick`）——两者不是同一个钟，且本 `dt`
+        // 是**每次 run() 调用**算一次：改用 run_ms（内部分 47800 字节小块）后会改变
+        // 从设备落帧粒度 → GPS GGA/RMC 投递被打碎 → 固件解析不到 RMC 速度（gv=0）。
+        // 改以固件时钟（退休字节 / RETIRED_BYTES_PER_MS）折算秒，推流时间 ≡ 固件时间，
+        // 与 run() 的调用分块无关。
         let retired_now = self.retired_insts.load(Ordering::Relaxed);
-        let dt = (retired_now - self.last_virt_retired.get()) as f32 / VIRTUAL_INSNS_PER_SEC;
+        let dt = (retired_now - self.last_virt_retired.get()) as f32
+            / (crate::sim::timing::RETIRED_BYTES_PER_MS as f32 * 1000.0);
         self.last_virt_retired.set(retired_now);
         self.step_virtual_slaves(dt);
         self.step_virtual_uart(dt);
