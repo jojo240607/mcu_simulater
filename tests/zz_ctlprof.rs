@@ -551,8 +551,8 @@ fn usb_cost_envharness_turn() {
         let scn =
             EnvScenario::new(Motion::Turn { radius: 20.0, rate: 0.5 }, Perturb::clean(), vec![]);
         let mut h = EnvHarness::new(scn, true);
-        if !host {
-            h.usb_host.detach();
+        if host {
+            h.usb_host.attach();
         }
         let mut s = Vec::new();
         for k in 0..STEPS {
