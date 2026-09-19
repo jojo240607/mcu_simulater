@@ -28,6 +28,25 @@ use crate::sim::status::{Status, BIT_NVIC_PENDING};
 
 /// STM32F407 外部中断数（IRQ 0..=81）
 pub const NVIC_IRQ_COUNT: usize = 82;
+
+/// NVIC 实现的优先级位数（Cortex-M4 上 ST 的 `__NVIC_PRIO_BITS = 4`）。
+/// IPR/SHPR 中优先级存【高 NVIC_PRIO_BITS 位】（= 数值左移 (8 - NVIC_PRIO_BITS)）。
+pub const NVIC_PRIO_BITS: u32 = 4;
+
+/// BASEPRI 寄存器值 → 优先级数值（供 [`Nvic::select_pending`] 使用）。
+///
+/// BASEPRI 存的是**左移 `8 - NVIC_PRIO_BITS` 位后**的值：内核临界区
+/// `rtos_crit_enter` 写 `BASEPRI = 0x40`，含义是"屏蔽优先级 >= 4"。
+///
+/// **绝不能取低若干位**：`0x40 & 0xF == 0` 会被误判成"不屏蔽"（真实缺陷，见
+/// `fix(machine): BASEPRI 优先级解析取错位段`）。后果是模拟器会在内核临界区内照样
+/// 递送 SysTick/PendSV（优先级 15），任务切换切开 `sleep_add`/`sleep_remove` 的链表
+/// 操作 → 睡眠链被破坏 → 任务永久睡死。真机硬件遵守 BASEPRI，故纯模拟器缺陷；
+/// 又因切换落点依赖代码布局，表现为"改代码就换症状"的 heisenbug。
+#[inline]
+pub const fn basepri_to_prio(raw: u32) -> u8 {
+    ((raw >> (8 - NVIC_PRIO_BITS)) & ((1 << NVIC_PRIO_BITS) - 1)) as u8
+}
 /// NVIC 寄存器区起点（相对 SCB 基址 0xE000E000；ISER0）
 pub const NVIC_WIN_START: u32 = 0x100;
 /// NVIC 寄存器区终点（不含；0x500 起为保留/系统异常区）
@@ -578,6 +597,45 @@ impl crate::peripheral::Peripheral for Nvic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BASEPRI 位段解析：必须取【高 NVIC_PRIO_BITS 位】。
+    #[test]
+    fn basepri_extracts_high_priority_bits() {
+        // 内核临界区写 0x40 = "屏蔽优先级 >= 4"
+        assert_eq!(basepri_to_prio(0x40), 4);
+        assert_eq!(basepri_to_prio(0x50), 5);
+        assert_eq!(basepri_to_prio(0xF0), 15);
+        // 0 = 不屏蔽
+        assert_eq!(basepri_to_prio(0x00), 0);
+        // 回归守卫：旧实现 `raw & 0xF` 会把 0x40 解析成 0（不屏蔽）
+        assert_ne!(basepri_to_prio(0x40), 0);
+    }
+
+    /// 行为守卫：内核临界区（BASEPRI=0x40 ⇒ 阈值 4）必须屏蔽最低优先级（15）的中断，
+    /// 否则任务切换会在内核临界区内切入 `sleep_add`/`sleep_remove` 的链表操作。
+    #[test]
+    fn kernel_critical_section_masks_lowest_prio_irq() {
+        let mut n = Nvic::new();
+        // IRQ0：优先级 15（最低，与 SysTick/PendSV 同级），使能并挂起
+        // 与固件/CMSIS 同路径：字节写，值为已左移 (8-PRIO_BITS)=4 位的优先级（15<<4）
+        n.write(NVIC_WIN_START + 0x300, 1, 0xF0).unwrap();
+        n.write(NVIC_WIN_START + 0x00, 4, 1).unwrap(); // ISER0: enable IRQ0
+        n.set_pending(0);
+        assert_eq!(n.priority(0), 15);
+
+        // 内核临界区（阈值 4）：优先级 15 >= 4 → 必须屏蔽
+        let kernel_basepri = basepri_to_prio(0x40);
+        assert_eq!(kernel_basepri, 4);
+        assert_eq!(
+            n.select_pending(false, kernel_basepri),
+            None,
+            "内核临界区内 prio 15 的中断不得抢占（BASEPRI=0x40 必须解析为阈值 4）"
+        );
+        // 对照：BASEPRI=0（不屏蔽）时应被选中 —— 说明上面的 None 来自屏蔽而非其它条件
+        assert_eq!(n.select_pending(false, 0), Some(0));
+        // 对照：阈值 16（>15）不屏蔽它
+        assert_eq!(n.select_pending(false, basepri_to_prio(0x00)), Some(0));
+    }
 
     #[test]
     fn irq_set_clear_pending_enable() {

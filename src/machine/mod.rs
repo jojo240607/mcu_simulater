@@ -2116,15 +2116,12 @@ impl Machine {
             // 挂起中断抢占检查（快路径：无挂起中断时跳过加锁的 select_pending_vector）
             if s & BIT_NVIC_PENDING != 0 {
                 let primask = uc.reg_read(RegisterARM::PRIMASK).unwrap_or(0) != 0;
-                // 【修复】BASEPRI 的优先级在【高 4 位】（__NVIC_PRIO_BITS=4，左移
-                // (8-4)=4 位存），即内核临界区写 0x40 表示"屏蔽优先级 >= 4"。
-                // 旧代码 `& 0xF` 取的是低 4 位 → 0x40 & 0xF == 0 → 被当成"不屏蔽"，
-                // 于是模拟器会在内核临界区内照样递送 SysTick/PendSV（优先级 15），
-                // 任务切换打断 sleep_add/sleep_remove 等链表操作 → 睡眠链被破坏
-                // （实测症状：控制任务被留在 SLEEPING 且不在睡眠链上 → 永久睡死；
-                // 写监视点抓到 sleep_add 与 sleep_remove 指令级交错）。真机硬件遵守
-                // BASEPRI，故不会出现；此缺陷使闭环测试在部分代码布局下必然失败。
-                let basepri = ((uc.reg_read(RegisterARM::BASEPRI).unwrap_or(0) >> 4) & 0xF) as u8;
+                // BASEPRI → 优先级数值。转换收在 `nvic::basepri_to_prio` 一处，
+                // 并带单测守卫（曾因取错位段导致内核临界区被当成"不屏蔽"，使
+                // SysTick/PendSV 切入 sleep_add/sleep_remove 破坏睡眠链）。
+                let basepri = crate::peripheral::nvic::basepri_to_prio(
+                    uc.reg_read(RegisterARM::BASEPRI).unwrap_or(0) as u32,
+                );
                 let mut n = cold.nvic.lock().unwrap();
                 if let Some(vector) = n.select_pending_vector(primask, basepri) {
                     n.set_stop_reason(StopReason::Switch(vector));
