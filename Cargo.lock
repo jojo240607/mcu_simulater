@@ -339,9 +339,16 @@ dependencies = [
 name = "flyctrl-core"
 version = "0.1.0"
 dependencies = [
+ "fpmath",
  "libm",
  "mavlink-core",
 ]
+
+[[package]]
+name = "fpmath"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f617488244e3bd5aa86da93efaf4072579a301832ca5a9c7e3493563b509a43d"
 
 [[package]]
 name = "glob"
