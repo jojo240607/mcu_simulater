@@ -245,7 +245,7 @@ fn hil_mcusim_closed_loop() {
                     f32::from_le_bytes([b[0], b[1], b[2], b[3]])
                 };
                 eprintln!("[hil-mcusim] mem: CTRL_ATT_I={:.0} CTRL_POS_I={:.0} HIL_AIN={:.0}",
-                    rd_f(0x2000b6c4), rd_f(0x2000b6c8), rd_f(0x2000b6e8));
+                    rd_f(0x200106c4), rd_f(0x200106c8), rd_f(0x200106e8));
             }
             let att = link.mcu_att().map(|a| (a.roll, a.pitch, a.yaw));
             let af = link.actuator_full;
