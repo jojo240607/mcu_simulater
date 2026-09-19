@@ -59,14 +59,16 @@ fn systick(m: &Machine) -> u64 {
         .unwrap_or(0)
 }
 
-fn build() -> Machine {
+fn build_with_uart(uart: bool) -> Machine {
     let sys = artifact::joc_base_elf();
     let app = artifact::flyctrl_real_app_bin();
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     let state = Arc::new(Mutex::new(FlySimState::default()));
     m.attach_flysim_sensors(state.clone());
-    m.attach_flysim_uart_slaves(state.clone());
+    if uart {
+        m.attach_flysim_uart_slaves(state.clone());
+    }
     {
         let mut st = state.lock().unwrap();
         st.imu_acc = [0.0, 0.0, -9.81];
@@ -81,6 +83,10 @@ fn build() -> Machine {
     m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
     m
+}
+
+fn build() -> Machine {
+    build_with_uart(true)
 }
 
 fn boot(m: &mut Machine) {
@@ -218,5 +224,136 @@ fn ctl_phase_breakdown() {
     println!(
         "[phase] step_hil 内层合计 {inner_total:.3} ms/拍 | 外层合计 {total:.3} ms/拍 | 采样 {} 拍",
         g.ticks
+    );
+}
+
+/// 固件 RTOS 毫秒计数器（joc-base `g_tick`，RTOS_TICK_HZ=1000）。
+const G_TICK: u64 = 0x100063B4;
+const SENSOR_SEQ: u64 = 0x200116DC;
+
+/// 控制/传感器任务的**真实运行频率**。
+///
+/// 零扰动：只在宿主侧读固件计数器（每 1ms 调一次 `run_ms(1.0)` 后采样），
+/// 不装任何 hook —— 实测 block hook 每 TB 三次 `mem_read_as_vec`（带堆分配）
+/// 会让固件轨迹显著偏移（同窗口 249.7Hz -> 57.3Hz），故不可用于测频率。
+///
+/// 标称：控制 `CONTROL_PERIOD_TICKS`=4 拍 => 250Hz；sensors `sample_dt`=0.002s
+/// => 2 拍 => 500Hz。
+#[test]
+fn task_rates_and_periods() {
+    let mut m = build();
+    boot(&mut m);
+
+    // 预热窗口（让两条任务都进入稳态）
+    for _ in 0..250u32 {
+        m.run_ms(4.0).unwrap();
+    }
+
+    const MS: u32 = 3000;
+    let t0 = systick(&m);
+    let r0 = m.retired_count();
+    let c0 = u32at(&mut m, CTRL_TICKS);
+    let q0 = u32at(&mut m, SENSOR_SEQ);
+
+    // 1ms 粒度采样：记录每次 CTRL_TICKS / SENSOR_SEQ(每轮+2) 变化时经过的固件毫秒
+    let mut hist_ctrl = [0u32; 24];
+    let mut hist_sen = [0u32; 64];
+    let mut last_c = c0;
+    let mut last_q = q0;
+    let mut last_ct = u32at(&mut m, G_TICK);
+    let mut last_qt = last_ct;
+    while ((systick(&m) - t0) as u32) < MS {
+        m.run_ms(1.0).unwrap();
+        let t = u32at(&mut m, G_TICK);
+        let c = u32at(&mut m, CTRL_TICKS);
+        if c != last_c {
+            let d = t.wrapping_sub(last_ct) as usize;
+            if d < hist_ctrl.len() {
+                hist_ctrl[d] += 1;
+            }
+            last_c = c;
+            last_ct = t;
+        }
+        let q = u32at(&mut m, SENSOR_SEQ);
+        if q.wrapping_sub(last_q) >= 2 {
+            let d = t.wrapping_sub(last_qt) as usize;
+            if d < hist_sen.len() {
+                hist_sen[d] += 1;
+            }
+            last_q = q;
+            last_qt = t;
+        }
+    }
+    let fw_ms = (systick(&m) - t0) as f64;
+    let retired = (m.retired_count() - r0) as f64;
+    let ctrl = last_c.wrapping_sub(c0) as f64;
+    let sen = u32at(&mut m, SENSOR_SEQ).wrapping_sub(q0) as f64 / 2.0;
+
+    println!(
+        "[rates] 窗口 {fw_ms:.0}ms | 控制 {ctrl:.0} 拍 -> {:.2} Hz（标称 250.0，周期 {:.3}ms）",
+        ctrl * 1000.0 / fw_ms,
+        fw_ms / ctrl
+    );
+    println!(
+        "[rates]                  | sensors {sen:.0} 轮 -> {:.2} Hz（标称 500.0，周期 {:.3}ms）",
+        sen * 1000.0 / fw_ms,
+        fw_ms / sen
+    );
+    println!(
+        "[rates] 单拍(轮)成本：控制 {:.0} 字节 = {:.3}ms/拍 | sensors {:.0} 字节 = {:.3}ms/轮",
+        retired / ctrl,
+        retired / ctrl / RETIRED_BYTES_PER_MS,
+        retired / sen,
+        retired / sen / RETIRED_BYTES_PER_MS
+    );
+    println!(
+        "[rates] CPU 总占用 {:.1}%（退休 {:.0} 字节/固件ms）",
+        retired * 100.0 / RETIRED_BYTES_PER_MS / fw_ms,
+        retired / fw_ms
+    );
+    let show = |name: &str, h: &[u32]| {
+        let n: u32 = h.iter().sum();
+        let mut parts = String::new();
+        for (d, c) in h.iter().enumerate() {
+            if *c > 0 {
+                parts.push_str(&format!(" {d}ms:{:.1}%", *c as f64 * 100.0 / n as f64));
+            }
+        }
+        println!("[rates] {name} 周期分布（1ms 采样粒度）{parts}");
+    };
+    show("控制  ", &hist_ctrl);
+    show("sensors", &hist_sen);
+}
+
+/// 轻载对照：只挂 flysim 传感器、不挂 UART 从设备（去掉 GPS/RC 推流与 USB 上行负载），
+/// 用于判定 sensors 达不到 500Hz 是'CPU 被抢'还是'周期设定本身不对'。
+#[test]
+fn task_rates_light() {
+    let mut m = build_with_uart(false);
+    boot(&mut m);
+    for _ in 0..250u32 {
+        m.run_ms(4.0).unwrap();
+    }
+    const MS: u32 = 3000;
+    let t0 = systick(&m);
+    let r0 = m.retired_count();
+    let c0 = u32at(&mut m, CTRL_TICKS);
+    let q0 = u32at(&mut m, SENSOR_SEQ);
+    while ((systick(&m) - t0) as u32) < MS {
+        m.run_ms(1.0).unwrap();
+    }
+    let fw = (systick(&m) - t0) as f64;
+    let retired = (m.retired_count() - r0) as f64;
+    let c = u32at(&mut m, CTRL_TICKS).wrapping_sub(c0) as f64;
+    let q = u32at(&mut m, SENSOR_SEQ).wrapping_sub(q0) as f64 / 2.0;
+    println!(
+        "[rates-light] 窗口 {fw:.0}ms | 控制 {} 拍 -> {:.2}Hz（周期 {:.3}ms） | sensors {} 轮 -> {:.2}Hz（周期 {:.3}ms） | CPU {:.1}%",
+        c as u32,
+        c * 1000.0 / fw,
+        fw / c,
+        q as u32,
+        q * 1000.0 / fw,
+        fw / q,
+        retired * 100.0 / RETIRED_BYTES_PER_MS / fw
     );
 }
