@@ -325,8 +325,12 @@ fn task_rates_and_periods() {
     show("sensors", &hist_sen);
 }
 
-/// 轻载对照：只挂 flysim 传感器、不挂 UART 从设备（去掉 GPS/RC 推流与 USB 上行负载），
+/// 轻载对照：只挂 flysim 传感器、不挂 UART 从设备。
+///
 /// 用于判定 sensors 达不到 500Hz 是'CPU 被抢'还是'周期设定本身不对'。
+/// 注意两种配置的差别**只在 UART**（USART2 NMEA GPS + USART3 SBUS）；USB 路径
+/// 两者相同——固件 telemetry/uplink 任务都无条件跑，而本路径没有虚拟 USB 主机
+/// （见 task_rates_with_usb_host）。
 #[test]
 fn task_rates_light() {
     let mut m = build_with_uart(false);
@@ -355,5 +359,57 @@ fn task_rates_light() {
         q * 1000.0 / fw,
         fw / q,
         retired * 100.0 / RETIRED_BYTES_PER_MS / fw
+    );
+}
+
+/// 重载 + **建模真实 USB 主机**（同 x_hil_mcusim：枚举 + 每 ms 取走下行）。
+/// 用于判定：flysim 路径下"无 USB 主机→IN 永不完成→usb_tx_pump 忙等"这个脚手架产物
+/// 对 CPU 占用与任务频率的影响有多大。
+#[test]
+fn task_rates_with_usb_host() {
+    use mcu_simulater::events::Event;
+
+    let mut m = build_with_uart(true);
+    boot(&mut m);
+
+    // USB 总线枚举：复位 + 4 个标准 SETUP
+    let setup = |m: &mut Machine, data: [u8; 8]| {
+        m.events.lock().unwrap().publish(&Event::UsbSetup { data });
+        m.run_budget(60_000).unwrap();
+    };
+    m.usb_otg.lock().unwrap().inject_usb_reset();
+    m.run_budget(60_000).unwrap();
+    setup(&mut m, [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]);
+    setup(&mut m, [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x20, 0x00]);
+    setup(&mut m, [0x00, 0x05, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    setup(&mut m, [0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    m.run_budget(200_000).unwrap();
+
+    const MS: u32 = 3000;
+    let t0 = systick(&m);
+    let r0 = m.retired_count();
+    let c0 = u32at(&mut m, CTRL_TICKS);
+    let q0 = u32at(&mut m, SENSOR_SEQ);
+    let mut drained_total = 0usize;
+    while ((systick(&m) - t0) as u32) < MS {
+        m.run_ms(1.0).unwrap();
+        // 主机侧取走下行（CDC 数据端点 EP1 IN）
+        let data = m.usb_otg.lock().unwrap().host_take_in(1);
+        drained_total += data.len();
+    }
+    let fw = (systick(&m) - t0) as f64;
+    let retired = (m.retired_count() - r0) as f64;
+    let c = u32at(&mut m, CTRL_TICKS).wrapping_sub(c0) as f64;
+    let q = u32at(&mut m, SENSOR_SEQ).wrapping_sub(q0) as f64 / 2.0;
+    println!(
+        "[rates-usbhost] 窗口 {fw:.0}ms | 控制 {} 拍 -> {:.2}Hz（{:.3}ms） | sensors {} 轮 -> {:.2}Hz（{:.3}ms） | CPU {:.1}% | 下行取走 {} 字节",
+        c as u32,
+        c * 1000.0 / fw,
+        fw / c,
+        q as u32,
+        q * 1000.0 / fw,
+        fw / q,
+        retired * 100.0 / RETIRED_BYTES_PER_MS / fw,
+        drained_total
     );
 }
