@@ -24,6 +24,7 @@ pub mod checkpoint;
 pub mod clock;
 pub mod config;
 pub mod core;
+pub mod elfsym;
 pub mod events;
 pub mod fault;
 pub mod gdbstub;
