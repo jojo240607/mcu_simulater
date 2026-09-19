@@ -28,6 +28,77 @@ pub const STEP_DT: f32 = STEP_DT_MS / 1000.0;
 
 /// 固件 EST_STATE 地址（app.elf 符号，布局见 [`EstReadout`]）。
 pub const EST_STATE: u32 = 0x2000_F184;
+/// 虚拟 USB 主机模型：建模"PC 连着 usb0（CDC 虚拟串口）收 MAVLink 遥测"。
+///
+/// **只作用于虚拟设备侧，不额外推进固件时间。** 与其它虚拟外设同构：由测试自身的
+/// 步进驱动，每步最多发一个枚举动作，固件按自己的节奏处理。绝不在此调用
+/// `advance_ms`/`run_budget`——那会改变固件的任务执行轨迹（实测会让固件在 step0 之前
+/// 多跑约 136ms，控制任务行为随之偏移）。
+///
+/// 为什么必须建模：固件 `telemetry_entry` 每 20ms 无条件写 usb0、`uplink_task` 以
+/// 1kHz 轮询 `usb0.read`。若没有主机消费 IN 传输，`UsbOtg` 的传输永不完成，固件
+/// `usb_tx_pump` 会反复打 `TX_PUMP busy` 诊断日志（实测 560 条/秒），冲爆 2KB 日志环，
+/// 把心跳等真正有用的日志挤掉。
+pub struct UsbHostModel {
+    /// 已执行的枚举动作数：0=未开始，1=已复位，2..=5=已发第 1..4 个 SETUP
+    stage: u8,
+    /// 主机累计取走的下行字节数（确认遥测真的在流）
+    pub rx_bytes: u64,
+    /// 是否已连接（`detach()` 后恒为 false，用于 A/B 对照）
+    attached: bool,
+}
+
+impl UsbHostModel {
+    /// 固件启动到 USB 就绪所需的步数（x_hil_mcusim 的预启动约 130ms，此处 13ms/步）。
+    const START_STEP: u64 = 10;
+    /// 标准枚举：设备/配置描述符、SET_ADDRESS、SET_CONFIGURATION
+    const SETUPS: [[u8; 8]; 4] = [
+        [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00],
+        [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x20, 0x00],
+        [0x00, 0x05, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ];
+
+    pub fn new() -> Self {
+        UsbHostModel { stage: 0, rx_bytes: 0, attached: true }
+    }
+
+    /// 断开主机：此后不再做任何 USB 操作（复位/SETUP/取走 IN）。
+    /// 仅用于 A/B 测量（对照"无主机"的真实使用形态）；不影响时间轴——
+    /// 调用方仍按同样步数推进 `advance_ms`。
+    pub fn detach(&mut self) {
+        self.attached = false;
+    }
+
+    /// 每步调用一次（须在固件时间推进**之后**）。返回本步取走的下行字节数。
+    pub fn tick(&mut self, m: &mut Machine, step: u64) -> usize {
+        use mcu_simulater::events::Event;
+        if !self.attached || step < Self::START_STEP {
+            return 0;
+        }
+        if self.stage == 0 {
+            m.usb_otg.lock().unwrap().inject_usb_reset();
+            self.stage = 1;
+            return 0;
+        }
+        if (self.stage as usize) <= Self::SETUPS.len() {
+            let data = Self::SETUPS[self.stage as usize - 1];
+            m.events.lock().unwrap().publish(&Event::UsbSetup { data });
+            self.stage += 1;
+            return 0;
+        }
+        let n = m.usb_otg.lock().unwrap().host_take_in(1).len();
+        self.rx_bytes += n as u64;
+        n
+    }
+}
+
+impl Default for UsbHostModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 固件 SENSOR_SEQ（sensors 任务推进计数，冻结即任务停滞）。
 pub const SENSOR_SEQ: u32 = 0x2001_16DC;
 
@@ -72,6 +143,8 @@ pub struct EnvHarness {
     /// 上次日志长度（增量解析用）。
     log_pos: usize,
     pub last_hb: Option<HbLine>,
+    /// 虚拟 USB 主机（被动模型，由本步进驱动）
+    pub usb_host: UsbHostModel,
 }
 
 /// 解析后的 hb 心跳行。
@@ -131,6 +204,7 @@ impl EnvHarness {
             log: String::new(),
             log_pos: 0,
             last_hb: None,
+            usb_host: UsbHostModel::new(),
         }
     }
 
@@ -145,6 +219,8 @@ impl EnvHarness {
         }
         let r = self.m.advance_ms(STEP_DT_MS as f64);
         assert!(r.is_ok(), "[step {}] advance_ms 错误: {r:?}", self.steps);
+        // 虚拟 USB 主机：只操作虚拟设备侧，不推进固件时间（在 advance_ms **之后**）
+        self.usb_host.tick(&mut self.m, self.steps);
         self.steps += 1;
         // 对齐不变量：固件时间必须 ≈ 步数 × dt（run_ms 的 SysTick 收敛允许 ≤1ms 量化）。
         // 若有人改回 run(字节预算) 表达时间，这里立刻红。
