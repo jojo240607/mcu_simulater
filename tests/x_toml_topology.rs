@@ -11,6 +11,12 @@ use unicorn_engine::RegisterARM;
 use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 
+/// 从 app.elf 符号表解析固件全局地址（不硬编码：`.app_globals` 段内符号顺序随固件
+/// 代码变化，硬编码会在固件改动后静默读错 → "假失败"）。见 `mcu_simulater::elfsym`。
+fn sym(name: &str) -> u64 {
+    mcu_simulater::elfsym::app_sym(name) as u64
+}
+
 #[test]
 fn flyctrl_real_sensors_via_toml_topology() {
     let elf = artifact::joc_base_elf();
@@ -158,18 +164,18 @@ fn flyctrl_real_sensors_via_toml_topology() {
 ///   LOG_RING=0x2001_0ED0 LOG_HEAD=0x2001_16E8 LOG_TAIL=0x2001_16EC
 /// （与 EST_STATE/SENSOR_FRAME 等约定一致：App 重建后需同步更新。）
 fn scan_log_ring(m: &mut mcu_simulater::machine::Machine) -> String {
-    const RING_ADDR: u64 = 0x2001_0ED0;
-    const HEAD_ADDR: u64 = 0x2001_16E8;
-    const TAIL_ADDR: u64 = 0x2001_16EC;
+    let ring_addr = sym("LOG_RING");
+    let head_addr = sym("LOG_HEAD");
+    let tail_addr = sym("LOG_TAIL");
     const RING_SIZE: usize = 2048;
     let mut hb = [0u8; 4];
     let mut tb = [0u8; 4];
-    let _ = m.cpu.raw().mem_read(HEAD_ADDR, &mut hb);
-    let _ = m.cpu.raw().mem_read(TAIL_ADDR, &mut tb);
+    let _ = m.cpu.raw().mem_read(head_addr, &mut hb);
+    let _ = m.cpu.raw().mem_read(tail_addr, &mut tb);
     let head = u32::from_le_bytes(hb) as usize % RING_SIZE;
     let tail = u32::from_le_bytes(tb) as usize % RING_SIZE;
     let mut ring = [0u8; RING_SIZE];
-    let _ = m.cpu.raw().mem_read(RING_ADDR, &mut ring);
+    let _ = m.cpu.raw().mem_read(ring_addr, &mut ring);
     let n = if tail >= head { tail - head } else { RING_SIZE - head + tail };
     if n == 0 || n > RING_SIZE {
         return String::new();

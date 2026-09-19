@@ -33,6 +33,12 @@ use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::vehicle::ActuatorCmd;
 use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
+
+/// 从 app.elf 符号表解析固件全局地址（不硬编码：`.app_globals` 段内符号顺序随固件
+/// 代码变化，硬编码会在固件改动后静默读错 → "假失败"）。见 `mcu_simulater::elfsym`。
+fn sym(name: &str) -> u64 {
+    mcu_simulater::elfsym::app_sym(name) as u64
+}
 use unicorn_engine::RegisterARM;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
@@ -140,8 +146,7 @@ fn hover_60s_env() {
 
     settle_ekf_before_arm(&m);
 
-    // ARM + RC 解锁
-    m.lock().unwrap().cpu.mem_write(0x2001_1769, &[1u8]).unwrap();
+    // 【一期】解锁只走 RC（原"地面站 ARM 注入"依赖 USB 上行，一期已用 usb-link 关闭）
     {
         let mut st = state.lock().unwrap();
         st.rc_ch[4] = 2000.0;

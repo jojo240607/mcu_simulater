@@ -24,6 +24,12 @@ use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::vehicle::ActuatorCmd;
 use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
+
+/// 从 app.elf 符号表解析固件全局地址（不硬编码：`.app_globals` 段内符号顺序随固件
+/// 代码变化，硬编码会在固件改动后静默读错 → "假失败"）。见 `mcu_simulater::elfsym`。
+fn sym(name: &str) -> u64 {
+    mcu_simulater::elfsym::app_sym(name) as u64
+}
 use unicorn_engine::RegisterARM;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
@@ -336,10 +342,9 @@ fn vperiph_closed_loop() {
     // [ARM 前收敛推进] RC 链路建立 + EKF 高度收敛（根因见 settle_ekf_before_arm 文档）
     settle_ekf_before_arm(&m, "vperiph-closed", 0.15);
 
-    // 地面站 ARM 等效注入：直接置 G_CMD_ARMED（AtomicBool）。
-    // 地址随固件构建变化：`arm-none-eabi-nm app.elf | grep G_CMD_ARMED` 获取，
-    // 重建固件后需同步（当前 clean 基线 = 0x20011769）。
-    m.lock().unwrap().cpu.mem_write(0x20011779, &[1u8]).unwrap();
+    // 【一期】解锁只走 RC（`st.rc_ch[4]=2000` → sensors_task 置 SENSOR_FRAME.armed）。
+    // 原"地面站 ARM 等效注入"直接写 G_CMD_ARMED，依赖 USB 上行（一期已用 usb-link 关闭），
+    // 该变量随之被优化掉，故移除。
 
     // 解锁 RC：ch4=2000（SBUS raw 1811 > 1700 armed）、ch3=1500（油门中位 raw 992 → 0.5）
     {
@@ -371,7 +376,7 @@ fn vperiph_closed_loop() {
         eprintln!("[DIAG] HIL_GATES=0x{gates:02x} armed={} rc={} health_ok={} est={} sp={} att_i={} pos_i={}",
                   (gates>>0)&1, (gates>>1)&1, (gates>>2)&1, (gates>>3)&1, (gates>>4)&1, (gates>>5)&1, (gates>>6)&1);
         let dm: Vec<String> = (0..4).map(|k| {
-            let off = 0x2001172C + 4*k; // DBG_MOTOR[0..4]
+            let off = sym("DBG_MOTOR") + 4 * k as u64; // DBG_MOTOR[0..4]
             f32::from_le_bytes(mm.cpu.mem_read(off, 4).unwrap().try_into().unwrap()).to_string()
         }).collect();
         eprintln!("[DIAG] DBG_MOTOR=[{}]", dm.join(","));
@@ -454,8 +459,9 @@ fn vperiph_hover_long() {
     // 历史"侥幸通过"：300 步截断早，机体未完全落到错误高度，|dz| 恰好 <0.8）。
     settle_ekf_before_arm(&m, "vperiph-hover", 0.15);
 
-    // ARM（G_CMD_ARMED 直接置 1）
-    m.lock().unwrap().cpu.mem_write(0x20011779, &[1u8]).unwrap();
+    // 【一期】解锁只走 RC（`st.rc_ch[4]=2000` → sensors_task 置 SENSOR_FRAME.armed）。
+    // 原"地面站 ARM 等效注入"直接写 G_CMD_ARMED，依赖 USB 上行（一期已用 usb-link 关闭），
+    // 该变量随之被优化掉，故移除。
 
     // 解锁 RC：ch4=2000（armed）、ch3=1500（油门中位）
     {
@@ -569,8 +575,9 @@ fn vperiph_hover_sustained() {
     // 根因：boot 早期 RC 未建立 → target_alt=+2.0 → EKF 高度锁错 → hold_alt 锁错）
     settle_ekf_before_arm(&m, "vperiph-sustain", 0.15);
 
-    // ARM + RC 解锁
-    m.lock().unwrap().cpu.mem_write(0x20011779, &[1u8]).unwrap();
+    // 【一期】解锁只走 RC（`st.rc_ch[4]=2000` → sensors_task 置 SENSOR_FRAME.armed）。
+    // 原"地面站 ARM 等效注入"直接写 G_CMD_ARMED，依赖 USB 上行（一期已用 usb-link 关闭），
+    // 该变量随之被优化掉，故移除。
     {
         let mut st = state.lock().unwrap();
         st.rc_ch[4] = 2000.0;
