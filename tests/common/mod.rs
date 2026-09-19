@@ -26,8 +26,14 @@ pub const STEP_DT_MS: f32 = 13.0;
 /// 单步场景时间（秒）。
 pub const STEP_DT: f32 = STEP_DT_MS / 1000.0;
 
-/// 固件 EST_STATE 地址（app.elf 符号，布局见 [`EstReadout`]）。
-pub const EST_STATE: u32 = 0x2000_F184;
+/// 固件 `EST_STATE` 地址（布局见 [`EstReadout`]）。
+///
+/// **从 app.elf 符号表解析，不硬编码**：linker 只钉住 `.app_globals` 段起始地址，
+/// 段内符号顺序随固件代码变化（实测一次 USB 相关改动就把 EST_STATE 从 0x2000F184
+/// 挪到 0x2000F06C），硬编码会静默读到垃圾并产生"假失败"。
+pub fn est_state() -> u32 {
+    mcu_simulater::elfsym::app_sym("EST_STATE")
+}
 /// 虚拟 USB 主机模型：建模"PC 连着 usb0（CDC 虚拟串口）收 MAVLink 遥测"。
 ///
 /// **只作用于虚拟设备侧，不额外推进固件时间。** 与其它虚拟外设同构：由测试自身的
@@ -59,13 +65,19 @@ impl UsbHostModel {
         [0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],
     ];
 
+    /// 一期固件不带机载电脑 → **默认不接主机**（模型存在但不动作）。
+    /// 后续接入机载电脑时调用 [`UsbHostModel::attach`] 打开。
     pub fn new() -> Self {
-        UsbHostModel { stage: 0, rx_bytes: 0, attached: true }
+        UsbHostModel { stage: 0, rx_bytes: 0, attached: false }
     }
 
-    /// 断开主机：此后不再做任何 USB 操作（复位/SETUP/取走 IN）。
-    /// 仅用于 A/B 测量（对照"无主机"的真实使用形态）；不影响时间轴——
-    /// 调用方仍按同样步数推进 `advance_ms`。
+    /// 接入虚拟主机（启用枚举与下行取走）。对应"机载电脑已连接"的形态。
+    pub fn attach(&mut self) {
+        self.attached = true;
+    }
+
+    /// 断开主机（默认即断开）：此后不再做任何 USB 操作（复位/SETUP/取走 IN）。
+    /// 不影响时间轴——调用方仍按同样步数推进 `advance_ms`。
     pub fn detach(&mut self) {
         self.attached = false;
     }
@@ -99,8 +111,10 @@ impl Default for UsbHostModel {
     }
 }
 
-/// 固件 SENSOR_SEQ（sensors 任务推进计数，冻结即任务停滞）。
-pub const SENSOR_SEQ: u32 = 0x2001_16DC;
+/// 固件 `SENSOR_SEQ`（sensors 任务推进计数，冻结即任务停滞）。同样从符号表解析。
+pub fn sensor_seq() -> u32 {
+    mcu_simulater::elfsym::app_sym("SENSOR_SEQ")
+}
 
 /// 从 app.elf 读出的估计状态（VehicleState + health + armed 的内存视图）。
 #[derive(Debug, Clone, Copy, Default)]
@@ -268,37 +282,37 @@ impl EnvHarness {
             m.cpu.mem_read(addr as u64, 4).ok().map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0)
         };
         let rf = |m: &mut Machine, addr: u32| -> f32 { f32::from_bits(rd(m, addr)) };
-        e.time_boot_ms = rd(&mut self.m, EST_STATE) as i32;
+        e.time_boot_ms = rd(&mut self.m, est_state()) as i32;
         for k in 0..3 {
-            e.pos[k] = rf(&mut self.m, EST_STATE + 4 + 4 * k as u32);
+            e.pos[k] = rf(&mut self.m, est_state() + 4 + 4 * k as u32);
         }
         for k in 0..3 {
-            e.vel[k] = rf(&mut self.m, EST_STATE + 16 + 4 * k as u32);
+            e.vel[k] = rf(&mut self.m, est_state() + 16 + 4 * k as u32);
         }
         for k in 0..4 {
-            e.att_wxyz[k] = rf(&mut self.m, EST_STATE + 28 + 4 * k as u32);
+            e.att_wxyz[k] = rf(&mut self.m, est_state() + 28 + 4 * k as u32);
         }
         for k in 0..3 {
-            e.omega[k] = rf(&mut self.m, EST_STATE + 44 + 4 * k as u32);
+            e.omega[k] = rf(&mut self.m, est_state() + 44 + 4 * k as u32);
         }
-        e.airspeed = rf(&mut self.m, EST_STATE + 56);
+        e.airspeed = rf(&mut self.m, est_state() + 56);
         for k in 0..3 {
-            e.accel_bias[k] = rf(&mut self.m, EST_STATE + 60 + 4 * k as u32);
+            e.accel_bias[k] = rf(&mut self.m, est_state() + 60 + 4 * k as u32);
         }
         // 【实测布局】EstState(repr(C)) = VehicleState(72B) + Health + bool(armed)，
         // 但编译后 Health 实际占 1B（mem 实证：hb 行 armed=true 时 EST+73=1、EST+76=0；
         // repr(C) enum 未标判别值在 ARM 上编译为 1B，而非 C int 4B）。
         // → health@72(1B)、armed@73(1B)。
-        e.health = self.m.cpu.mem_read((EST_STATE + 72) as u64, 1).ok().map(|b| b[0] as u32).unwrap_or(0);
-        e.armed = self.m.cpu.mem_read((EST_STATE + 73) as u64, 1).ok().map(|b| b[0]).unwrap_or(0);
+        e.health = self.m.cpu.mem_read((est_state() + 72) as u64, 1).ok().map(|b| b[0] as u32).unwrap_or(0);
+        e.armed = self.m.cpu.mem_read((est_state() + 73) as u64, 1).ok().map(|b| b[0]).unwrap_or(0);
         e
     }
 
-    /// 读取 SENSOR_SEQ（sensors 任务推进计数）。
+    /// 读取 sensor_seq()（sensors 任务推进计数）。
     pub fn read_sensor_seq(&mut self) -> u32 {
         self.m
             .cpu
-            .mem_read(SENSOR_SEQ as u64, 4)
+            .mem_read(sensor_seq() as u64, 4)
             .ok()
             .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
             .unwrap_or(0)

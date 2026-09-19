@@ -21,7 +21,12 @@ use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
-const SENSOR_SEQ: u64 = 0x200116DC;
+/// 固件 `SENSOR_SEQ` 地址——从 app.elf 符号表解析（见 mcu_simulater::elfsym）。
+/// 不硬编码：`.app_globals` 段内符号顺序随固件代码变化，硬编码会在固件改动后
+/// 静默读到垃圾（表现为"采样率 0Hz"这类假失败）。
+fn sensor_seq_addr() -> u64 {
+    mcu_simulater::elfsym::app_sym("SENSOR_SEQ") as u64
+}
 
 fn systick(m: &Machine) -> u64 {
     m.vec_entries()
@@ -32,7 +37,7 @@ fn systick(m: &Machine) -> u64 {
 }
 
 fn seq(m: &mut Machine) -> u32 {
-    let b = m.cpu.mem_read(SENSOR_SEQ, 4).unwrap_or_else(|_| vec![0; 4]);
+    let b = m.cpu.mem_read(sensor_seq_addr(), 4).unwrap_or_else(|_| vec![0; 4]);
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
