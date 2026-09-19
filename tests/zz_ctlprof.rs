@@ -11,6 +11,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod common;
+
+use common::EnvHarness;
 use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
@@ -412,4 +415,172 @@ fn task_rates_with_usb_host() {
         retired * 100.0 / RETIRED_BYTES_PER_MS / fw,
         drained_total
     );
+}
+
+/// USB 通路开销归因：**同一时间轴下 host ON/OFF 对照**。
+///
+/// 设计原则（避免"顺手改执行模型"）：
+/// - 两只变体都只用 `advance_ms` 步进，步数与每步毫秒**完全相同**；
+/// - 唯一差别是"是否真的操作 USB"（复位/SETUP/取走 IN）；不做 USB 的一侧
+///   照样推进同样多的时间（空转同样的 `advance_ms`），保证时间轴逐拍对齐；
+/// - 不使用任何 hook（hook 会显著扰动固件轨迹）。
+///
+/// 输出：控制/传感器频率、CPU 占用、USB 中断向量触发次数、USB 外设内部计数、
+/// 主机取走字节数、console 日志量（无主机时会刷 `TX_PUMP busy`）。
+#[test]
+fn usb_path_cost_attribution() {
+    use mcu_simulater::clock::McuClock;
+    use mcu_simulater::events::Event;
+
+    /// USB OTG FS 在 STM32F407 上是 IRQ 67 → 向量号 = 67 + 16（内核异常数）
+    const USB_VEC: u32 = 67 + 16;
+
+    const STEPS: u32 = 700;
+    const HOST_START: u32 = 10;
+
+    struct Out {
+        ctrl: f64,
+        sensors: f64,
+        cpu_pct: f64,
+        retired_per_ms: f64,
+        usb_irqs: u64,
+        dbg: [u64; 14],
+        drained: u64,
+        log_bytes: usize,
+        busy_warn: usize,
+    }
+
+    let mut run = |host: bool| -> Out {
+        let mut m = build();
+        boot(&mut m);
+
+        let t0 = systick(&m);
+        let r0 = m.retired_count();
+        let c0 = u32at(&mut m, CTRL_TICKS);
+        let q0 = u32at(&mut m, SENSOR_SEQ);
+
+        for step in 0..STEPS {
+            if step == HOST_START {
+                // 两侧都推进同样的 7ms；只有 host 侧真的操作 USB
+                if host {
+                    m.usb_otg.lock().unwrap().inject_usb_reset();
+                }
+                m.advance_ms(1.0).unwrap();
+                for data in [
+                    [0x80u8, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00],
+                    [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x20, 0x00],
+                    [0x00, 0x05, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],
+                    [0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],
+                ] {
+                    if host {
+                        m.events.lock().unwrap().publish(&Event::UsbSetup { data });
+                    }
+                    m.advance_ms(1.0).unwrap();
+                }
+                m.advance_ms(1.0).unwrap();
+            }
+            m.advance_ms(13.0).unwrap();
+            if host && step >= HOST_START {
+                let _ = m.usb_otg.lock().unwrap().host_take_in(1);
+            }
+        }
+
+        let fw_ms = (systick(&m) - t0) as f64;
+        let retired = (m.retired_count() - r0) as f64;
+        let ctrl = u32at(&mut m, CTRL_TICKS).wrapping_sub(c0) as f64;
+        let sensors = u32at(&mut m, SENSOR_SEQ).wrapping_sub(q0) as f64 / 2.0;
+        let usb_irqs = m
+            .vec_entries()
+            .iter()
+            .find(|(v, _)| *v == USB_VEC)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        let (dbg, drained) = {
+            let u = m.usb_otg.lock().unwrap();
+            (u.dbg, u.dbg[4])
+        };
+        let log = m.console.lock().unwrap().output().to_vec();
+        let busy_warn = log.windows(9).filter(|w| w == b"TX_PUMP b").count();
+        Out {
+            ctrl: ctrl * 1000.0 / fw_ms,
+            sensors: sensors * 1000.0 / fw_ms,
+            cpu_pct: retired * 100.0 / RETIRED_BYTES_PER_MS / fw_ms,
+            retired_per_ms: retired / fw_ms,
+            usb_irqs,
+            dbg,
+            drained: drained as u64,
+            log_bytes: log.len(),
+            busy_warn,
+        }
+    };
+
+    let off = run(false);
+    let on = run(true);
+    let show = |tag: &str, o: &Out| {
+        println!(
+            "[usb] {tag:<8} 控制 {:.2}Hz | sensors {:.2}Hz | CPU {:.1}% | 退休 {:.0} 字节/ms | USB中断 {} | host_take_in {} | 取走 {} 字节 | console {} 字节 (TX_PUMP busy {})",
+            o.ctrl, o.sensors, o.cpu_pct, o.retired_per_ms, o.usb_irqs, o.dbg[4], o.drained,
+            o.log_bytes, o.busy_warn
+        );
+        println!(
+            "[usb] {tag:<8} 外设计数 TXFE={} DFIFO写={} XFRC={} DIEPINT.W1C={} host_take_in={} EPENA写={}",
+            o.dbg[0], o.dbg[1], o.dbg[2], o.dbg[3], o.dbg[4], o.dbg[5]
+        );
+    };
+    show("host OFF", &off);
+    show("host ON", &on);
+    println!(
+        "[usb] 差值：控制 {:+.2}Hz（{:+.1}%）| CPU {:+.1}pp | 退休 {:+.0} 字节/ms（{:+.1}%）| USB中断 {:+.0}",
+        on.ctrl - off.ctrl,
+        (on.ctrl - off.ctrl) * 100.0 / off.ctrl,
+        on.cpu_pct - off.cpu_pct,
+        on.retired_per_ms - off.retired_per_ms,
+        (on.retired_per_ms - off.retired_per_ms) * 100.0 / off.retired_per_ms,
+        on.usb_irqs as f64 - off.usb_irqs as f64
+    );
+}
+
+/// EnvHarness 路径上的受控 A/B：同一 Turn 场景，主机 attached vs detached。
+/// 用 `UsbHostModel::detach()` 切换（只影响主机自身是否动作），执行模型完全一致。
+#[test]
+fn usb_cost_envharness_turn() {
+    use mcu_simulater::env::scenario::{EnvScenario, Motion, Perturb};
+
+    const STEPS: u32 = 900;
+    let mut run = |host: bool| -> (Vec<u32>, usize, [u64; 14], u64) {
+        let scn =
+            EnvScenario::new(Motion::Turn { radius: 20.0, rate: 0.5 }, Perturb::clean(), vec![]);
+        let mut h = EnvHarness::new(scn, true);
+        if !host {
+            h.usb_host.detach();
+        }
+        let mut s = Vec::new();
+        for k in 0..STEPS {
+            h.step();
+            if k % 50 == 0 {
+                s.push(u32at(&mut h.m, CTRL_TICKS));
+            }
+        }
+        s.push(u32at(&mut h.m, CTRL_TICKS));
+        let log = h.m.console.lock().unwrap().output().len();
+        let dbg = h.m.usb_otg.lock().unwrap().dbg;
+        let rx = h.usb_host.rx_bytes;
+        (s, log, dbg, rx)
+    };
+
+    let (so, lo, do_, _) = run(false);
+    let (sn, ln, dn, rxn) = run(true);
+    println!("[env] Turn 场景 EnvHarness，控制拍采样(每50步)");
+    println!("[env]   attached=false {so:?}");
+    println!("[env]   attached=true  {sn:?}");
+    println!(
+        "[env] console 字节 {lo} -> {ln} | 主机取走 {rxn} 字节 | XFRC {} -> {}",
+        do_[2], dn[2]
+    );
+    for i in 1..so.len().min(sn.len()) {
+        let a = so[i].wrapping_sub(so[i - 1]);
+        let b = sn[i].wrapping_sub(sn[i - 1]);
+        let d = if a == 0 { f64::NAN } else { (b as f64 - a as f64) * 100.0 / a as f64 };
+        println!("[env]   {:>3}..{:>3}: 无主机 {:>4} / 有主机 {:>4} 拍（{d:+.0}%）", i * 50, (i + 1) * 50, a, b);
+    }
 }
