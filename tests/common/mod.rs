@@ -35,6 +35,8 @@ pub fn apply_env_calib(m: &mut mcu_simulater::machine::Machine) {
         ("ZZ_Q_ACCEL", "G_Q_ACCEL"),
         ("ZZ_Q_VEL", "G_Q_VEL"),
         ("ZZ_R_VEL", "G_R_VEL"),
+        ("ZZ_R_POS", "G_R_POS"),
+        ("ZZ_TAU_XY", "G_TAU_XY"),
     ] {
         if let Ok(v) = std::env::var(env) {
             if let Ok(t) = v.parse::<f32>() {

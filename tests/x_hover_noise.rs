@@ -23,6 +23,12 @@ use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::vehicle::ActuatorCmd;
 use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
+
+/// 从 app.elf 符号表解析固件全局地址（不硬编码：`.app_globals` 段内符号顺序随固件
+/// 代码变化，硬编码会在固件改动后静默读错 → "假失败"）。见 `mcu_simulater::elfsym`。
+fn sym(name: &str) -> u64 {
+    mcu_simulater::elfsym::app_sym(name) as u64
+}
 use unicorn_engine::RegisterARM;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
@@ -68,7 +74,7 @@ fn read_thrust(m: &Arc<Mutex<Machine>>) -> [f32; 4] {
 
 /// 读固件 EKF 估计高度 est.pos[2]（NED 向下正，地址布局同 x_vperiph）。
 fn read_ekf_z(m: &Arc<Mutex<Machine>>) -> f32 {
-    let b = m.lock().unwrap().cpu.mem_read(0x2000F174 + 28, 4).unwrap();
+    let b = m.lock().unwrap().cpu.mem_read(sym("EST_STATE") + 12, 4).unwrap();
     f32::from_le_bytes(b.try_into().unwrap())
 }
 
@@ -79,7 +85,7 @@ fn settle_ekf_before_arm(m: &Arc<Mutex<Machine>>) -> f32 {
     let mut z = f32::NAN;
     for i in 0..400 {
         mm.run_budget(1_000_000).unwrap();
-        z = f32::from_le_bytes(mm.cpu.mem_read(0x2000F174 + 28, 4).unwrap().try_into().unwrap());
+        z = f32::from_le_bytes(mm.cpu.mem_read(sym("EST_STATE") + 12, 4).unwrap().try_into().unwrap());
         if i % 50 == 0 {
             eprintln!("[noise] 收敛推进 i={i} ekf_z={z:.3}");
         }
@@ -128,10 +134,39 @@ fn hover_60s_noisy() {
     }
     let m = Arc::new(Mutex::new(m));
 
+    for (env, symname) in [
+        ("ZZ_Q_ACCEL", "G_Q_ACCEL"),
+        ("ZZ_Q_VEL", "G_Q_VEL"),
+        ("ZZ_R_VEL", "G_R_VEL"),
+        ("ZZ_R_POS", "G_R_POS"),
+        ("ZZ_TAU_XY", "G_TAU_XY"),
+    ] {
+        if let Ok(v) = std::env::var(env) {
+            if let Ok(t) = v.parse::<f32>() {
+                let a = mcu_simulater::elfsym::app_sym(symname) as u64;
+                m.lock().unwrap().cpu.mem_write(a, &t.to_le_bytes()).unwrap();
+                eprintln!("[calib] {symname} = {t}");
+            }
+        }
+    }
+
+    // [临时诊断] 振荡特征提取：每 5s 窗口统计
+    //   pitch 幅值 / 过零次数（→ 频率）/ 电机差动范围 / 电机饱和情况
+    let motor_addr = mcu_simulater::elfsym::app_sym("DBG_MOTOR") as u64;
+    let mut win_pitch_max = 0.0f32;
+    let mut win_cross = 0u32;
+    let mut win_mdiff_lo = f32::MAX;
+    let mut win_mdiff_hi = f32::MIN;
+    let mut win_m_lo = 1.0f32;
+    let mut win_m_hi = 0.0f32;
+    let mut prev_pitch = 0.0f32;
+    let mut have_prev = false;
+    let mut win_i = 0u32;
+
     settle_ekf_before_arm(&m);
 
-    // ARM + RC 解锁
-    m.lock().unwrap().cpu.mem_write(0x20011769, &[1u8]).unwrap();
+    // 【一期】解锁只走 RC（原"地面站 ARM 注入"依赖 USB 上行，一期已用 usb-link 关闭）
+
     {
         let mut st = state.lock().unwrap();
         st.rc_ch[4] = 2000.0;
@@ -187,6 +222,39 @@ fn hover_60s_noisy() {
             Some(s) => ([s.pos[0].0, s.pos[1].0, s.pos[2].0], [s.vel[0].0, s.vel[1].0, s.vel[2].0]),
             None => ([0.0, 0.0, -5.0], [0.0, 0.0, 0.0]),
         };
+        // [临时诊断] 振荡特征：pitch 过零/幅值 + 电机差动
+        if let Some(s) = st {
+            let p = s.att.pitch();
+            if have_prev && ((p > 0.0) != (prev_pitch > 0.0)) {
+                win_cross += 1;
+            }
+            prev_pitch = p;
+            have_prev = true;
+            win_pitch_max = win_pitch_max.max(p.abs());
+            let b = m.lock().unwrap().cpu.mem_read(motor_addr, 16).unwrap_or_default();
+            if b.len() == 16 {
+                let g = |i: usize| f32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]]);
+                let (m0, m1, m2_, m3) = (g(0), g(1), g(2), g(3));
+                let d = (m0 + m1) - (m2_ + m3);
+                win_mdiff_lo = win_mdiff_lo.min(d);
+                win_mdiff_hi = win_mdiff_hi.max(d);
+                for v in [m0, m1, m2_, m3] {
+                    win_m_lo = win_m_lo.min(v);
+                    win_m_hi = win_m_hi.max(v);
+                }
+            }
+        }
+        win_i += 1;
+        if win_i % 1250 == 0 {
+            eprintln!("[osc] {:>4.0}-{:>4.0}s max|pitch|={:6.2}° 过零={:3} (≈{:.2}Hz) 电机差动=[{:+.3},{:+.3}] 电机=[{:.3},{:.3}]",
+                (win_i as f32/250.0 - 5.0), (win_i as f32/250.0),
+                win_pitch_max.to_degrees(), win_cross,
+                win_cross as f32 / 2.0 / 5.0,
+                win_mdiff_lo, win_mdiff_hi, win_m_lo, win_m_hi);
+            win_pitch_max = 0.0; win_cross = 0;
+            win_mdiff_lo = f32::MAX; win_mdiff_hi = f32::MIN;
+            win_m_lo = 1.0; win_m_hi = 0.0;
+        }
         roll_max = roll_max.max(if let Some(s) = st { s.att.roll().abs() } else { 0.0 });
         pitch_max = pitch_max.max(if let Some(s) = st { s.att.pitch().abs() } else { 0.0 });
 
