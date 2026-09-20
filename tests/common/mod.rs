@@ -26,6 +26,26 @@ pub const STEP_DT_MS: f32 = 13.0;
 /// 单步场景时间（秒）。
 pub const STEP_DT: f32 = STEP_DT_MS / 1000.0;
 
+/// [临时标定] 经环境变量向固件写入 EKF 参数覆盖（当前支持 `G_Q_ACCEL`）。
+///
+/// 用途：协方差更新改用 Joseph 形式后位置/高度通道需重标定；把过程噪声做成可运行时
+/// 写入的旋钮，即可不重编固件扫描"加计偏置容忍度 vs 噪声鲁棒性"。未设环境变量 = 不注入。
+pub fn apply_env_calib(m: &mut mcu_simulater::machine::Machine) {
+    for (env, symname) in [
+        ("ZZ_Q_ACCEL", "G_Q_ACCEL"),
+        ("ZZ_Q_VEL", "G_Q_VEL"),
+        ("ZZ_R_VEL", "G_R_VEL"),
+    ] {
+        if let Ok(v) = std::env::var(env) {
+            if let Ok(t) = v.parse::<f32>() {
+                let a = mcu_simulater::elfsym::app_sym(symname) as u64;
+                m.cpu.mem_write(a, &t.to_le_bytes()).unwrap();
+                eprintln!("[calib] {symname} = {t}");
+            }
+        }
+    }
+}
+
 /// 固件 `EST_STATE` 地址（布局见 [`EstReadout`]）。
 ///
 /// **从 app.elf 符号表解析，不硬编码**：linker 只钉住 `.app_globals` 段起始地址，
@@ -202,6 +222,8 @@ impl EnvHarness {
             eprintln!("[insn_invalid] pc=0x{pc:08x}");
             false
         }).unwrap();
+
+        apply_env_calib(&mut m);
 
         if prefill {
             scn.write_state(&mut st.lock().unwrap());
