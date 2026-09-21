@@ -164,23 +164,12 @@ fn hover_60s_env() {
     // - 电池压降：battery_r 内阻（VehicleConfig 内置，悬停负载自动压降）
     let mut sensor_cfg = SensorConfig::realistic();
     sensor_cfg.gps_drop_prob = 0.01; // 1% 丢星：偶发 GPS 无样本，考验 FDIR/位置环
-    let wind = WindField::new(WindConfig {
-        // NED 风 (n,e,d) → UP (x,y,z) = [n, -d, -e]：北 2.5 + 东 1.0 m/s 斜向侧风
-        base: [2.5, 0.0, -1.0],
-        // 阵风：北向 1.2 m/s 峰值 @ 0.12Hz（约 8s 周期）
-        gust_amp: [1.2, 0.0, 0.0],
-        gust_freq: 0.12,
-        // Dryden 湍流：水平 0.3 m/s σ，垂直 0.1 m/s σ，τ=0.5s
-        turb_sigma: [0.3, 0.1, -0.3],
-        turb_tau: 0.5,
-        seed: 0x1234_5678,
-        // 风切变：幂律 α=0.2 @10m 参考（5m 悬停处 ≈ 0.87×base）
-        shear_exponent: 0.2,
-        shear_ref_height: 10.0,
-        // 空间相关风：尺度 2m（机身不同部位风速差异）
-        spatial_scale: 2.0,
-        ..WindConfig::default()
-    });
+    // **引用唯一真源** `WindConfig::beaufort3()`（蒲福 3 级上限 5.4 m/s）。
+    //
+    // 需求定案：飞行器至少应能抗 **3 级风**。此前本测例与 H 场 `wind_turb_scan`
+    // 各写各的风场、参数还不一致 ⇒ 两场输入不可比，H 场的抗风结论无法作为本场
+    // 验收依据。现两场均引用同一预设。
+    let wind = WindField::new(WindConfig::beaufort3());
     let mut sim = SimLoop::new(
         PhySdkWorld::create_empty(),
         &VehicleConfig::default_quad(),
