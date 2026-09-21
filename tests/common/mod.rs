@@ -40,6 +40,10 @@ pub fn apply_env_calib(m: &mut mcu_simulater::machine::Machine) {
         // 磁航向锚定强度。注意哨兵：**-1 = 用编译期值**；**0 = 显式关闭锚定**
         // （隔离磁路影响用；其它旋钮的哨兵是 0，本旋钮不是——因为 0 是有效值）。
         ("ZZ_MAG_ALPHA", "G_MAG_ALPHA"),
+        // 重力锚定强度。哨兵同规：**-1 = 用编译期值**（0 = 显式关闭锚定）。
+        // 用途：**在 M 场自己的闭环口径下**实测 att_alpha（不抄 SIL 的值 ——
+        // 锚定是场景依赖的：估计类测试需要、闭环类有害，见 flyctrl 提交 mrev）。
+        ("ZZ_ATT_ALPHA", "G_ATT_ALPHA"),
     ] {
         if let Ok(v) = std::env::var(env) {
             if let Ok(t) = v.parse::<f32>() {
