@@ -1,5 +1,20 @@
 # fly_simulater × mcu_simulater 虚拟外设直通接口协议
 
+> ## ⚠️ 口径更正（2026-09-21）
+>
+> 本文部分内容已陈旧，阅读时以本节为准：
+>
+> 1. **IMU 已改为 BMI088（SPI3 双片选）**，不再是 mpu6050(I2C)。
+>    见 flyctrl 提交 `e541b47 feat(sensors): IMU 从 MPU6050(I2C) 切换 BMI088(SPI)`；
+>    对应实现 `vperiph/spi/bmi088.rs`、固件 `ImuBmi088("bmi088")`。
+>    `mpu6050` 虚拟设备仍在（旧路径，供 I2C IMU 回归），但**不是当前主源**。
+>    陀螺量程 ±2000 dps / 加计 ±3g。
+> 2. **仓库根路径已变为 `~/work/fc-umbrella/<repo>`**（壳工程；历史文档写 `~/work/<repo>`）。
+> 3. **固件构建已统一为 `./scripts/build.sh real-sensors`**（产出 `/tmp/flyctrl_real.bin`），
+>    不再是 `python3 build_app.py --features ... --out ...`。
+> 4. **时钟口径**：场景时间 = 固件时间（1:1），控制拍 **249.7Hz**。
+>    本文若写“固件时间慢 N 倍”，那是 `28bb0c5` 前旧标定的遗留。
+
 > 目标：fly_simulater（物理真值）与 mcu_simulater（MCU + 固件）联调。
 > **不走 USB、不走共享内存式驱动旁路**：fly_sim 每步把物理真值写进共享
 > `FlySimState`（Arc\<Mutex\>），mcu_sim 的虚拟外设（I2C/UART 从设备）经
@@ -134,9 +149,8 @@ RcSbus 观测此前约定在 0x2002_0100 起共享 RAM，已随旧共享数组�
 
 运行前置（构建固件）：
 ```bash
-cd /home/ubuntu/work/joc-base && cmake --build build_rel          # minimal elf
-cd /home/ubuntu/work/flyctrl && python3 build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin
-cd /home/ubuntu/work/mcu_simulater && cargo test --release --offline --test x_vperiph_mcusim
+cd ~/work/fc-umbrella && ./scripts/build.sh real-sensors   # minimal ELF + 两种固件均由此驱动
+cd ~/work/fc-umbrella/mcu_simulater && cargo test --release --test x_vperiph_mcusim
 ```
 预期输出末尾：`>>> [VPERIPH-MCUSIM] 虚拟外设直通闭环验证通过 ✓` 与 `>>> [VPERIPH-MCUSIM] 长时悬停收敛验证通过 ✓`。
 

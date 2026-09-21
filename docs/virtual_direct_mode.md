@@ -1,5 +1,12 @@
 # 虚拟外设直通仿真（HIL 无 USB 方案）——调试模式总纲
 
+> ## ⚠️ 口径更正（2026-09-21）
+>
+> 1. **IMU 已改为 BMI088（SPI3 双片选）**，不再是 mpu6050(I2C)（见 `e541b47`）。
+> 2. **仓库根路径为 `~/work/fc-umbrella/<repo>`**（本文写 `~/work/<repo>` 是旧布局）。
+> 3. **构建用 `./scripts/build.sh real-sensors`**，不再是 `python3 build_app.py ...`。
+> 4. **场景时间 = 固件时间（1:1）**，控制拍 **249.7Hz**（本文若写“慢 N 倍”已废）。
+
 > 本文件是**调试模式的权威定义**，供所有后续开发与对话参考。
 > 结论先行：**本方案既不是 USB-HIL，也不是 SIL**，而是**物理模型直控虚拟外设**。
 
@@ -15,11 +22,11 @@
 
 | 组件 | 仓库 | 角色 |
 |---|---|---|
-| `mcu_simulater` | `/home/ubuntu/work/mcu_simulater` | **仿真 MCU + 片外虚拟外设**。虚拟外设含各种传感器（IMU/气压计/磁力计/GPS/SBUS 等）与电机（PWM 驱动虚拟 TIM） |
-| `fly-simulater` | `/home/ubuntu/work/fly-simulater` | **物理建模/仿真真实物理环境**（动力学、空气、电机推力模型）。核心 crate：`fly-sim-core` |
-| `joc-base` | `/home/ubuntu/work/joc-base` | **自研 RTOS**（非商用 RTOS） |
-| `flyctrl` | `/home/ubuntu/work/flyctrl` | **飞控代码**（应用层，运行在 joc-base 之上，real-sensors 特性走标准驱动） |
-| `groundctrl` | `/home/ubuntu/work/groundctrl` | 地面站（外部链路，不在本调试链路内） |
+| `mcu_simulater` | `~/work/fc-umbrella/mcu_simulater` | **仿真 MCU + 片外虚拟外设**。虚拟外设含各种传感器（IMU/气压计/磁力计/GPS/SBUS 等）与电机（PWM 驱动虚拟 TIM）。**IMU 主源 = BMI088（SPI3 双片选）** |
+| `fly-simulater` | `~/work/fc-umbrella/fly-simulater` | **物理建模/仿真真实物理环境**（动力学、空气、电机推力模型）。核心 crate：`fly-sim-core` |
+| `joc-base` | `~/work/fc-umbrella/joc-base` | **自研 RTOS**（非商用 RTOS） |
+| `flyctrl` | `~/work/fc-umbrella/flyctrl` | **飞控代码**（应用层，运行在 joc-base 之上，real-sensors 特性走标准驱动） |
+| `groundctrl` | `~/work/fc-umbrella/groundctrl` | 地面站（外部链路，不在本调试链路内） |
 
 依赖关系：
 
@@ -115,9 +122,8 @@ SIL 的典型做法：飞控算法编译成 PC 程序直接跑，不经过 MCU �
 运行前置（构建固件）：
 
 ```bash
-cd /home/ubuntu/work/joc-base && cmake --build build_rel          # minimal elf
-cd /home/ubuntu/work/flyctrl && python3 build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin
-cd /home/ubuntu/work/mcu_simulater && cargo test --release --offline --test x_vperiph_mcusim
+cd ~/work/fc-umbrella && ./scripts/build.sh real-sensors   # minimal ELF + 两种固件均由此驱动
+cd ~/work/fc-umbrella/mcu_simulater && cargo test --release --test x_vperiph_mcusim
 ```
 
 预期输出末尾：

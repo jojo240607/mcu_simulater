@@ -1,5 +1,12 @@
 # 环境仿真调试飞控模拟——闭环验证说明
 
+> ## ⚠️ 口径更正（2026-09-21）
+>
+> 1. **IMU 已改为 BMI088（SPI3 双片选）**，不再是 mpu6050(I2C)（见 `e541b47`）。
+> 2. **仓库根路径为 `~/work/fc-umbrella/<repo>`**（本文写 `~/work/<repo>` 是旧布局）。
+> 3. **构建用 `./scripts/build.sh real-sensors`**，不再是 `python3 build_app.py ...`。
+> 4. **场景时间 = 固件时间（1:1）**，控制拍 249.7Hz（旧“慢 N 倍”说法已废）。
+
 > 目标：记录 fly_simulater（PC 物理）↔ mcu_simulater（MCU + 固件）HIL 闭环验证的
 > 完整架构、验证协议、已解决问题与诊断手段，供后续复现与修改参考。
 
@@ -55,9 +62,8 @@
 运行前置（构建固件）：
 
 ```bash
-cd /home/ubuntu/work/joc-base && cmake --build build_rel          # minimal elf
-cd /home/ubuntu/work/flyctrl && python3 build_app.py --features real-sensors --out /tmp/flyctrl_clean.bin
-cd /home/ubuntu/work/mcu_simulater && cargo test --release --offline --test x_vperiph_mcusim
+cd ~/work/fc-umbrella && ./scripts/build.sh real-sensors   # minimal ELF + 两种固件均由此驱动
+cd ~/work/fc-umbrella/mcu_simulater && cargo test --release --test x_vperiph_mcusim
 ```
 
 预期输出末尾：
