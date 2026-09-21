@@ -21,6 +21,8 @@
 //! 构建前置：`cd joc-base && cmake --build build_rel`（minimal elf）、
 //! `./scripts/build.sh real-sensors`（产出 `/tmp/flyctrl_real.bin`）。
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -116,6 +118,12 @@ fn hover_60s_env() {
     assert!(sys.exists(), "minimal elf 缺失");
     assert!(app.exists(), "real-sensors app 缺失：{} —— 先跑 ./scripts/build.sh real-sensors，或用 JOC_APP_FLYCTRL_REAL 指向产物", app.display());
 
+    // ⚠️ **必须显式调用**：`apply_env_calib` 的唯一调用点在 `EnvHarness::new` 内部，
+    // 而本测例**不构造 EnvHarness**（直接建 Machine + SimLoop）⇒ 此前所有 `ZZ_*`
+    // 环境变量旋钮注入在本测例里**静默失效** ✗。
+    // 教训（本会话已列的纪律）：**先确认注入是否生效**（看 `[calib]` 打印），
+    // 再解释结果 —— 否则会把"默认值下的结果"误读成"旋钮设为该值的结果"。
+    // （早先一次"两端关磁锚"对照即因此无效：M 场那侧其实一直跑在默认 0.05。）
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
 
@@ -137,6 +145,7 @@ fn hover_60s_env() {
         st.rc_ch = [1500.0; 16];
     }
 
+    common::apply_env_calib(&mut m); // ZZ_* 旋钮注入（须在建机后、启动前）
     m.load_elf(&sys).unwrap();
     m.load_app_partition(&app).unwrap();
     m.reset().unwrap();
