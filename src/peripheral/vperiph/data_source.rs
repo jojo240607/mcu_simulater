@@ -23,6 +23,14 @@ impl DataSource {
         }
     }
 
+    /// 取某通道的 **f64** 值（高精度通道走它，其余回落 `value()`）。
+    pub fn value64(&self, field: &str) -> f64 {
+        match self {
+            DataSource::Const(v) => *v as f64,
+            DataSource::Math(m) => m.value64(field),
+        }
+    }
+
     /// 推进数据源（Math 模型 step；Const 无操作）。
     pub fn step(&mut self, dt: f32) {
         if let DataSource::Math(m) = self {
@@ -65,6 +73,15 @@ pub trait SensorModel: Send + Sync {
 
     /// 取某通道当前值（未知通道返回 0.0）
     fn value(&self, field: &str) -> f32;
+
+    /// 取某通道的 **f64** 值。默认回落 f32 口径（`value() as f64`）。
+    ///
+    /// 为何需要：经纬度量级大，f32 存储的 ulp 折算到米为 lat 0.21m / lon 0.73m，
+    /// 而 realistic GPS 噪声仅 0.5m ⇒ 量化成为**额外**噪声。需要保精度的通道
+    /// （GPS 经纬度）走本口，其余通道自动回落、零改动。
+    fn value64(&self, field: &str) -> f64 {
+        self.value(field) as f64
+    }
 }
 
 impl SensorModel for Box<dyn SensorModel> {
@@ -441,8 +458,12 @@ pub struct FlySimState {
     /// 气压（Pa）
     pub baro_pa: f32,
     /// GPS 位置（度/米）+ 定位状态
-    pub gps_lat: f32,
-    pub gps_lon: f32,
+    /// 纬度（度，北正）。**f64**：经纬度数值大（~31°/121°），f32 的 ulp 折算到米为
+    /// lat 0.21m / lon 0.73m，而 `realistic()` GPS 的位置噪声只有 0.5m ⇒ 量化会变成
+    /// **额外**噪声，使 M 场（经 NMEA 往返）与 H 场（直传 NED）输入不等价。
+    pub gps_lat: f64,
+    /// 经度（度，东正）。见 `gps_lat` 关于 f64 的说明。
+    pub gps_lon: f64,
     pub gps_alt: f32,
     pub gps_fix: f32,
     /// GPS NED 速度（m/s；北/东/下，向下正）。Doppler 速度经 `$GNRMC` 帧下发，
@@ -513,8 +534,8 @@ impl SensorModel for FlySimSource {
                 }
             }
             FlySimKind::Gps => match field {
-                "lat" => st.gps_lat,
-                "lon" => st.gps_lon,
+                "lat" => st.gps_lat as f32,
+                "lon" => st.gps_lon as f32,
                 "alt" => st.gps_alt,
                 "fix" => st.gps_fix,
                 "vel_n" => st.gps_vel[0],
@@ -554,6 +575,19 @@ impl SensorModel for FlySimSource {
                 }
             }
         }
+    }
+
+    /// **f64 取值口**：GPS 经纬度直读 f64（其余通道回落 f32）。
+    ///
+    /// 见 `SensorModel::value64` 的说明 —— 经纬度量级大，f32 存储的 ulp 折算到米为
+    /// lat 0.21m / lon 0.73m，而 realistic GPS 噪声仅 0.5m ⇒ 量化成为额外噪声，
+    /// 使 M 场经 NMEA 往返后与 H 场（直传 NED）输入不等价。
+    fn value64(&self, field: &str) -> f64 {
+        if self.kind == FlySimKind::Gps && (field == "lat" || field == "lon") {
+            let st = self.state.lock().unwrap();
+            return if field == "lat" { st.gps_lat } else { st.gps_lon };
+        }
+        self.value(field) as f64
     }
 }
 

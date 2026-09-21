@@ -133,8 +133,8 @@ fn hover_60s_noisy() {
         st.imu_acc = [0.0, 0.0, -9.81];
         st.imu_gyr = [0.0, 0.0, 0.0];
         st.baro_pa = 101_325.0f32;
-        st.gps_lat = LAT0;
-        st.gps_lon = LON0;
+        st.gps_lat = LAT0 as f64;
+        st.gps_lon = LON0 as f64;
         st.gps_alt = ALT0 + 5.0;
         st.gps_fix = 3.0;
         st.gps_vel = [0.0, 0.0, 0.0]; // 静止：无 Doppler 速度
@@ -328,8 +328,8 @@ fn hover_60s_noisy() {
             // 位置/速度在帧间不刷新属正常，与 SIL 一致）
             match sim.last_gps() {
                 Some(g) => {
-                    st.gps_lat = LAT0 + g.pos[0].0 / 111_320.0;
-                    st.gps_lon = LON0 + g.pos[1].0 / (111_320.0 * LAT0.to_radians().cos());
+                    st.gps_lat = LAT0 as f64 + (g.pos[0].0 / 111_320.0) as f64;
+                    st.gps_lon = LON0 as f64 + (g.pos[1].0 / (111_320.0 * LAT0.to_radians().cos())) as f64;
                     st.gps_alt = ALT0 - g.pos[2].0;
                     st.gps_fix = 3.0;
                     if let Some(v) = g.vel {

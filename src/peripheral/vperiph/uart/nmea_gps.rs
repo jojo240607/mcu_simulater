@@ -40,8 +40,11 @@ impl NmeaGps {
     ///
     /// 格式：`$GNGGA,hhmmss,ddmm.mmmm,N,dddmm.mmmm,E,quality,numSat,hdop,alt,M,sep,M,,*cs\r\n`
     fn build_gga(&self, v: &dyn SensorModel) -> Vec<u8> {
-        let lat = v.value("lat"); // 度（北正）
-        let lon = v.value("lon"); // 度（东正）
+        // 经纬度走 **f64** 取值口：f32 在这两个量级下的 ulp 折算到米为
+        // lat 0.21m / lon 0.73m，会变成凌驾于 0.5m 噪声之上的额外量化，
+        // 使 M 场与 H 场输入不等价（详见 SensorModel::value64）。
+        let lat = v.value64("lat") as f32; // 度（北正）
+        let lon = v.value64("lon") as f32; // 度（东正）
         let alt = v.value("alt"); // 米
         let fix = v.value("fix") as u8; // 0/1/2/3
         let lat_abs = lat.abs();

@@ -122,8 +122,8 @@ fn hover_60s_demo() {
         st.imu_acc = [0.0, 0.0, -9.81];
         st.imu_gyr = [0.0, 0.0, 0.0];
         st.baro_pa = 101_325.0f32;
-        st.gps_lat = LAT0;
-        st.gps_lon = LON0;
+        st.gps_lat = LAT0 as f64;
+        st.gps_lon = LON0 as f64;
         st.gps_alt = ALT0 + 5.0;
         st.gps_fix = 3.0;
         st.gps_vel = [0.0, 0.0, 0.0]; // 静止：无 Doppler 速度
@@ -215,8 +215,8 @@ fn hover_60s_demo() {
             st.imu_acc = [imu_true.accel[0].0, imu_true.accel[1].0, imu_true.accel[2].0];
             st.imu_gyr = [imu_true.gyro[0].0, imu_true.gyro[1].0, imu_true.gyro[2].0];
             let (n, e, d) = (pos[0], pos[1], pos[2]);
-            st.gps_lat = LAT0 + n / 111_320.0;
-            st.gps_lon = LON0 + e / (111_320.0 * LAT0.to_radians().cos());
+            st.gps_lat = LAT0 as f64 + (n / 111_320.0) as f64;
+            st.gps_lon = LON0 as f64 + (e / (111_320.0 * LAT0.to_radians().cos())) as f64;
             st.gps_alt = ALT0 - d;
             st.gps_fix = 3.0;
             // GPS Doppler 速度（NED m/s）：经 $GNRMC 帧下发 → EKF update_vel 约束

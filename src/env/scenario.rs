@@ -492,8 +492,8 @@ impl EnvScenario {
             }
             let dlat = gps_pos[0] / 111_320.0;
             let dlon = gps_pos[1] / (111_320.0 * self.lat0.to_radians().cos());
-            st.gps_lat = self.lat0 + dlat;
-            st.gps_lon = self.lon0 + dlon;
+            st.gps_lat = self.lat0 as f64 + dlat as f64;
+            st.gps_lon = self.lon0 as f64 + dlon as f64;
             st.gps_alt = self.alt_ref - gps_pos[2];
             let mut gvel = tr.vel;
             if let Some(nz) = self.perturb.noise {

@@ -235,8 +235,8 @@ fn run_closed_loop(
             st.imu_gyr = [imu_true.gyro[0].0, imu_true.gyro[1].0, imu_true.gyro[2].0];
             // 位置：NED (n,e,d 向下正) → GPS 度/米 + 气压
             let (n, e, d) = (pos[0], pos[1], pos[2]);
-            st.gps_lat = LAT0 + n / 111_320.0;
-            st.gps_lon = LON0 + e / (111_320.0 * LAT0.to_radians().cos());
+            st.gps_lat = LAT0 as f64 + (n / 111_320.0) as f64;
+            st.gps_lon = LON0 as f64 + (e / (111_320.0 * LAT0.to_radians().cos())) as f64;
             st.gps_alt = ALT0 - d; // d 向下正 → 越低 alt 越小
             st.gps_fix = 3.0;
             // 气压：标准大气（h 向上正 = -(d - 家庭点)）。家庭点=起飞台(d=-5)，
@@ -318,8 +318,8 @@ fn vperiph_closed_loop() {
         st.imu_acc = [0.0, 0.0, -9.81];
         st.imu_gyr = [0.0, 0.0, 0.0];
         st.baro_pa = 101_325.0f32; // h=0 家庭点气压（d=-5 起飞台；与 GPS 原点对齐，消除高度源冲突）
-        st.gps_lat = LAT0;
-        st.gps_lon = LON0;
+        st.gps_lat = LAT0 as f64;
+        st.gps_lon = LON0 as f64;
         st.gps_alt = ALT0 + 5.0; // 起飞台(d=-5) alt=9 → ref_alt=9 → 运行期 d_fw=0，气压单独驱动 d=-5
         st.gps_fix = 3.0;
         st.rc_ch = [1500.0; 16];
@@ -434,8 +434,8 @@ fn vperiph_hover_long() {
         st.imu_acc = [0.0, 0.0, -9.81];
         st.imu_gyr = [0.0, 0.0, 0.0];
         st.baro_pa = 101_325.0f32; // h=0 家庭点气压（d=-5 起飞台；与 GPS 原点对齐，消除高度源冲突）
-        st.gps_lat = LAT0;
-        st.gps_lon = LON0;
+        st.gps_lat = LAT0 as f64;
+        st.gps_lon = LON0 as f64;
         st.gps_alt = ALT0 + 5.0; // 起飞台(d=-5) alt=9 → ref_alt=9 → 运行期 d_fw=0，气压单独驱动 d=-5
         st.gps_fix = 3.0;
         st.rc_ch = [1500.0; 16];
@@ -557,8 +557,8 @@ fn vperiph_hover_sustained() {
         st.imu_acc = [0.0, 0.0, -9.81];
         st.imu_gyr = [0.0, 0.0, 0.0];
         st.baro_pa = 101_325.0f32;
-        st.gps_lat = LAT0;
-        st.gps_lon = LON0;
+        st.gps_lat = LAT0 as f64;
+        st.gps_lon = LON0 as f64;
         st.gps_alt = ALT0 + 5.0;
         st.gps_fix = 3.0;
         st.rc_ch = [1500.0; 16];
