@@ -37,6 +37,9 @@ pub fn apply_env_calib(m: &mut mcu_simulater::machine::Machine) {
         ("ZZ_R_VEL", "G_R_VEL"),
         ("ZZ_R_POS", "G_R_POS"),
         ("ZZ_TAU_XY", "G_TAU_XY"),
+        // 磁航向锚定强度。注意哨兵：**-1 = 用编译期值**；**0 = 显式关闭锚定**
+        // （隔离磁路影响用；其它旋钮的哨兵是 0，本旋钮不是——因为 0 是有效值）。
+        ("ZZ_MAG_ALPHA", "G_MAG_ALPHA"),
     ] {
         if let Ok(v) = std::env::var(env) {
             if let Ok(t) = v.parse::<f32>() {
