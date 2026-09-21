@@ -280,6 +280,23 @@ fn hover_60s_env() {
             let h = baro_up - 5.0;
             st.baro_pa = 101_325.0 * (-h / 8434.5).exp();
             st.rc_ch[4] = 2000.0;
+
+            // ---- 【A/B 诊断开关】`st.att` 的来源 ----
+            //
+            // 虚拟外设的**磁力计**是由 `st.att`（世界→机体四元数）旋转世界地磁推导的
+            // （`data_source.rs:538-547`），而 `st.att` 只由 `scn.write_state()` 按
+            // **场景解析真值**写入（`scenario.rs:421`）。
+            //
+            // 后果：本测例用 SimLoop 物理引擎推进机体，但**从不把实际姿态写回 `st.att`**
+            // （grep 实测：mcu_simulater/tests/*.rs 中无一处写 st.att / st.mag）
+            // ⇒ 固件的磁力计永远报告"机体水平"，与物理引擎里实际的 35° 姿态无关；
+            // 而 H 场（`FlyController`）是用**真实姿态**推导磁力计的。
+            // 这是两场输入不等价的一个具体点，故做成开关验证其对结果的影响。
+            if std::env::var("ZZ_ATT_FROM_PLANT").is_ok() {
+                if let Some(s) = last_state {
+                    st.att = [s.att.w, s.att.x, s.att.y, s.att.z];
+                }
+            }
         }
 
         // 固件推进已移至上方的 `run_one_control_tick`（锁相）。
