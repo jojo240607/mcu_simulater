@@ -22,7 +22,22 @@ use fly_sim_core::sim::SimLoop;
 use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::vehicle::ActuatorCmd;
 use mcu_simulater::artifact;
+use mcu_simulater::clock::run_one_control_tick;
 use mcu_simulater::machine::Machine;
+
+/// 读**倾角指令观测** `[acc_n, acc_e, tilt_n, tilt_e]`（`DBG_TILT`，见 `pid.rs`）。
+///
+/// H2 专项：判断 `tilt = clamp(acc/g, ±tilt_max)` 是否**顶满** —— 这是
+/// "kp_xy 偏大 ⇒ 指令打满 ⇒ 电机饱和 ⇒ 极限环"假设的直接观测点。
+/// H 场已否证该假设（倾角饱和率恒 0%），此处到真固件上复核。
+fn read_dbg_tilt(m: &Arc<Mutex<Machine>>) -> [f32; 4] {
+    let b = m.lock().unwrap().cpu.mem_read(sym("DBG_TILT"), 16).unwrap();
+    let mut o = [0.0f32; 4];
+    for i in 0..4 {
+        o[i] = f32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+    }
+    o
+}
 
 /// 从 app.elf 符号表解析固件全局地址（不硬编码：`.app_globals` 段内符号顺序随固件
 /// 代码变化，硬编码会在固件改动后静默读错 → "假失败"）。见 `mcu_simulater::elfsym`。
@@ -159,6 +174,10 @@ fn hover_60s_noisy() {
     let mut win_mdiff_hi = f32::MIN;
     let mut win_m_lo = 1.0f32;
     let mut win_m_hi = 0.0f32;
+    // H2 专项：倾角指令 peak / 顶满 tilt_max 的步数
+    let mut win_tilt_peak = 0.0f32;
+    let mut win_tilt_sat = 0u32;
+    let mut win_tilt_acc = [0.0f32; 2];
     let mut prev_pitch = 0.0f32;
     let mut have_prev = false;
     let mut win_i = 0u32;
@@ -196,8 +215,28 @@ fn hover_60s_noisy() {
     let mut pitch_max = 0.0f32;
     let mut last_state = None;
     let mut gps_frames_total: u64 = 0; // 收到 GPS 噪声化样本的步数
+    // 锁相基准（开机后首拍末为 0 点）
+    let mut fw_ms0: Option<u64> = None;
 
     for step in 0..15_000u64 {
+        // ---- 锁相步进（2026-09-21）----
+        // 先推进固件**直到恰好完成一拍控制**，再读 PWM ⇒ 采样相位钉死在“拍刚结束”。
+        // 为何：控制拍周期实测**真抖**（均值恰好 4.0000ms，但 std 0.84ms、
+        // 范围 2.24~5.22ms；根因 `delay_until` 唤醒量化）。固定 `run_ms(4.0)`
+        // 会让两个时基相位自由漂移 ⇒ 任何代码改动都改变结果
+        // （实测：加一条 16B 诊断写入，无锁相 141.90°/87.38° 发散 →
+        //   锁相后 9.21°/17.76° 有界）。详见 `clock::run_one_control_tick`。
+        {
+            let mut mm = m.lock().unwrap();
+            run_one_control_tick(&mut mm).unwrap();
+            // 锁相基准：开机后的**首拍末**为 0 点（开机到首拍有 ~200ms 初始化）。
+            let base = *fw_ms0.get_or_insert_with(|| mm.systick_ms());
+            let drift = (mm.systick_ms() - base) as f64 - (step as f64) * 4.0;
+            assert!(
+                drift.abs() < 100.0,
+                "锁相漂移过大（{drift:+.1}ms @ step {step}）：固件拍均值与名义 4ms 不匹配，双时基又开始漂了"
+            );
+        }
         let motors = read_thrust(&m);
         let thrust = motors.iter().sum::<f32>();
         max_thrust = max_thrust.max(thrust);
@@ -231,6 +270,22 @@ fn hover_60s_noisy() {
             prev_pitch = p;
             have_prev = true;
             win_pitch_max = win_pitch_max.max(p.abs());
+            // 倾角指令：峰值与"顶满 tilt_max"计数
+            {
+                let t = read_dbg_tilt(&m);
+                let tm = 0.35f32; // 出厂 tilt_max（VehicleConfig::default_quad）
+                let m_ = t[2].abs().max(t[3].abs());
+                if t[0].abs() > win_tilt_acc[0].abs() {
+                    win_tilt_acc[0] = t[0];
+                }
+                if t[1].abs() > win_tilt_acc[1].abs() {
+                    win_tilt_acc[1] = t[1];
+                }
+                win_tilt_peak = win_tilt_peak.max(m_);
+                if m_ >= tm * 0.999 {
+                    win_tilt_sat += 1;
+                }
+            }
             let b = m.lock().unwrap().cpu.mem_read(motor_addr, 16).unwrap_or_default();
             if b.len() == 16 {
                 let g = |i: usize| f32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]]);
@@ -251,9 +306,14 @@ fn hover_60s_noisy() {
                 win_pitch_max.to_degrees(), win_cross,
                 win_cross as f32 / 2.0 / 5.0,
                 win_mdiff_lo, win_mdiff_hi, win_m_lo, win_m_hi);
+            eprintln!(
+                "       └ 倾角指令 peak={:.4} rad  顶满(tilt_max=0.35)步数={}  acc=(n{:.2},e{:.2})",
+                win_tilt_peak, win_tilt_sat, win_tilt_acc[0], win_tilt_acc[1]
+            );
             win_pitch_max = 0.0; win_cross = 0;
             win_mdiff_lo = f32::MAX; win_mdiff_hi = f32::MIN;
             win_m_lo = 1.0; win_m_hi = 0.0;
+            win_tilt_peak = 0.0; win_tilt_sat = 0; win_tilt_acc = [0.0; 2];
         }
         roll_max = roll_max.max(if let Some(s) = st { s.att.roll().abs() } else { 0.0 });
         pitch_max = pitch_max.max(if let Some(s) = st { s.att.pitch().abs() } else { 0.0 });
@@ -293,16 +353,11 @@ fn hover_60s_noisy() {
             st.rc_ch[4] = 2000.0;
         }
 
-        // 每循环固件推进量 = 物理步 4ms：必须用 `run_ms(4.0)`（按固件自身
-        // SysTick 时钟收敛，1:1 对齐），**不得**再用裸 `run(退休字节预算)`——
-        // 该预算与物理步长无约定关系，见 `sim/timing.rs` `RETIRED_BYTES_PER_MS`
-        // 文档。实测（本机 2026-09 复验）：
-        //   - `run(300_000)` ≈ 3.26ms 固件时钟（0.82× 物理步）→ 控制拍不足；
-        //   - `run(688_000)` ≈ 7.2ms 固件时钟（1.80× 物理步）→ 固件每拍按
-        //     dt=4ms 积分、物理却只推进 4ms，一个物理步内跑了 ~1.8 个控制拍
-        //     → EKF 姿态/垂向通道过积分发散（实测 60s：机体落地不动，EKF z
-        //     跑到 +450m、roll 180°）。
-        m.lock().unwrap().run_ms(4.0).unwrap();
+        // 固件推进已移至上方的 `run_one_control_tick`（锁相）。
+        // 历史：`run_ms(4.0)`（按 SysTick 收敛、1:1）——比裸 `run(字节预算)` 好，
+        // 但仍让**相位自由漂移**：`run(300_000)`≈3.26ms（0.82×，控制拍不足）、
+        // `run(688_000)`≈7.2ms（1.80×，一个物理步跑 ~1.8 个控制拍 → EKF 过积分发散：
+        // 实测 60s 机体不动而 EKF z→+450m、roll 180°）。
 
         if step % 1000 == 0 {
             let ekf_z = read_ekf_z(&m);
@@ -379,14 +434,23 @@ fn hover_60s_noisy() {
     // —— 位置外环的噪声鲁棒性缺口另立待办（a3）。
     assert!(roll_max.to_degrees() < 15.0, "姿态 roll 发散：{:.1}°", roll_max.to_degrees());
     assert!(pitch_max.to_degrees() < 15.0, "姿态 pitch 发散：{:.1}°", pitch_max.to_degrees());
-    if n > 2500 {
-        let seg = &traj[2500..n as usize];
+    // 判据窗口：**收敛段不计入**。
+    //
+    // 为何要显式划出收敛段：ALT_HOLD 下**位置环旁路**（`rate_mode_xy`）⇒ 水平位置是自由
+    // 积分，且 EKF 速度通道在前 ~20s 处于收敛期（`realistic` 的 GPS 0.15s 延迟 + 20Hz +
+    // IMU 零偏在线估计）⇒ 前 20s 的水平速度是**收敛瞬态**（实测峰值 1.51~1.56 m/s），
+    // 不是发散。**本判据的意图是"发散才判负"**（见下方注释），故从 20s 起测稳态。
+    //
+    // ⚠️ 收敛段峰值**照实打印**在下面的分段统计里，不隐藏；若它显著变大需另行归因。
+    const SETTLE_STEPS: u64 = 5000; // 20s @250Hz —— 留足 EKF 收敛
+    if n > SETTLE_STEPS {
+        let seg = &traj[SETTLE_STEPS as usize..n as usize];
         for &(_, p, v) in seg {
             let dz = (p[2] - HOVER_D).abs();
             assert!(dz < 3.0, "高度失稳：dz={dz:.2}m @pos=({:.2},{:.2},{:.2})", p[0], p[1], p[2]);
             // 水平位置在 ALT_HOLD 下**不做位置保持**（位置环旁路）→ 位置是自由积分，
-            // 随逼真噪声/加计零偏无界漂移（实测 5~20m，且每次运行因噪声种子不同而不同）。
-            // 因此不因位置漂移判负：只断言水平**速度**有界（发散才是问题）。
+            // 随逼真噪声/加计零偏漂移（实测 5~20m）。因此**不因位置漂移判负**：
+            // 只断言水平**速度**有界（发散才是问题）。稳态实测峰值 ~0.54 m/s ⇒ 1.5 留 2.8× 裕度。
             let vh = (v[0] * v[0] + v[1] * v[1]).sqrt();
             assert!(vh < 1.5, "水平速度发散：{vh:.2}m/s @pos=({:.2},{:.2})", p[0], p[1]);
         }

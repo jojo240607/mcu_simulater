@@ -32,6 +32,7 @@ use fly_sim_core::wind::{WindConfig, WindField};
 use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::vehicle::ActuatorCmd;
 use mcu_simulater::artifact;
+use mcu_simulater::clock::run_one_control_tick;
 use mcu_simulater::machine::Machine;
 
 /// 从 app.elf 符号表解析固件全局地址（不硬编码：`.app_globals` 段内符号顺序随固件
@@ -197,12 +198,28 @@ fn hover_60s_env() {
     let mut held = true;
     let mut max_thrust = 0.0f32;
     let mut traj: Vec<(u64, [f32; 3], [f32; 3])> = Vec::new(); // (step, pos, vel)
+    let mut fw_ms0: Option<u64> = None;
     let mut roll_max = 0.0f32;
     let mut pitch_max = 0.0f32;
     let mut last_state = None;
     let mut gps_frames_total: u64 = 0; // 收到 GPS 噪声化样本的步数
 
     for step in 0..15_000u64 {
+        // ---- 锁相步进（2026-09-21）----
+        // 先推进固件**直到恰好完成一拍控制**，再读 PWM。
+        // 为何：控制拍周期实测抖动 std 0.84ms（均值恰好 4.0000ms，根因是
+        // `delay_until` 唤醒量化）；固定 `run_ms(4.0)` 推进会让 **PWM 回读的
+        // 相位自由漂移** ⇒ 任何代码改动（哪怕加一条不执行的支路）都会改变
+        // 量化图案 → 改变相位 → 改变结果。这就是 M 场“代码布局灵敏度”的根因，
+        // **与算力余量无关**（实测计算仅占 26%）。详见 `clock::run_one_control_tick`。
+        {
+            let mut mm = m.lock().unwrap();
+            run_one_control_tick(&mut mm).unwrap();
+            // 锁相基准：取开机后的**第一拍末**为 0 点（开机到首拍有 ~200ms 初始化）。
+            if fw_ms0.is_none() {
+                fw_ms0 = Some(mm.systick_ms());
+            }
+        }
         let motors = read_thrust(&m);
         let thrust = motors.iter().sum::<f32>();
         max_thrust = max_thrust.max(thrust);
@@ -265,14 +282,19 @@ fn hover_60s_env() {
             st.rc_ch[4] = 2000.0;
         }
 
-        // 固件推进与物理步长同口径（4ms）：不再用裸 run(字节预算)。旧写法
-        // run(300_000) 实测仅 ≈3.3ms 固件时间 < 4ms 物理步 → 固件比场景慢 0.83×，
-        // 场景/固件时钟失配（同类：x_vperiph 已修为 run_ms）。
-        m.lock().unwrap().run_ms(4.0).unwrap();
+        // 固件推进已移至上方的 `run_one_control_tick`（锁相）。
+        // 旧写法：`m.lock().unwrap().run_ms(4.0)` —— 固定 4ms 推进，相位自由漂移；
+        // 更早是裸 `run(300_000)`（实测仅 ≈3.3ms 固件时间 < 4ms 物理步 → 0.83× 失配）。
 
         if step % 1000 == 0 {
             let ekf_z = read_ekf_z(&m);
             let mm = m.lock().unwrap();
+            // 锁相对齐（**增量**口径）：从首拍末起，固件时钟应与“物理已推进的
+            // 名义时间” 1:1（实测均值拍 = 4.0000ms）。漂移只会来自“实测均值 ≠ 名义 dt”，
+            // 本断言把它变成可见信号。
+            let fw_ms = mm.systick_ms();
+            let phys_ms = (step as f64) * 4.0;
+            let drift = (fw_ms - fw_ms0.unwrap_or(fw_ms)) as f64 - phys_ms;
             let (gps_frames, fifo_len) = {
                 let uv = mm.usart.lock().unwrap();
                 let u2 = uv.get(1).unwrap().lock().unwrap();
@@ -280,8 +302,13 @@ fn hover_60s_env() {
                 (frames, u2.rx_fifo_len())
             };
             eprintln!(
-                "[env] t={:.0}s thrust={thrust:.3} pos=({:.2},{:.2},{:.2}) vel=({:.2},{:.2},{:.2}) ekf_z={ekf_z:.2} gps_frames={gps_frames} fifo={fifo_len}",
+                "[env] t={:.0}s thrust={thrust:.3} pos=({:.2},{:.2},{:.2}) vel=({:.2},{:.2},{:.2}) ekf_z={ekf_z:.2} gps_frames={gps_frames} fifo={fifo_len} | 锁相漂移={drift:+.1}ms",
                 step as f64 * 0.004, pos[0], pos[1], pos[2], vel[0], vel[1], vel[2]
+            );
+            assert!(
+                drift.abs() < 100.0,
+                "锁相漂移过大（{drift:+.1}ms @ step {step}）：固件拍均值与名义 4ms 不匹配，\
+                 双时基又开始漂了"
             );
         }
         if st.is_some() {

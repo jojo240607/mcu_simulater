@@ -82,3 +82,60 @@ impl<C: McuClock> HilStepper<C> {
         &mut self.clock
     }
 }
+
+// ============================ 锁相步进（控制拍为时基） ============================
+
+/// 固件控制拍计数器的**符号名**（ELF 解析，不硬编码地址）。
+const CTRL_TICKS_SYM: &str = "CTRL_TICKS";
+
+fn read_u32(m: &mut Machine, addr: u64) -> u32 {
+    let b = m.cpu.mem_read(addr, 4).unwrap_or_else(|_| vec![0; 4]);
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// 推进 MCU 直到**恰好完成一拍控制**（`CTRL_TICKS` +1），返回该拍耗时（固件 ms）。
+///
+/// # 为何需要它（这是 M 场“代码布局灵敏度”的根因）
+///
+/// [`HilStepper`] 让 MCU 按**固定 `dt_ms`** 推进，而固件控制拍有它**自己的、抖动的**
+/// 周期。实测（亚毫秒分辨率，用退休字节当时钟，量化仅 0.148ms）：
+///
+/// ```text
+/// 周期：均值 4.0000ms（250.00Hz）  标准差 0.8426ms  min 2.2439  max 5.2224
+/// ```
+///
+/// ⇒ 两个时基**相位自由漂移** ⇒ **PWM 回读落在控制周期内的相位随机**
+/// ⇒ 任何代码改动只要移动零点几 ms，就会改变唤醒的量化图案 → 改变相位 → 改变结果。
+/// **这与算力余量无关**（实测计算仅占 26%、空转 74%）；之前“固件没时序余量”的
+/// 归因是错的（那个结论建立在虚高 1.47× 的字节换算常量上）。
+///
+/// # 本函数的做法与为何不会漂
+///
+/// 把“控制拍”钉成唯一时基：**每完成一拍才返回**，调用方据此推进一次物理/场景。
+/// 于是 PWM 总在“拍刚结束”被采样，**相位固定**。
+/// 又因实测周期**均值恰好 4.0000ms**，调用方每拍推进名义 `dt_ms` 与之 1:1，
+/// 长期不漂（漂移只会来自均值≠`dt_ms`，可用对齐断言监控）。
+///
+/// 注：本函数**不改变固件行为**——它只用 [crate::machine::Machine::run_budget] 分段
+/// 推进同一台机器，不做任何写入。
+///
+/// 返回：该拍实际推进的固件毫秒数（整数，SysTick 粒度）。
+pub fn run_one_control_tick(m: &mut Machine) -> Result<f64> {
+    /// 轮询粒度（退休字节）：≈0.15ms 固件时间，远细于控制拍。
+    const POLL_BYTES: usize = 20_000;
+    /// 安全阀：按 0.15ms/次估算可覆盖 ~3s 固件时间，正常一拍只要 ~27 次。
+    const MAX_POLLS: u32 = 20_000;
+
+    let addr = crate::elfsym::app_sym(CTRL_TICKS_SYM) as u64;
+    let t0 = read_u32(m, addr);
+    let ms0 = m.systick_ms();
+    for _ in 0..MAX_POLLS {
+        m.run_budget(POLL_BYTES)?;
+        if read_u32(m, addr) != t0 {
+            return Ok(m.systick_ms().saturating_sub(ms0) as f64);
+        }
+    }
+    Err(crate::core::CoreError::Io(format!(
+        "等待控制拍超时：{MAX_POLLS} 次轮询未看到 {CTRL_TICKS_SYM} 增长（固件卡死或符号错）"
+    )))
+}

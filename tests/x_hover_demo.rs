@@ -17,6 +17,7 @@ use fly_sim_core::sim::SimLoop;
 use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::vehicle::ActuatorCmd;
 use mcu_simulater::artifact;
+use mcu_simulater::clock::run_one_control_tick;
 use mcu_simulater::machine::Machine;
 
 /// 从 app.elf 符号表解析固件全局地址（不硬编码：`.app_globals` 段内符号顺序随固件
@@ -164,8 +165,23 @@ fn hover_60s_demo() {
     let mut roll_max = 0.0f32;
     let mut pitch_max = 0.0f32;
     let mut last_state = None;
+    // 锁相基准（开机后首拍末为 0 点）
+    let mut fw_ms0: Option<u64> = None;
 
     for step in 0..15_000u64 {
+        // ---- 锁相步进（2026-09-21）---- 同 `x_hover_noise`：以控制拍为时基，
+        // 每完成一拍才推进一次物理 ⇒ PWM 采样相位钉死。详见 `clock::run_one_control_tick`。
+        {
+            let mut mm = m.lock().unwrap();
+            run_one_control_tick(&mut mm).unwrap();
+            // 锁相基准：开机后的**首拍末**为 0 点（开机到首拍有 ~200ms 初始化）。
+            let base = *fw_ms0.get_or_insert_with(|| mm.systick_ms());
+            let drift = (mm.systick_ms() - base) as f64 - (step as f64) * 4.0;
+            assert!(
+                drift.abs() < 100.0,
+                "锁相漂移过大（{drift:+.1}ms @ step {step}）：固件拍均值与名义 4ms 不匹配，双时基又开始漂了"
+            );
+        }
         let motors = read_thrust(&m);
         let thrust = motors.iter().sum::<f32>();
         max_thrust = max_thrust.max(thrust);
@@ -215,16 +231,9 @@ fn hover_60s_demo() {
             st.rc_ch[4] = 2000.0;
         }
 
-        // 每循环固件推进量 = 物理步 4ms：必须用 `run_ms(4.0)`（按固件自身
-        // SysTick 时钟收敛，1:1 对齐），**不得**再用裸 `run(退休字节预算)`——
-        // 该预算与物理步长无约定关系，见 `sim/timing.rs` `RETIRED_BYTES_PER_MS`
-        // 文档。实测（本机 2026-09 复验）：
-        //   - `run(300_000)` ≈ 3.26ms 固件时钟（0.82× 物理步）→ 控制拍不足；
-        //   - `run(688_000)` ≈ 7.2ms 固件时钟（1.80× 物理步）→ 固件每拍按
-        //     dt=4ms 积分、物理却只推进 4ms，一个物理步内跑了 ~1.8 个控制拍
-        //     → EKF 姿态/垂向通道过积分发散（实测 60s：机体落地不动，EKF z
-        //     跑到 +450m、roll 180°）。
-        m.lock().unwrap().run_ms(4.0).unwrap();
+        // 固件推进已移至上方的 `run_one_control_tick`（锁相）。
+        // 历史：`run_ms(4.0)`（比裸 `run(字节预算)` 好，但仍让相位自由漂移：
+        // `run(300_000)`≈3.26ms（0.82×）、`run(688_000)`≈7.2ms（1.80× → 过积分发散））。
 
         if step % 250 == 0 {
             let ekf_z = read_ekf_z(&m);
