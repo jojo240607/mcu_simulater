@@ -21,7 +21,34 @@ use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 const CTRL_TICKS: u64 = 0x2001F004;
 const CTRL_PHASE: u64 = 0x2001F000;
 const HIL_PROBE: u64 = 0x2001F100;
-const RETIRED_BYTES_PER_MS: f64 = 92_000.0;
+/// CPU 侧换算：退休字节 → 固件毫秒。
+///
+/// ⚠️ **已修正**：历史值 `92_000.0` 与实测相差 ~1.47×，使打印出的“单拍耗时”
+/// 虚高 1.47×、并出现 **CPU 147.2%** 这种物理上不可能（>100%）的结果——
+/// 而“M 场无时序余量”的错误结论正是靠它支撑的。
+///
+/// 2026-09-21 重标定：分段相位合计（**比例**）必须等于**独立实测的周期**
+/// （SysTick，与任何字节常数无关）⇒ 反推出真值 ≈**136,800 字节/固件ms**。
+/// （注：它既不等于旧的 92k，也不等于 95.6k / 172k——三个数口径不同，
+///  参见 `src/sim/timing.rs` 的注释；以本文件的自校准为准。）
+///
+/// 新代码请优先用 [`bytes_per_ms_calibrated`] 现场标定，不要依赖本常量。
+const RETIRED_BYTES_PER_MS: f64 = 136_800.0;
+/// 历史（错误）值，仅用于打印“虚高倍数”做溯源对照。
+const LEGACY_BYTES_PER_MS: f64 = 92_000.0;
+
+/// **自校准**的 CPU 侧换算：`retired / fw_ms`。
+///
+/// 用现场数据标定，**不再依赖任何硬编码常数**，从而根除上面那类“常数过期 →
+/// 结论错误”的 bug。唯一前提：窗口内 CPU 不空转（空闲任务忙等 → 退休字节随时间
+/// 线性增长；若未来改成 WFI 真休眠，本标定会偏低，需同步复核）。
+fn bytes_per_ms_calibrated(retired: f64, fw_ms: f64) -> f64 {
+    if fw_ms > 0.0 && retired > 0.0 {
+        retired / fw_ms
+    } else {
+        RETIRED_BYTES_PER_MS
+    }
+}
 
 /// 外层相位名（CTRL_PHASE 取值）。
 const OUTER: [(usize, &str); 5] = [
@@ -129,11 +156,100 @@ fn ctl_period_and_tick_cost() {
         fw_ms / ticks,
         ticks * 1000.0 / fw_ms
     );
+    // **自校准**：若 CPU 不空转，则 `retired/fw_ms` 就是“字节/固件ms”真值。
+    // 用它换算才得到真实耗时；先打印出来以便与其它常量对比溯源。
+    let bpms = bytes_per_ms_calibrated(retired, fw_ms);
     println!(
-        "[ctl] 单拍平均退休 {:.0} 字节 → 全拍耗时 {:.3}ms | CPU 总占用 {:.1}%",
+        "[ctl] 实测换算 = {bpms:.0} 字节/固件ms（自校准；旧硬编码 92_000 会把耗时虚高 {:.2}×，\
+         导致打印 >100% 的不可能 CPU 占用）",
+        bpms / LEGACY_BYTES_PER_MS
+    );
+    println!(
+        "[ctl] 单拍平均退休 {:.0} 字节 → 全拍耗时 {:.3}ms（= 周期，逐拍不空转）",
         retired / ticks,
-        retired / ticks / RETIRED_BYTES_PER_MS,
-        retired * 100.0 / RETIRED_BYTES_PER_MS / fw_ms
+        retired / ticks / bpms,
+    );
+    println!(
+        "[ctl] 注：空闲任务**忙等**⇒“退休字节/固件ms”恒≈墙钟，“CPU%”恒≈100%，\
+         **无信息量**；真实时序余量看 `ctl_phase_breakdown` 的【计算 vs delay】(那里能分开)。"
+    );
+}
+
+/// **亚毫秒分辨率的控制拍周期测量**（判断控制周期到底抖不抖）。
+///
+/// 动机：`task_rates_and_periods` 按 **1ms 粒度**采样，得到 2~6ms 的分布——
+/// 但那可能是**测量假象**（1ms 粒度 + `run_ms` 块粒度过冲 ~1.12×）。
+/// 要判“控制周期是干净的 ~4.005ms（只有测量量化）”还是“它本来就在抖”，
+/// 必须换更细的时钟。
+///
+/// 方法：用**退休字节**作时钟。自校准值 ≈136,554 字节/固件ms ⇒ 每 20K 字节
+/// ≈ **0.15ms** 的采样分辨率。记录每次 `CTRL_TICKS` 变化间隔内的退休字节量。
+/// 判读：若周期干净，各间隔应集中在均值±0.15ms（std≈0.05ms）；
+/// 若真在抖，std 会显著大于 0.15ms。
+#[test]
+fn ctl_period_fine_resolution() {
+    const BUDGET: usize = 20_000; // ≈0.15ms 固件时间
+    let mut m = build();
+    boot(&mut m);
+
+    let t0 = systick(&m);
+    let r0 = m.retired_count();
+    let mut last_ticks = u32at(&mut m, CTRL_TICKS);
+    let mut last_ret = m.retired_count();
+    let mut gaps_bytes: Vec<f64> = Vec::new();
+
+    // 跑 ~2s 固件时间
+    for _ in 0..200_000 {
+        m.run_budget(BUDGET).unwrap();
+        if systick(&m).saturating_sub(t0) > 2000 {
+            break;
+        }
+        let t = u32at(&mut m, CTRL_TICKS);
+        let d = t.wrapping_sub(last_ticks);
+        if d > 0 {
+            let r = m.retired_count();
+            let per = (r - last_ret) as f64 / d as f64;
+            for _ in 0..d.min(64) {
+                gaps_bytes.push(per);
+            }
+            last_ret = r;
+            last_ticks = t;
+        }
+    }
+
+    let fw_ms = systick(&m).saturating_sub(t0) as f64;
+    let total_ret = (m.retired_count() - r0) as f64;
+    let bpms = total_ret / fw_ms;
+    let n = gaps_bytes.len();
+    assert!(n > 100, "样本太少（{n}）");
+    let ms: Vec<f64> = gaps_bytes.iter().map(|b| b / bpms).collect();
+    let mean = ms.iter().sum::<f64>() / n as f64;
+    let minv = ms.iter().cloned().fold(f64::INFINITY, f64::min);
+    let maxv = ms.iter().cloned().fold(0.0f64, f64::max);
+    let var = ms.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+    let sd = var.sqrt();
+
+    println!("\n[fine] {n} 拍 / {fw_ms:.0}ms 固件 | 自校准 {bpms:.0} 字节/ms | 采样分辨率 {:.4}ms", BUDGET as f64 / bpms);
+    println!("[fine] 周期：均值 **{mean:.4}ms**（{:.2}Hz） 标准差 **{sd:.4}ms**  min {minv:.4} max {maxv:.4}", 1000.0 / mean);
+
+    // 直方（0.2ms 一桶）
+    let mut buckets = [0u32; 24]; // 2.0 .. 6.8ms
+    for v in &ms {
+        let i = (((v - 2.0) / 0.2).floor() as isize).clamp(0, 23) as usize;
+        buckets[i] += 1;
+    }
+    let mut line = String::from("[fine] 直方(0.2ms/桶) ");
+    for (i, c) in buckets.iter().enumerate() {
+        if *c > 0 {
+            line += &format!("{:.1}ms:{}% ", 2.0 + i as f64 * 0.2, c * 100 / n as u32);
+        }
+    }
+    println!("{line}");
+
+    println!(
+        "[fine] 判读：采样本身带来 ±{:.3}ms 量化⇒若 std 只在 ~0.1ms 量级，说明周期是干净的，\
+         之前的 2~6ms 分布是 1ms 采样假象；若 std ≫0.1ms，则是**真抖动**。",
+        BUDGET as f64 / bpms
     );
 }
 
