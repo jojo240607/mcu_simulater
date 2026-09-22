@@ -66,29 +66,43 @@ fn rc_drop_disarms() {
         }
     }
     assert!(armed_seen, "解锁应生效（armed=1）");
-    // ★判据只在【掉链窗口内】采信 ✓（t∈[10s,40s] ✓）：
-    //   故障在 t=40s 结束 ⇒ RC 恢复 ⇒ 固件会【重新解锁】✓（那是正确行为 ✓）
-    //   ⇒ 若把窗口跑到 45s 并在末次取值，会因"已恢复解锁"而误判为失败 ✗✓
+    // ★判据（含宽限期 ✓）：掉链在场景 t=10s 触发 ✓，但固件**检测需要若干帧** ✓
+    //   ⇒ 不能从 t=10s 就要求 armed=0 ✗（那是"要求瞬时检测"✗，物理上做不到 ✓）
+    //   正确表述 ✓：① 宽限期内（10s → 11s ✓）必须转为 0 ✓；
+    //              ② 此后到故障结束前（→ 39.5s ✓）必须【持续】为 0 ✓
+    const T_DROP: f64 = 10_000.0;
+    const T_GRACE: f64 = 11_000.0;
+    const T_END: f64 = 39_500.0;
+    let mut became_zero_ms: Option<f64> = None;
+    let mut rebounce_ms: Option<f64> = None;
     let mut in_window = 0u32;
-    let mut disarmed_all = true;
-    let mut still = 0u32;
     while (h.fw_ms() - t0) < 44_000 {
         h.step();
         let ms = (h.fw_ms() - t0) as f64;
-        if ms >= 10_000.0 && ms <= 40_000.0 {
+        if ms >= T_DROP && ms <= T_END {
             in_window += 1;
-            if h.read_est().armed != 0 {
-                disarmed_all = false; // 掉链窗口内必须【始终】为 0 ✓
+            let a = h.read_est().armed;
+            if a == 0 && became_zero_ms.is_none() {
+                became_zero_ms = Some(ms);
+            }
+            if became_zero_ms.is_some() && a == 1 && rebounce_ms.is_none() {
+                rebounce_ms = Some(ms); // 掉链期间回跳（疑似缺陷 ✗）
             }
         }
-        if ms > 40_500.0 && h.read_est().armed == 1 {
-            still += 1; // 窗口结束后应恢复解锁（记录，不作主判据 ✓）
-        }
     }
-    assert!(in_window > 100, "掉链窗口采样过少（{in_window}）—— 判据可能空洞 ✗");
-    assert!(
-        disarmed_all,
-        "RC 掉链窗口 [10s,40s] 内解锁位必须【持续】为 0 ✗（采样 {in_window} 次）"
+    println!(
+        "  掉链检测：转为 0 于 {:?} ms（宽限至 {T_GRACE:.0}ms ✓）；回跳于 {:?}；窗口采样 {in_window} ✓",
+        became_zero_ms, rebounce_ms
     );
-    println!("  ✓ 掉链窗口采样 {in_window} 次全部 armed=0 ✓；窗口后恢复解锁计数 {still} ✓");
+    assert!(in_window > 100, "掉链窗口采样过少（{in_window}）—— 判据可能空洞 ✗");
+    let bz = became_zero_ms.expect("掉链窗口内从未出现 armed=0 ✗ ⇒ 固件未检测到掉链 ✗");
+    assert!(
+        bz <= T_GRACE,
+        "掉链检测过慢 ✗：转为 0 于 {bz:.0}ms，宽限 {T_GRACE:.0}ms"
+    );
+    assert!(
+        rebounce_ms.is_none(),
+        "掉链期间解锁位【回跳】✗（于 {:?} ms）—— 防失控保护未持续生效 ✗",
+        rebounce_ms
+    );
 }
