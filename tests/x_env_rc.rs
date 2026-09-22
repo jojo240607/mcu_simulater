@@ -66,15 +66,29 @@ fn rc_drop_disarms() {
         }
     }
     assert!(armed_seen, "解锁应生效（armed=1）");
-    let mut disarmed = false;
-    while (h.fw_ms() - t0) < 45_000 {
+    // ★判据只在【掉链窗口内】采信 ✓（t∈[10s,40s] ✓）：
+    //   故障在 t=40s 结束 ⇒ RC 恢复 ⇒ 固件会【重新解锁】✓（那是正确行为 ✓）
+    //   ⇒ 若把窗口跑到 45s 并在末次取值，会因"已恢复解锁"而误判为失败 ✗✓
+    let mut in_window = 0u32;
+    let mut disarmed_all = true;
+    let mut still = 0u32;
+    while (h.fw_ms() - t0) < 44_000 {
         h.step();
-        let e = h.read_est();
-        if e.armed == 0 {
-            disarmed = true;
-        } else {
-            disarmed = false;
+        let ms = (h.fw_ms() - t0) as f64;
+        if ms >= 10_000.0 && ms <= 40_000.0 {
+            in_window += 1;
+            if h.read_est().armed != 0 {
+                disarmed_all = false; // 掉链窗口内必须【始终】为 0 ✓
+            }
+        }
+        if ms > 40_500.0 && h.read_est().armed == 1 {
+            still += 1; // 窗口结束后应恢复解锁（记录，不作主判据 ✓）
         }
     }
-    assert!(disarmed, "RC 掉链应保持解锁位清零（armed=0）");
+    assert!(in_window > 100, "掉链窗口采样过少（{in_window}）—— 判据可能空洞 ✗");
+    assert!(
+        disarmed_all,
+        "RC 掉链窗口 [10s,40s] 内解锁位必须【持续】为 0 ✗（采样 {in_window} 次）"
+    );
+    println!("  ✓ 掉链窗口采样 {in_window} 次全部 armed=0 ✓；窗口后恢复解锁计数 {still} ✓");
 }
