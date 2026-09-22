@@ -21,7 +21,8 @@ fn long_hover_bounded_and_alive() {
     let mut max_vel = 0.0f32;
     let mut last_adv = 0u32; // SENSOR_SEQ 冻结窗口
     let mut last_seq = seq0;
-    for _ in 0..1600 {
+    let _t0 = h.scn.t() as f64;
+    while (h.scn.t() as f64) - _t0 < (1600 as f64 * 0.013) {
         h.step();
         let e = h.read_est();
         max_pos = max_pos.max((e.pos[0].powi(2) + e.pos[1].powi(2) + e.pos[2].powi(2)).sqrt());
@@ -50,7 +51,8 @@ fn long_cruise_converges_and_bounded() {
     let mut vmin = 1e9f32;
     let mut vmax = 0.0f32;
     let mut pos_n = 0.0f32;
-    for _ in 0..800 {
+    let _t0 = h.scn.t() as f64;
+    while (h.scn.t() as f64) - _t0 < (800 as f64 * 0.013) {
         h.step();
         let e = h.read_est();
         vmin = vmin.min(e.vel[0]);

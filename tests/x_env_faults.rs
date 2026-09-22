@@ -26,7 +26,8 @@ fn imu_saturate_critical() {
     let mut h = EnvHarness::new(scn, true);
     h.run_for_ms(70 as f64 * 13.0); // 预热 0.93s（fault t=1.0 前）
     let mut saw_critical = false;
-    for _ in 0..300 {
+    let _t0 = h.scn.t() as f64;
+    while (h.scn.t() as f64) - _t0 < (300 as f64 * 0.013) {
         h.step();
         let e = h.read_est();
         if e.health == 2 {
@@ -48,7 +49,8 @@ fn imu_freeze_hover_no_false_positive() {
     );
     let mut h = EnvHarness::new(scn, true);
     h.run_for_ms(85 as f64 * 13.0); // 预热 1.13s（fault t=1.2 前）
-    for _ in 0..300 {
+    let _t0 = h.scn.t() as f64;
+    while (h.scn.t() as f64) - _t0 < (300 as f64 * 0.013) {
         h.step();
         let e = h.read_est();
         assert!(e.health == 0, "悬停中 IMU 冻结（幅值合理）不应误报，health={}", e.health);
@@ -68,7 +70,8 @@ fn gps_drop_degraded_then_recover() {
     h.run_for_ms(60 as f64 * 13.0); // 预热 0.8s（fault t=1.0 前，fix established）
     let mut saw_degraded = false;
     let mut degraded_step = 0u32;
-    for s in 0..260u32 {
+    // ★锁相后每步≈4ms（原13ms）⇒ 界按 13/4 缩放以保持原意时长 ✗→✓
+    for s in 0..((260 as f64 * 3.25) as u32) {
         h.step();
         let e = h.read_est();
         if e.health == 1 && !saw_degraded {
@@ -80,7 +83,8 @@ fn gps_drop_degraded_then_recover() {
     // 恢复窗口（fault 1.0-2.5s；GPS 样本保持 500ms 延迟 + FDIR 40 拍 → 降级约
     // 1.7s，恢复约 2.7s）：检测循环 260 步（3.46s）内应已见恢复，额外 150 步兜底。
     let mut recovered = false;
-    for _ in 0..150 {
+    let _t0 = h.scn.t() as f64;
+    while (h.scn.t() as f64) - _t0 < (150 as f64 * 0.013) {
         h.step();
         let e = h.read_est();
         if e.health == 0 {
@@ -128,7 +132,8 @@ fn baro_step_bounded_by_gps() {
     let mut max_dev = 0.0f32;
     let mut worst_hz = 0.0f32;
     // 检测 750 步（10s 场景=固件，4ms/步 ✓）——须覆盖过冲并到达稳态（见上）。
-    for _ in 0..750u32 {
+    // ★锁相后每步≈4ms（原13ms）⇒ 界按 13/4 缩放以保持原意时长 ✗→✓
+    for _ in 0..((750 as f64 * 3.25) as u32) {
         h.step();
         let e = h.read_est();
         max_dev = max_dev.max((e.pos[2] - before[2]).abs());
@@ -173,7 +178,8 @@ fn gps_jump_rejected_by_baro() {
     h.run_for_ms(80 as f64 * 13.0); // 预热 1.06s（fault t=1.2 前）
     let before = h.read_est().pos[2];
     let mut max_dev = 0.0f32;
-    for _ in 0..210 {
+    let _t0 = h.scn.t() as f64;
+    while (h.scn.t() as f64) - _t0 < (210 as f64 * 0.013) {
         h.step();
         let e = h.read_est();
         max_dev = max_dev.max((e.pos[2] - before).abs());
@@ -194,7 +200,8 @@ fn baro_freeze_no_false_positive() {
     );
     let mut h = EnvHarness::new(scn, true);
     h.run_for_ms(80 as f64 * 13.0); // 预热 1.06s（fault t=1.2 前）
-    for _ in 0..210 {
+    let _t0 = h.scn.t() as f64;
+    while (h.scn.t() as f64) - _t0 < (210 as f64 * 0.013) {
         h.step();
         let e = h.read_est();
         assert!(e.health == 0, "气压计冻结（有读数）不应触发 FDIR，health={}", e.health);
@@ -215,7 +222,8 @@ fn mag_disturb_keeps_attitude() {
     h.run_for_ms(120 as f64 * 13.0); // 预热 1.6s（fault t=2.0 前，EKF 收敛）
     let mut max_rp = 0.0f32;
     let mut health_ok = true;
-    for _ in 0..250 {
+    let _t0 = h.scn.t() as f64;
+    while (h.scn.t() as f64) - _t0 < (250 as f64 * 0.013) {
         h.step();
         let e = h.read_est();
         let rp = e.euler();
@@ -245,7 +253,8 @@ fn mag_freeze_keeps_attitude() {
     h.run_for_ms(120 as f64 * 13.0);
     let mut max_rp = 0.0f32;
     let mut health_ok = true;
-    for _ in 0..250 {
+    let _t0 = h.scn.t() as f64;
+    while (h.scn.t() as f64) - _t0 < (250 as f64 * 0.013) {
         h.step();
         let e = h.read_est();
         let rp = e.euler();
