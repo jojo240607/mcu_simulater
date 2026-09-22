@@ -71,15 +71,20 @@ fn rc_drop_disarms() {
     //   ⇒ 不能从 t=10s 就要求 armed=0 ✗（那是"要求瞬时检测"✗，物理上做不到 ✓）
     //   正确表述 ✓：① 宽限期内（10s → 11s ✓）必须转为 0 ✓；
     //              ② 此后到故障结束前（→ 39.5s ✓）必须【持续】为 0 ✓
+    // ★★**时间基准 = 场景时间** ✓（不是 fw_ms()-t0 ✗）：
+    //   `FaultEvent` 的 t/dur 都是【场景时间】✓；而 t0 取在 boot 之后 ✗
+    //   ⇒ 用 fw_ms()-t0 会偏移一个 boot 时长（实测 t0 对应场景 t=5.198s ✓）
+    //   ⇒ 实测教训 ✗：曾据此把"故障结束后 RC 恢复⇒重新解锁（正确 ✓）"误判为"回跳缺陷"✗✓
+    //   （本会话第 14 次"把不同量当成同一个"✗ —— 这次是【两条时间轴】✓）
     const T_DROP: f64 = 10_000.0;
     const T_GRACE: f64 = 11_000.0;
     const T_END: f64 = 39_500.0;
     let mut became_zero_ms: Option<f64> = None;
     let mut rebounce_ms: Option<f64> = None;
     let mut in_window = 0u32;
-    while (h.fw_ms() - t0) < 44_000 {
+    while (h.scn.t() as f64) < 44.0 {
         h.step();
-        let ms = (h.fw_ms() - t0) as f64;
+        let ms = (h.scn.t() as f64) * 1000.0; // ★场景时间基 ✓
         if ms >= T_DROP && ms <= T_END {
             in_window += 1;
             let a = h.read_est().armed;
