@@ -63,17 +63,13 @@ fn accel_bias_tolerated() {
 
 #[test]
 fn gyro_bias_tolerated() {
-    // ★**与 H 场对齐**（2026-09-21 ✓）——对照 H 场 `drift_rejection_still_works_after_fix` ✓
-    //   H 场口径：① 安静配置（low_noise ✓）② 零偏 0.01 rad/s ③ 静态悬停【长时长】④
-    //             判据 =【稳态倾角】而非 max（max 对时长敏感 ✗）⑤ 磁【干净】（硬铁=0 ✓）
-    //   M 场现实约束 ✗：步率 74.9Hz（STEP_DT_MS=13 ✓）⇒ H 场 120s ↔ 9231 步 ≈ 35 分钟 ✗
-    //   ⇒ 取【等效激励 b×t】并【在注释里显式写出等价关系】✓：
-    //        0.05 rad/s × 65 s  ≡  0.01 rad/s × 325 s（b×t 均为 3.25 rad ✓）
-    //   ⇒ 本测例取 0.05×65s（= 5000 步 ≈ 19 分钟 ✗，但比 35 分钟可行 ✓）
-    //   ★历史：原测例为 500 步（6.5s）× 0.05 rad/s ⇒ 激励仅 0.325 rad，
-    //     且判据用 max tilt（对时长敏感 ✗）⇒ 与 H 场不可比 ✗（§5.4 ✓）。
-    const SECS: f32 = 65.0;
-    let steps = (SECS / (common::STEP_DT_MS / 1000.0)) as u32;
+    // ★与 H 场对齐（2026-09-21 ✓）——对照 H 场 `drift_rejection_still_works_after_fix` ✓
+    //   H 场口径 ✓：① 安静配置 ② 零偏 0.05 rad/s ③ 静态悬停【长时长】④
+    //             判据 =【稳态倾角】而非 max ✗（max 对时长敏感）⑤ 磁【干净】（硬铁=0 ✓）
+    //   ★时长按【固件时间】表达 ✓（锁相步进后步数是实现细节 ✗；不再依赖废弃的
+    //     `STEP_DT_MS` ✗）—— 这正是 §5.17/§5.18 迁移的要求 ✓。
+    //   等效激励写在注释里 ✓：0.05 rad/s × 65 s（b×t = 3.25 rad ✓）
+    const SECS: f64 = 65.0;
     let scn = EnvScenario::new(
         Motion::Hover,
         // 磁干净（硬铁=0 ✓，照 H 场"不把航向课题混进来"✓）+ 仅陀螺零偏 ✓
@@ -81,34 +77,38 @@ fn gyro_bias_tolerated() {
         vec![],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_for_ms(500 as f64 * 13.0); // 预热（fix + 收敛）
+    h.run_for_secs(5.0); // 预热（fix + 收敛 ✓）—— 按固件时间 ✓
+
+    let t0 = h.fw_ms();
+    let target_ms = SECS * 1000.0;
     let mut max_tilt = 0.0f32;
     let mut ss_sum = 0.0f64;
     let mut ss_n = 0u32;
-    for k in 0..steps {
+    while ((h.fw_ms() - t0) as f64 + 4.0) < target_ms {
         h.step();
         let e = h.read_est();
+        assert!(e.health == 0, "陀螺零偏不应触发 FDIR（health={}）", e.health);
         let eu = e.euler();
         let tilt = (eu[0].powi(2) + eu[1].powi(2)).sqrt();
         max_tilt = max_tilt.max(tilt);
         // ★稳态窗口 = 后 1/4（照"稳态 ≠ 全段均值"的既有教训 ✓）
-        if k >= steps * 3 / 4 {
+        if (h.fw_ms() - t0) as f64 >= target_ms * 0.75 {
             ss_sum += tilt as f64;
             ss_n += 1;
         }
-        assert!(e.health == 0, "陀螺零偏不应触发 FDIR（health={}）", e.health);
     }
     let ss = (ss_sum / ss_n.max(1) as f64) as f32;
-    println!(
-        "\n[对齐后的陀螺零偏测例] 零偏 0.05 rad/s × {SECS}s（= 5000 步 ✓，等效激励 3.25 rad ✓）"
-    );
+    println!("\n[对齐后的陀螺零偏测例] 零偏 0.05 rad/s × {SECS}s（按固件时间 ✓）");
     println!("  max tilt = {max_tilt:.4} rad（{:.2}°）", max_tilt.to_degrees());
     println!("  ★稳态 tilt = {ss:.4} rad（{:.2}°）", ss.to_degrees());
-    println!("  对照 H 场预测（Legacy 不学零偏）：b/k_eff = {:.2}°", (0.01f32 / (0.02 * 0.5 / 0.004)).to_degrees());
+    println!(
+        "  对照 H 场预测（Legacy 不学零偏）：b/k_eff = {:.2}°",
+        (0.01f32 / (0.02 * 0.5 / 0.004)).to_degrees()
+    );
     // ⚠️ 阈值【待按物理推导】✗：先测量，不为了让测试通过而定阈值 ✓（本会话纪律 ✓）
-    //    推导依据将用：ESKF 有 bg 状态 ⇒ 稳态倾角应 【显著小于】不学零偏时的 b/k_eff 量级 ✓
     assert!(max_tilt < 1.0, "对齐后 max tilt 应有界（<1.0 rad），实际 {max_tilt:.3} rad");
 }
+
 #[test]
 fn baro_drift_tolerated() {
     // 气压高度温漂 0.15 m/s：高度估计在 baro（漂移）与 GPS（不漂移）间融合，

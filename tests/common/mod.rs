@@ -15,8 +15,9 @@ use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
 /// 单步场景时间（毫秒）——**整数毫秒**（固件 SysTick 是 1ms 粒度）。
 ///
-/// 闭环步进 = 场景推进 `STEP_DT_MS` ms + 固件经 [`mcu_simulater::clock::McuClock`]
-/// 推进**同一** `STEP_DT_MS`（`run_ms` 按固件自身 SysTick 收敛）。
+/// 闭环步进 = **以固件控制拍为唯一时基** ✓（`clock::run_one_control_tick` ✓）：
+/// 固件恰好完成一拍控制 ✓ → 再按【实测流逝时长】推进场景并写共享状态 ✓。
+/// ⇒ 250Hz 控制 / 500Hz 传感器由【固件自身】决定 ✓，harness 不再假定 dt ✗。
 ///
 /// ★**2026-09-21 回退说明**：曾改为 4.0 ✗ 已回退为 13.0 ✓。
 /// 原因：**13.0 是本 M 场测试套件【已验证的基线标定】** ✓（该套件曾用于与 H 场做验收 ✓）。
@@ -29,9 +30,10 @@ use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 /// bytes/ms 随代码块混合比在 100K~109K 之间浮动）。旧口径把 `2_300_000` 当成
 /// 「≈13.3ms 固件时间」，实测固件实走 **~21.5ms** → 固件比场景快 ~1.6×，
 /// 与 c62ec21 修的悬停路径是同类时钟失配（场景/固件时间错配 → EKF 积分漂）。
+/// ⚠️**已废弃** ✗（2026-09-21）：锁相步进后每步对应【固件一拍控制】（名义 4ms ✓），
+/// 不再存在"固定场景步长"✗。**请改用 `run_for_ms` / `run_for_secs`** ✓（按固件时间 ✓）。
+/// 保留此常量仅为兼容尚未迁移的引用 ✗（`grep STEP_DT_MS` 应逐步清零 ✓）。
 pub const STEP_DT_MS: f32 = 13.0;
-/// 单步场景时间（秒）。
-pub const STEP_DT: f32 = STEP_DT_MS / 1000.0;
 
 /// [临时标定] 经环境变量向固件写入 EKF 参数覆盖（当前支持 `G_Q_ACCEL`）。
 ///
@@ -292,6 +294,12 @@ impl EnvHarness {
                 "run_for_ms({ms}) 未在合理步数内达成（guard={guard}）—— 固件时钟异常？"
             );
         }
+    }
+
+    /// 当前【固件时间】(ms) ✓ —— 供测例用"按固件时间的循环"表达时长 ✓
+    /// （替代"按步数循环"✗，步数是实现细节 ✓）
+    pub fn fw_ms(&self) -> u64 {
+        self.m.systick_ms()
     }
 
     /// 按【秒】跑（同 `run_for_ms` ✓）
