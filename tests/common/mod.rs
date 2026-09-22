@@ -260,28 +260,39 @@ impl EnvHarness {
         }
     }
 
-    /// 跑一步：场景推进 → 写共享状态 → 固件经 McuClock 推进同一 dt
-    /// （run 期间状态冻结，符合一致性不变量）。
+    /// 跑一步：**以固件控制拍为时基**（照 `982e0cf` 的锁相范式 ✓）
+    ///
+    /// 流程 ✓：① 读固件当前时间 → ② 推进固件【直到恰好完成一拍控制】→
+    /// ③ 按**实测流逝时长**推进场景并写共享状态 ✓（不假设任何固定 dt ✗）。
+    ///
+    /// 为何改（用户指正 + `982e0cf` 诊断 ✓）：
+    /// ```text
+    /// 原实现按【固定 13ms】推进 ⇒ 固件控制拍（均值 4.0000ms、std 0.84ms）与场景
+    /// 时基【相位自由漂移】⇒ 代码布局灵敏度 ✗；且 13ms 使传感器等效更新率仅 74.9Hz ✗
+    /// （设计：控制 250Hz / **传感器 500Hz** ✓，见 flyctrl/app 的 mod.rs / sensors_task.rs ✓）
+    /// 锁相后：时基由【固件自身】决定 ✓ ⇒ 250Hz/500Hz 自动正确 ✓，harness 不再假定 ✗
+    /// ```
     pub fn step(&mut self) {
-        use mcu_simulater::clock::McuClock;
-        self.scn.advance(STEP_DT);
+        use mcu_simulater::clock::run_one_control_tick;
+        // ② 固件推进恰好一拍控制（内部轮询固件符号 CTRL_TICKS ✓，不改固件行为 ✓）
+        let t_before = self.m.systick_ms();
+        run_one_control_tick(&mut self.m).expect("run_one_control_tick 失败");
+        let t_after = self.m.systick_ms();
+        // ③ 按【实测流逝】推进场景（自洽 ✓：不假设 dt ✗）
+        let elapsed_ms = (t_after.saturating_sub(t_before)) as f32;
+        let dt = if elapsed_ms > 0.0 { elapsed_ms } else { 1.0 };
+        self.scn.advance(dt / 1000.0);
         {
             let mut st = self.st.lock().unwrap();
             self.scn.write_state(&mut st);
         }
-        let r = self.m.advance_ms(STEP_DT_MS as f64);
-        assert!(r.is_ok(), "[step {}] advance_ms 错误: {r:?}", self.steps);
-        // 虚拟 USB 主机：只操作虚拟设备侧，不推进固件时间（在 advance_ms **之后**）
-        self.usb_host.tick(&mut self.m, self.steps);
         self.steps += 1;
-        // 对齐不变量：固件时间必须 ≈ 步数 × dt（run_ms 的 SysTick 收敛允许 ≤1ms 量化）。
-        // 若有人改回 run(字节预算) 表达时间，这里立刻红。
+        // 锁相漂移守卫（照 x_hover_noise 模板 ✓）：长期均值必须贴合名义控制周期 ✓
         let elapsed = self.m.systick_ms() - self.step0_ms;
-        let expect = self.steps * STEP_DT_MS as u64;
-        assert!(
-            elapsed.abs_diff(expect) <= 1,
-            "[clock] 固件时间 {elapsed}ms != 步数×dt {expect}ms —— 场景/固件时钟失配             （时间推进一律走 McuClock/run_ms，不得用 run(字节预算)）"
-        );
+        let expect = (self.steps as f64 * 4.0) as u64; // 名义控制周期 4ms（250Hz）
+        if elapsed.abs_diff(expect) > 200 {
+            panic!("[clock] 锁相漂移过大：固件 {elapsed}ms vs 名义 {expect}ms（步 {}）", self.steps);
+        }
         self.pump_log();
     }
 
