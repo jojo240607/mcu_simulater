@@ -40,19 +40,23 @@ fn unlock_via_rc_armed() {
 
 #[test]
 fn rc_drop_disarms() {
-    // 先解锁，再掉链 ⇒ 解锁位应清零且【持续】为 0 ✓
+    // 解锁后掉链（全通道回 1500）→ 解锁位清零（防失控保护 ✓）。
+    // 解锁先发生（`RcStuck` 持续置 ch4=2000 ✓），掉链在场景 t=10s 触发 ✓。
     // ★判据窗口按【固件时间】重述 ✓（锁相后步数是实现细节 ✗）：
-    //   旧写法"600 步 / 700 步"按【13ms/步】标定 ✗（注释原写"t=10s 场景 ≈ 750 步"✓）；
-    //   锁相后 ≈4ms/步 ⇒ 700 步仅 ≈2.8s ✗ ⇒ 够不到 `RcDrop { t: 10.0, dur: 30.0 }` ✗✓
+    //   旧写法"600 步 + 700 步"按【13ms/步】标定 ✗（≈16.9s ✓，够到 t=10s ✓）；
+    //   锁相后 ≈4ms/步 ⇒ 1300 步仅 ≈5.2s ✗ ⇒ 够不到掉链窗口 ✗✓
     let scn = EnvScenario::new(
         Motion::Hover,
         Perturb::clean(),
-        vec![FaultEvent::RcDrop { t: 10.0, dur: 30.0 }],
+        vec![
+            // ★两个故障都要有 ✓（少了 RcStuck 就不会解锁 ✗ —— 我此前漏掉过 ✓）
+            FaultEvent::RcStuck { t: 0.0, ch: 4, raw: 2000.0, dur: 1.0e9 },
+            FaultEvent::RcDrop { t: 10.0, dur: 30.0 },
+        ],
     );
     let mut h = EnvHarness::new(scn, true);
     h.run_for_ms(400 as f64 * 13.0); // boot（保持原时长 ✓，按固件时间 ✓）
     let t0 = h.fw_ms();
-    // ① 等待解锁（给足 8s 固件时间 ✓）
     let mut armed_seen = false;
     while (h.fw_ms() - t0) < 8_000 {
         h.step();
@@ -62,7 +66,6 @@ fn rc_drop_disarms() {
         }
     }
     assert!(armed_seen, "解锁应生效（armed=1）");
-    // ② 覆盖掉链窗口 [10s, 40s] ✓ ⇒ 跑到 45s ✓；期间解锁位必须持续为 0 ✓
     let mut disarmed = false;
     while (h.fw_ms() - t0) < 45_000 {
         h.step();
