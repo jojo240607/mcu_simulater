@@ -57,6 +57,7 @@ fn rc_drop_disarms() {
     let mut h = EnvHarness::new(scn, true);
     h.run_for_ms(400 as f64 * 13.0); // boot（保持原时长 ✓，按固件时间 ✓）
     let t0 = h.fw_ms();
+    println!("  [基准] t0 时刻：场景 t={:.3}s；此后我的 ms = fw_ms()-t0 ✓", h.scn.t());
     let mut armed_seen = false;
     while (h.fw_ms() - t0) < 8_000 {
         h.step();
@@ -87,6 +88,12 @@ fn rc_drop_disarms() {
             }
             if became_zero_ms.is_some() && a == 1 && rebounce_ms.is_none() {
                 rebounce_ms = Some(ms); // 掉链期间回跳（疑似缺陷 ✗）
+                // ★双时间轴诊断 ✓（分辨"真缺陷"✗ vs"我的时间基准错位"✗）：
+                println!(
+                    "  [回跳] 我的 t={ms:.0}ms | 场景 t={:.3}s | 我的 t0 对应场景 t={:.3}s",
+                    h.scn.t(),
+                    h.scn.t() - (ms / 1000.0) as f32
+                );
             }
         }
     }

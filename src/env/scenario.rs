@@ -178,6 +178,14 @@ pub struct EnvScenario {
 }
 
 impl EnvScenario {
+    /// ★场景当前时间（秒）✓ —— 供测例做【双时间轴诊断】✓
+    /// （分辨"固件时间"与"场景时间"是否错位 ✗ —— 本会话第 14 次同类的防呆 ✓）。
+    pub fn t(&self) -> f32 {
+        self.t
+    }
+}
+
+impl EnvScenario {
     pub fn new(motion: Motion, perturb: Perturb, faults: Vec<FaultEvent>) -> Self {
         let n = faults.len();
         Self {
