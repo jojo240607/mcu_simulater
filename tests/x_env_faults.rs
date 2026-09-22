@@ -99,7 +99,7 @@ fn baro_step_bounded_by_gps() {
     // 【校准语义】虚拟时钟校准（VIRTUAL=172M，场景时间=固件时间）后按固件秒计。
     //
     // ⚠️ **2026-09-21 修正：原窗口 2.8s 采到的是过冲瞬态，不是稳态。**
-    // 用逐步探针实测（`zz_baro_probe`，13.3ms/步）：
+    // 用逐步探针实测（`zz_baro_probe`，4ms/步 ✓；2026-09-21 STEP_DT_MS 13.0→4.0 ✓）：
     //
     //   步     est_dz   est_vz   baro_dz  gps_dz(真值)
     //   209   -15.93    -7.68     15.00    -0.00   ← 原采样点(2.8s)，仍在过冲中
@@ -127,7 +127,7 @@ fn baro_step_bounded_by_gps() {
     let before = h.read_est().pos;
     let mut max_dev = 0.0f32;
     let mut worst_hz = 0.0f32;
-    // 检测 750 步（10s 场景=固件，13.3ms/步）——须覆盖过冲并到达稳态（见上）。
+    // 检测 750 步（10s 场景=固件，4ms/步 ✓）——须覆盖过冲并到达稳态（见上）。
     for _ in 0..750u32 {
         h.step();
         let e = h.read_est();
