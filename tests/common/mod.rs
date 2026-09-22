@@ -18,11 +18,16 @@ use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 /// 闭环步进 = 场景推进 `STEP_DT_MS` ms + 固件经 [`mcu_simulater::clock::McuClock`]
 /// 推进**同一** `STEP_DT_MS`（`run_ms` 按固件自身 SysTick 收敛）。
 ///
+/// ★**2026-09-21 更正**：原为 13.0 ✗ —— 那是【旧的 `run(字节预算)` 标定】遗留 ✓；
+/// 模拟器优化后固件实测控制拍 **249.7Hz（均值恰好 4.0000ms ✓**，见
+/// `zz_ctlprof::ctl_period_and_tick_cost` ✓）⇒ 步长改为 **4.0ms** ✓，
+/// 使 M 场与 H 场（dt=0.004 ✓）步率【完全一致】✓✓。
+///
 /// **不再用 `run(字节预算)` 表达时间**：字节预算是后端实现细节（实测同预算的
 /// bytes/ms 随代码块混合比在 100K~109K 之间浮动）。旧口径把 `2_300_000` 当成
 /// 「≈13.3ms 固件时间」，实测固件实走 **~21.5ms** → 固件比场景快 ~1.6×，
 /// 与 c62ec21 修的悬停路径是同类时钟失配（场景/固件时间错配 → EKF 积分漂）。
-pub const STEP_DT_MS: f32 = 13.0;
+pub const STEP_DT_MS: f32 = 4.0;
 /// 单步场景时间（秒）。
 pub const STEP_DT: f32 = STEP_DT_MS / 1000.0;
 
