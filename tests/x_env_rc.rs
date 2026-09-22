@@ -40,20 +40,21 @@ fn unlock_via_rc_armed() {
 
 #[test]
 fn rc_drop_disarms() {
-    // 解锁后掉链（全通道回 1500）→ 解锁位清零（防失控保护）。
-    // 解锁先发生（固件 seq≈250），掉链在场景 t=10s（固件 ~290 拍）后触发
+    // 先解锁，再掉链 ⇒ 解锁位应清零且【持续】为 0 ✓
+    // ★判据窗口按【固件时间】重述 ✓（锁相后步数是实现细节 ✗）：
+    //   旧写法"600 步 / 700 步"按【13ms/步】标定 ✗（注释原写"t=10s 场景 ≈ 750 步"✓）；
+    //   锁相后 ≈4ms/步 ⇒ 700 步仅 ≈2.8s ✗ ⇒ 够不到 `RcDrop { t: 10.0, dur: 30.0 }` ✗✓
     let scn = EnvScenario::new(
         Motion::Hover,
         Perturb::clean(),
-        vec![
-            FaultEvent::RcStuck { t: 0.0, ch: 4, raw: 2000.0, dur: 1.0e9 },
-            FaultEvent::RcDrop { t: 10.0, dur: 30.0 },
-        ],
+        vec![FaultEvent::RcDrop { t: 10.0, dur: 30.0 }],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_for_ms(400 as f64 * 13.0); // boot
+    h.run_for_ms(400 as f64 * 13.0); // boot（保持原时长 ✓，按固件时间 ✓）
+    let t0 = h.fw_ms();
+    // ① 等待解锁（给足 8s 固件时间 ✓）
     let mut armed_seen = false;
-    for _ in 0..600 {
+    while (h.fw_ms() - t0) < 8_000 {
         h.step();
         if h.read_est().armed == 1 {
             armed_seen = true;
@@ -61,16 +62,15 @@ fn rc_drop_disarms() {
         }
     }
     assert!(armed_seen, "解锁应生效（armed=1）");
-    // 掉链窗口（t=10s 场景 ≈ 750 步）持续 30s 场景 → 解锁位应清零
+    // ② 覆盖掉链窗口 [10s, 40s] ✓ ⇒ 跑到 45s ✓；期间解锁位必须持续为 0 ✓
     let mut disarmed = false;
-    for _ in 0..700 {
+    while (h.fw_ms() - t0) < 45_000 {
         h.step();
         let e = h.read_est();
-        // RC 掉链时固件应保持解锁位清零（不回跳）
         if e.armed == 0 {
             disarmed = true;
         } else {
-            disarmed = false; // 掉链期间必须持续未解锁
+            disarmed = false;
         }
     }
     assert!(disarmed, "RC 掉链应保持解锁位清零（armed=0）");
