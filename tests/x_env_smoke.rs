@@ -18,7 +18,7 @@ fn est_layout_probe() {
     let scn = EnvScenario::new(Motion::Hover, mcu_simulater::env::scenario::Perturb::clean(), vec![]);
     let mut h = EnvHarness::new(scn, true);
     // 跑 400 步（~2.7s 虚拟时间），EKF 应已稳定。
-    h.run_steps(400);
+    h.run_for_ms(400 as f64 * 13.0);
     let e = h.read_est();
     assert!(
         e.att_wxyz[0].abs() > 0.9,
@@ -43,7 +43,7 @@ fn est_layout_probe() {
     );
     // SENSOR_SEQ 持续推进
     let s1 = h.read_sensor_seq();
-    h.run_steps(50);
+    h.run_for_ms(50 as f64 * 13.0);
     let s2 = h.read_sensor_seq();
     assert!(s2 > s1, "SENSOR_SEQ 应持续推进（sensors 任务冻结？）：{s1} → {s2}");
     eprintln!("RESULT: layout ok, pos[2]={:.2} health={} sensor_seq {s1}→{s2}", e.pos[2], e.health);
@@ -56,7 +56,7 @@ fn hover_converges_stable() {
     let mut h = EnvHarness::new(scn, true);
 
     // 预热（解锁不必要，估计器独立于 armed；跑足让 EKF 收敛）
-    h.run_steps(450); // ~3s
+    h.run_for_ms(450 as f64 * 13.0); // ~3s
 
     // 收敛后连续采样 500 步（~3.4s）：断言误差全程有界、健康保持 Nominal、任务不冻结
     let mut worst_vel = 0.0f32;

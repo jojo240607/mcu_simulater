@@ -272,6 +272,33 @@ impl EnvHarness {
     /// （设计：控制 250Hz / **传感器 500Hz** ✓，见 flyctrl/app 的 mod.rs / sensors_task.rs ✓）
     /// 锁相后：时基由【固件自身】决定 ✓ ⇒ 250Hz/500Hz 自动正确 ✓，harness 不再假定 ✗
     /// ```
+    /// ★**按时间跑**（迁移后的首选 ✓）：持续 `step()` 直到【固件时间】走过 `ms` 毫秒 ✓。
+    ///
+    /// 为何用固件时间而非步数 ✓：锁相后每步对应固件的一拍控制（名义 4ms ✓），
+    /// 用时间表达 ⇒ **步数成为实现细节** ✓ ⇒ 测例不再依赖"每步多少 ms"的隐式假设 ✗
+    /// （这正是旧前提遗留问题 ✗：原来 `run_steps(N)` 隐含"13ms/步"✗）。
+    ///
+    /// 迁移映射 ✓（保持测例的**时间长度**不变 ✓，但时基改为固件 ✓）：
+    ///   `run_steps(N)`  →  `run_for_ms(N as f64 * 13.0)`   // 旧口径 N 步 ≈ N×13ms ✓
+    pub fn run_for_ms(&mut self, ms: f64) {
+        let target = ms;
+        let t0 = self.m.systick_ms();
+        let mut guard = 0u32;
+        while (self.m.systick_ms() - t0) as f64 + 4.0 < target {
+            self.step();
+            guard += 1;
+            assert!(
+                guard < 2_000_000,
+                "run_for_ms({ms}) 未在合理步数内达成（guard={guard}）—— 固件时钟异常？"
+            );
+        }
+    }
+
+    /// 按【秒】跑（同 `run_for_ms` ✓）
+    pub fn run_for_secs(&mut self, secs: f64) {
+        self.run_for_ms(secs * 1000.0);
+    }
+
     pub fn step(&mut self) {
         use mcu_simulater::clock::run_one_control_tick;
         // ② 固件推进恰好一拍控制（内部轮询固件符号 CTRL_TICKS ✓，不改固件行为 ✓）

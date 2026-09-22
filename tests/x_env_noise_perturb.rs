@@ -34,7 +34,7 @@ fn noise_robust_hover() {
         vec![],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(400); // 预热（fix + 收敛）
+    h.run_for_ms(400 as f64 * 13.0); // 预热（fix + 收敛）
     let (max_pos, max_vel, wh) = run_stats(&mut h, 500);
     assert!(max_pos < 3.0, "噪声下悬停位置应保持有界（<3m），实际 {max_pos:.2}m");
     assert!(max_vel < 1.0, "噪声下悬停速度应保持有界（<1m/s），实际 {max_vel:.2}m/s");
@@ -51,7 +51,7 @@ fn accel_bias_tolerated() {
         vec![],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(500);
+    h.run_for_ms(500 as f64 * 13.0);
     let (max_pos, max_vel, wh) = run_stats(&mut h, 500);
     // 【校准语义】校准后窗口按固件秒计（6.6s），恒定偏置积分达到稳态（~3.6 m/s）：
     // EKF 仅垂向零偏有状态（x[9]），水平偏置靠 GPS Doppler 速度（r_vel=0.3，消费级
@@ -81,7 +81,7 @@ fn gyro_bias_tolerated() {
         vec![],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(500); // 预热（fix + 收敛）
+    h.run_for_ms(500 as f64 * 13.0); // 预热（fix + 收敛）
     let mut max_tilt = 0.0f32;
     let mut ss_sum = 0.0f64;
     let mut ss_n = 0u32;
@@ -119,7 +119,7 @@ fn baro_drift_tolerated() {
         vec![],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(400);
+    h.run_for_ms(400 as f64 * 13.0);
     let (max_pos, _, wh) = run_stats(&mut h, 500);
     assert!(max_pos < 4.0, "气压温漂下高度估计应有界（<4m），实际 {max_pos:.2}m");
     assert_eq!(wh, 0, "气压温漂不应触发 FDIR（health={wh}）");
@@ -134,7 +134,7 @@ fn accel_bias_step_tolerated() {
         vec![],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(400);
+    h.run_for_ms(400 as f64 * 13.0);
     let (max_vel, _, wh) = run_stats(&mut h, 500);
     assert!(max_vel < 2.0, "加计偏置阶跃后速度应有界（<2m/s），实际 {max_vel:.2}m/s");
     assert_eq!(wh, 0, "加计偏置阶跃不应触发 FDIR（health={wh}）");

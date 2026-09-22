@@ -21,7 +21,7 @@ fn unlock_via_rc_armed() {
         vec![FaultEvent::RcStuck { t: 0.0, ch: 4, raw: 2000.0, dur: 1.0e9 }],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(400); // boot + RC 帧同步（固件 seq ~150）
+    h.run_for_ms(400 as f64 * 13.0); // boot + RC 帧同步（固件 seq ~150）
     let mut saw_armed = false;
     // 既有 x_flyctrl_unlock_flight 实测 armed 在固件 seq≈250（SBUS 20Hz 帧 + 锁存）
     // 置位。⚠️ 时钟前提已更正（2026-09-21：场景=固件 1:1，控制 249.7Hz）→
@@ -51,7 +51,7 @@ fn rc_drop_disarms() {
         ],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(400); // boot
+    h.run_for_ms(400 as f64 * 13.0); // boot
     let mut armed_seen = false;
     for _ in 0..600 {
         h.step();

@@ -24,7 +24,7 @@ fn imu_saturate_critical() {
         vec![FaultEvent::ImuSaturate { t: 1.0, fs: 2.0 }],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(70); // 预热 0.93s（fault t=1.0 前）
+    h.run_for_ms(70 as f64 * 13.0); // 预热 0.93s（fault t=1.0 前）
     let mut saw_critical = false;
     for _ in 0..300 {
         h.step();
@@ -47,7 +47,7 @@ fn imu_freeze_hover_no_false_positive() {
         vec![FaultEvent::ImuFreeze { t: 1.2 }],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(85); // 预热 1.13s（fault t=1.2 前）
+    h.run_for_ms(85 as f64 * 13.0); // 预热 1.13s（fault t=1.2 前）
     for _ in 0..300 {
         h.step();
         let e = h.read_est();
@@ -65,7 +65,7 @@ fn gps_drop_degraded_then_recover() {
         vec![FaultEvent::GpsDrop { t: 1.0, dur: 1.5 }],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(60); // 预热 0.8s（fault t=1.0 前，fix established）
+    h.run_for_ms(60 as f64 * 13.0); // 预热 0.8s（fault t=1.0 前，fix established）
     let mut saw_degraded = false;
     let mut degraded_step = 0u32;
     for s in 0..260u32 {
@@ -123,7 +123,7 @@ fn baro_step_bounded_by_gps() {
         vec![FaultEvent::BaroStep { t: 1.2, dalt: 15.0 }],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(80); // 预热 1.06s（fault t=1.2 前）
+    h.run_for_ms(80 as f64 * 13.0); // 预热 1.06s（fault t=1.2 前）
     let before = h.read_est().pos;
     let mut max_dev = 0.0f32;
     let mut worst_hz = 0.0f32;
@@ -170,7 +170,7 @@ fn gps_jump_rejected_by_baro() {
         vec![FaultEvent::GpsJump { t: 1.2, d: [0.0, 0.0, 25.0] }],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(80); // 预热 1.06s（fault t=1.2 前）
+    h.run_for_ms(80 as f64 * 13.0); // 预热 1.06s（fault t=1.2 前）
     let before = h.read_est().pos[2];
     let mut max_dev = 0.0f32;
     for _ in 0..210 {
@@ -193,7 +193,7 @@ fn baro_freeze_no_false_positive() {
         vec![FaultEvent::BaroFreeze { t: 1.2 }],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(80); // 预热 1.06s（fault t=1.2 前）
+    h.run_for_ms(80 as f64 * 13.0); // 预热 1.06s（fault t=1.2 前）
     for _ in 0..210 {
         h.step();
         let e = h.read_est();
@@ -212,7 +212,7 @@ fn mag_disturb_keeps_attitude() {
         vec![FaultEvent::MagDisturb { t: 2.0, bias: [0.2, 0.2, 0.1] }],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(120); // 预热 1.6s（fault t=2.0 前，EKF 收敛）
+    h.run_for_ms(120 as f64 * 13.0); // 预热 1.6s（fault t=2.0 前，EKF 收敛）
     let mut max_rp = 0.0f32;
     let mut health_ok = true;
     for _ in 0..250 {
@@ -242,7 +242,7 @@ fn mag_freeze_keeps_attitude() {
         vec![FaultEvent::MagFreeze { t: 2.0 }],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(120);
+    h.run_for_ms(120 as f64 * 13.0);
     let mut max_rp = 0.0f32;
     let mut health_ok = true;
     for _ in 0..250 {

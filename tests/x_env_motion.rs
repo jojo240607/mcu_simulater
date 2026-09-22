@@ -38,7 +38,7 @@ fn climb_height_tracks() {
     // 跟踪应单调正确。断言高度单调下降（NED 向下）且健康位正常。
     let scn = EnvScenario::new(Motion::Vertical { vel_up: 2.0 }, Perturb::clean(), vec![]);
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(400); // 预热（GPS fix + EKF 收敛）
+    h.run_for_ms(400 as f64 * 13.0); // 预热（GPS fix + EKF 收敛）
     let mut prev_pz = f32::NAN;
     let mut mon_dec = true;
     let mut alt_gain = 0.0f32;
@@ -73,7 +73,7 @@ fn cruise_velocity_tracks() {
     // 北向速度收敛到真值附近（GPS 观测生效），位置向北增长。
     let scn = EnvScenario::new(Motion::Cruise { vel_n: 3.0 }, Perturb::clean(), vec![]);
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(500); // 预热（GPS fix + Doppler 收敛）
+    h.run_for_ms(500 as f64 * 13.0); // 预热（GPS fix + Doppler 收敛）
     let mut vmax = 0.0f32;
     let mut vmin = 1e9f32;
     let mut moved = false;
@@ -102,7 +102,7 @@ fn oscillate_attitude_responds() {
     // （响应摆动而非冻结在水平）且不发散。
     let scn = EnvScenario::new(Motion::Oscillate { axis: 0, amp: 0.3, freq: 0.5 }, Perturb::clean(), vec![]);
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(500);
+    h.run_for_ms(500 as f64 * 13.0);
     let mut max_roll = 0.0f32;
     for _ in 0..400 {
         h.step();
@@ -142,7 +142,7 @@ fn turn_yaw_rate_tracks() {
     //   4) 位置沿圆周推进
     let scn = EnvScenario::new(Motion::Turn { radius: 20.0, rate: 0.5 }, Perturb::clean(), vec![]);
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(500);
+    h.run_for_ms(500 as f64 * 13.0);
     let mut omz_min = 1e9f32;
     let mut omz_max = 0.0f32;
     let mut prev_yaw = f32::NAN;

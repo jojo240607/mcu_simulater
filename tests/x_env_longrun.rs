@@ -15,7 +15,7 @@ fn long_hover_bounded_and_alive() {
         vec![],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(400); // 预热（fix + 收敛）
+    h.run_for_ms(400 as f64 * 13.0); // 预热（fix + 收敛）
     let seq0 = h.read_sensor_seq();
     let mut max_pos = 0.0f32;
     let mut max_vel = 0.0f32;
@@ -46,7 +46,7 @@ fn long_hover_bounded_and_alive() {
 fn long_cruise_converges_and_bounded() {
     let scn = EnvScenario::new(Motion::Cruise { vel_n: 3.0 }, Perturb::clean(), vec![]);
     let mut h = EnvHarness::new(scn, true);
-    h.run_steps(600); // 预热（fix + Doppler 收敛）
+    h.run_for_ms(600 as f64 * 13.0); // 预热（fix + Doppler 收敛）
     let mut vmin = 1e9f32;
     let mut vmax = 0.0f32;
     let mut pos_n = 0.0f32;
