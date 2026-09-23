@@ -187,6 +187,27 @@ fn eskf_diag_snapshot_from_firmware() {
         let o = 4 * (slot * 16 + i);
         f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
     };
+    // ★读【被拒/成功】的最新新息诊断（区分"量纲错"vs"门太紧" ✓）
+    for (sym, label) in [("ESKF_LAST_REJ", "最近被拒"), ("ESKF_LAST_OK", "最近成功")] {
+        let ad = mcu_simulater::elfsym::app_sym(sym) as u64;
+        let b = h.m.cpu.mem_read(ad, 16).expect("读诊断失败");
+        let f = |i: usize| f32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]]);
+        println!(
+            "  [{label}] residual = {:.4} · sigma = {:.4} · NIS = {:.3} · 次数 = {:.0}",
+            f(0), f(1), f(2), f(3)
+        );
+    }
+    // ★同时读【各通路计数】（判定"辅助观测是否真在生效"✓）
+    {
+        let c = mcu_simulater::elfsym::app_sym("ESKF_COUNTS") as u64;
+        let cb = h.m.cpu.mem_read(c, 48).expect("读 ESKF_COUNTS 失败");
+        let g = |i: usize| u32::from_le_bytes([cb[4*i], cb[4*i+1], cb[4*i+2], cb[4*i+3]]);
+        println!(
+            "\n[固件通路计数] step={} grav应用={} ★grav被门拒={} baro={}(拒{}) gps位={}(拒{}) gps速={}(拒{}) mag={}(拒{})",
+            g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7), g(8), g(9), g(10)
+        );
+        assert!(g(0) > 0, "step 计数为 0 ✗ ⇒ 适配器未被调用 ✗");
+    }
     println!("\n[固件侧多点快照] 4 个时刻 ✓");
     for slot in 0..4 {
         let n = f(slot, 15);
