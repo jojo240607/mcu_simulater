@@ -138,6 +138,7 @@ fn ctl_period_and_tick_cost() {
     let c0 = u32at(&mut m, CTRL_TICKS);
     let r0 = m.retired_count();
     let vs0 = m.virtual_sec();
+    let sseq0 = u32at(&mut m, SENSOR_SEQ);
     for _ in 0..STEPS {
         m.run_ms(4.0).unwrap();
     }
@@ -145,6 +146,7 @@ fn ctl_period_and_tick_cost() {
     let c1 = u32at(&mut m, CTRL_TICKS);
     let r1 = m.retired_count();
     let vs1 = m.virtual_sec();
+    let sseq1 = u32at(&mut m, SENSOR_SEQ);
 
     let fw_ms = (t1 - t0) as f64;
     let ticks = c1.wrapping_sub(c0) as f64;
@@ -165,6 +167,13 @@ fn ctl_period_and_tick_cost() {
         m.retired_count(),
         m.retired_count() as i64 - m.scb_cycles_in() as i64,
         m.scb_cycles_in() as f64 / (m.retired_count().max(1)) as f64,
+    );
+    // ★§5.118：传感器帧 : 控制拍 之比 ⇒ 应 ≈ 2:1（500Hz : 250Hz ✓）
+    // SENSOR_SEQ 每轮 +2（见本文件既有用法 ✓）⇒ 帧数 = Δ/2 ✓
+    let sframes = sseq1.wrapping_sub(sseq0) as f64 / 2.0;
+    println!(
+        "[ctl] 传感器帧 = {:.0} · 控制拍 = {:.0} · 比 = **{:.4}** （应 ≈ 2.0000 ✓）",
+        sframes, ticks, sframes / ticks.max(1.0)
     );
     // ★§5.112 三方对比 ✓：挂起设定次数 vs 溢出次数 vs ISR 进入次数（= systick_ms ✓）
     let (pset, ovf) = m.syst_diag_counts();
