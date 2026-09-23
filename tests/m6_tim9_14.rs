@@ -65,7 +65,11 @@ fn m6_tim9_14_mounted_and_tick() {
         write_u32(&mut m, base + OFF_CNT, 0);
         write_u32(&mut m, base + OFF_CR1, CR1_CEN);
     }
-    m.run_budget(50_000).unwrap();
+    // ★§5.115：TIM 现在吃【声明时钟折算流】（Δbytes × 210/239 ✓，见 `sim::timing`）
+    // ⇒ 要使 CNT 至少 +1，需 ≥ (PSC+1) = 65_536 个**基准周期** ⇒ 至少 65_536×239/210
+    //   ≈ 74_600 个退休字节 ✓。原 50_000 只给 43_933 基准周期 ⇒ **CNT 恒为 0** ✗
+    //（这是"按新事实补足预算"✓，测试**意图不变**：仍验证三个 TIM 随虚拟时钟推进 ✓）
+    m.run_budget(120_000).unwrap();
 
     for (name, base) in [("TIM9", TIM9_BASE), ("TIM12", TIM12_BASE), ("TIM14", TIM14_BASE)] {
         let cnt = read_u32(&mut m, base + OFF_CNT);
