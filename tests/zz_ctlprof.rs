@@ -61,7 +61,7 @@ const OUTER: [(usize, &str); 5] = [
 
 /// 内层相位名（PROBE[0] 段号），键 = 10 + 段号。
 /// 段号 0..=7 来自 `hil.rs`（step_hil 外层），8..=11 来自 `ekf.rs`（EKF::step 内层）。
-const INNER: [(usize, &str); 12] = [
+const INNER: [(usize, &str); 20] = [
     (10, "1.0 进入 step_hil -> IMU预处理完"),
     (11, "1.1 IMU预处理 -> 初始化门控完"),
     (12, "1.2 初始化门控 -> EKF::step 返回"),
@@ -73,7 +73,15 @@ const INNER: [(usize, &str); 12] = [
     (18, "  └ESKF step 进入"),
     (19, "  └ESKF predict 完成"),
     (20, "  └ESKF 重力辅助完成"),
-    (21, "  └ESKF 其余观测+组装完成"),
+    (21, "  └ESKF 空速检查后"),
+    (22, "  └ESKF GPS位更新前"),
+    (23, "  └ESKF GPS位更新后"),
+    (24, "  └ESKF GPS速更新后"),
+    (25, "  └ESKF 空速检查后"),
+    (29, "  └ESKF state() 前"),
+    (26, "  └step_hil 气压前"),
+    (27, "  └step_hil 气压后"),
+    (28, "  └step_hil 磁前"),
 ];
 
 fn u32at(m: &mut Machine, a: u64) -> u32 {
