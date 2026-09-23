@@ -187,6 +187,19 @@ fn eskf_diag_snapshot_from_firmware() {
         let o = 4 * (slot * 16 + i);
         f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
     };
+    // ★读【重力辅助三分支计数】+ 最近 dev/gn ⇒ 指名到支路 ✓
+    {
+        let gb = mcu_simulater::elfsym::app_sym("ESKF_GRAV_BRANCH") as u64;
+        let b = h.m.cpu.mem_read(gb, 12).expect("读 GRAV_BRANCH 失败");
+        let f = |i: usize| f32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]]);
+        let dv = mcu_simulater::elfsym::app_sym("ESKF_LAST_DEV") as u64;
+        let d = h.m.cpu.mem_read(dv, 8).expect("读 LAST_DEV 失败");
+        let g = |i: usize| f32::from_le_bytes([d[4*i], d[4*i+1], d[4*i+2], d[4*i+3]]);
+        println!(
+            "  [重力三分支] 退化 = {:.0} · ★门关 = {:.0} · 应用 = {:.0} ｜ 最近 dev = {:.4} m/s² (dev/g = {:.4})",
+            f(0), f(1), f(2), g(0), g(1)
+        );
+    }
     // ★读【被拒/成功】的最新新息诊断（区分"量纲错"vs"门太紧" ✓）
     for (sym, label) in [("ESKF_LAST_REJ", "最近被拒"), ("ESKF_LAST_OK", "最近成功")] {
         let ad = mcu_simulater::elfsym::app_sym(sym) as u64;
