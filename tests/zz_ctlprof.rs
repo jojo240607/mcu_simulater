@@ -61,7 +61,7 @@ const OUTER: [(usize, &str); 5] = [
 
 /// 内层相位名（PROBE[0] 段号），键 = 10 + 段号。
 /// 段号 0..=7 来自 `hil.rs`（step_hil 外层），8..=11 来自 `ekf.rs`（EKF::step 内层）。
-const INNER: [(usize, &str); 16] = [
+const INNER: [(usize, &str); 23] = [
     (8,  "  └ESKF step 进入"),
     (9,  "  └ESKF predict 完"),
     (10, "  └ESKF 重力完"),
@@ -78,6 +78,13 @@ const INNER: [(usize, &str); 16] = [
     (32, "S3 气压读完"),
     (33, "S4 GPS读完"),
     (34, "S5 RC读完"),
+    (40, "C40 控制段1"),
+    (41, "C41 控制段2"),
+    (42, "C42 控制段3"),
+    (43, "C43 控制段4"),
+    (44, "C44 控制段5"),
+    (45, "C45 控制段6"),
+    (46, "C46 控制段7"),
 ];
 
 fn u32at(m: &mut Machine, a: u64) -> u32 {
@@ -261,14 +268,19 @@ fn ctl_period_fine_resolution() {
 /// 故合成键 = 10 + 内层段号）。有 hook 开销，绝对值偏大，只看相对分布。
 #[test]
 fn ctl_phase_breakdown() {
-    const N: usize = 22;
-    #[derive(Default)]
+    const N: usize = 64; // ★提高容量（原 22 按旧 id 设置 ⇒ 新探针 30+/40+ 被丢 ✗）
     struct Acc {
         last_r: u64,
         last_key: usize,
         last_ticks: u32,
         ticks: u64,
         buckets: [u64; N],
+    }
+    // ★手工 Default（Rust 的数组 Default 只到 32 ✗ ⇒ 64 需手写 ✓）
+    impl Default for Acc {
+        fn default() -> Self {
+            Self { last_r: 0, last_key: 0, last_ticks: 0, ticks: 0, buckets: [0u64; N] }
+        }
     }
 
     let mut m = build();
