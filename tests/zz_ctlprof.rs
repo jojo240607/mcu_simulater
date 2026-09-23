@@ -51,12 +51,13 @@ fn bytes_per_ms_calibrated(retired: f64, fw_ms: f64) -> f64 {
 }
 
 /// 外层相位名（CTRL_PHASE 取值）。
-const OUTER: [(usize, &str); 5] = [
+const OUTER: [(usize, &str); 6] = [
     (0, "0 循环顶 -> 读完帧"),
     (1, "(1 读帧后，见内层)"),
     (2, "2 step_hil完 -> 设定点/PWM"),
     (3, "3 PWM写 -> PWM完"),
     (4, "4 PWM完 -> 拍末(含 delay_until)"),
+    (5, "5 读帧完 -> 设定点前"),
 ];
 
 /// 内层相位名（PROBE[0] 段号），键 = 10 + 段号。
