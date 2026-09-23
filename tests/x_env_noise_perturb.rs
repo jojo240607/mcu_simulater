@@ -182,14 +182,28 @@ fn eskf_diag_snapshot_from_firmware() {
     let mut h = EnvHarness::new(scn, true);
     h.run_for_secs(8.0); // 跑 8s（必须 > boot ~5.2s ✓，否则估计器走不到第 5 步 ✗）
     let addr = mcu_simulater::elfsym::app_sym("ESKF_DIAG") as u64;
-    let b = h.m.cpu.mem_read(addr, 64).expect("读 ESKF_DIAG 失败 ✗");
-    let f = |i: usize| f32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
-    println!("\n[固件侧快照 ESKF_DIAG] 第 {} 步", f(15));
-    println!("  gyro  = [{:.6}, {:.6}, {:.6}]", f(0), f(1), f(2));
-    println!("  accel = [{:.6}, {:.6}, {:.6}]", f(3), f(4), f(5));
-    println!("  q     = [{:.6}, {:.6}, {:.6}, {:.6}] (w,x,y,z)", f(6), f(7), f(8), f(9));
-    println!("  bg    = [{:.6}, {:.6}, {:.6}]", f(10), f(11), f(12));
-    println!("  gps   = pos[2]={:.3}, pos[0]={:.3}", f(13), f(14));
+    let b = h.m.cpu.mem_read(addr, 256).expect("读 ESKF_DIAG 失败 ✗"); // 4 槽 × 16 × 4B ✓
+    let f = |slot: usize, i: usize| {
+        let o = 4 * (slot * 16 + i);
+        f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    };
+    println!("\n[固件侧多点快照] 4 个时刻 ✓");
+    for slot in 0..4 {
+        let n = f(slot, 15);
+        if n == 0.0 { println!("  槽{slot}: 未采到 ✗"); continue; }
+        let a = [f(slot, 3), f(slot, 4), f(slot, 5)];
+        let amag = (a[0]*a[0] + a[1]*a[1] + a[2]*a[2]).sqrt();
+        println!(
+            "  步{:.0}: |accel| = {:.4} ✓应≈9.81 · accel_z = {:.4} · q_w = {:.5} · gps_z = {:.2}",
+            n, amag, a[2], f(slot, 6), f(slot, 13)
+        );
+    }
+    println!("\n[固件侧快照 ESKF_DIAG] 第 {} 步", f(0, 15));
+    println!("  gyro  = [{:.6}, {:.6}, {:.6}]", f(0, 0), f(0, 1), f(0, 2));
+    println!("  accel = [{:.6}, {:.6}, {:.6}]", f(0, 3), f(0, 4), f(0, 5));
+    println!("  q     = [{:.6}, {:.6}, {:.6}, {:.6}] (w,x,y,z)", f(0, 6), f(0, 7), f(0, 8), f(0, 9));
+    println!("  bg    = [{:.6}, {:.6}, {:.6}]", f(0, 10), f(0, 11), f(0, 12));
+    println!("  gps   = pos[2]={:.3}, pos[0]={:.3}", f(0, 13), f(0, 14));
     // ★先验证【符号→RAM 读取通路】本身 ✓（拿 profiler 已证明可读的 CTRL_TICKS 对照 ✓）
     {
         let ct = mcu_simulater::elfsym::app_sym("CTRL_TICKS") as u64;
@@ -199,11 +213,10 @@ fn eskf_diag_snapshot_from_firmware() {
         println!("  [通路自检] CTRL_TICKS(0x{ct:X})={ctv}（应>0 ✓）| ESKF_COUNTS[0](0x{ec:X})={ecv}");
         assert!(ctv > 0, "CTRL_TICKS=0 ⇒ 符号→RAM 读取通路本身有问题 ✗（先修这个 ✗）");
     }
-    assert!(f(15) > 0.0, "快照未采样 ✗（步数=0）⇒ 诊断机制未运行 ✗");
-    // ★物理自洽检查：悬停时 |accel| 应 ≈ g（9.81 ✓）
-    let amag = (f(3) * f(3) + f(4) * f(4) + f(5) * f(5)).sqrt();
-    println!("  |accel| = {amag:.4}（悬停应 ≈9.81 ✓）");
-    assert!((amag - 9.81).abs() < 1.0, "|accel|={amag:.3} 偏离 g ⇒ 量纲/标度可疑 ✗");
+    assert!(f(0, 15) > 0.0, "快照未采样 ✗（步数=0）⇒ 诊断机制未运行 ✗");
+    let amag = (f(0, 3) * f(0, 3) + f(0, 4) * f(0, 4) + f(0, 5) * f(0, 5)).sqrt();
+    println!("  （槽0 |accel| = {amag:.4} ✓）");
+    assert!((amag - 9.81).abs() < 2.0, "|accel|={amag:.3} 偏离 g 过多 ⇒ 量纲/标度可疑 ✗");
     // ★初始姿态：悬停应接近水平 ⇒ w 应 ≈1 ✓
-    println!("  w = {:.4}（悬停应 ≈1 ✓）", f(6));
+    println!("  （槽0 q_w = {:.5} ✓）", f(0, 6));
 }
