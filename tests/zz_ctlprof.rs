@@ -776,3 +776,27 @@ fn eskf_path_counts_after_knob_fix() {
     println!("  最近 dev = {:.4} m/s² · dev/g = {:.4}", fd(0), fd(1));
     assert!(g(0) > 0, "step 计数为 0 ✗");
 }
+
+/// ★★★**消融对照测真实绝对耗时**（§5.64 ✓，无 hook 干扰 ✓）
+/// 关掉一路 ⇒ 量整拍周期差 ⇒ 该路的【真实绝对耗时】✓（不用被 hook 放大的探针值 ✗）
+#[test]
+fn abl_absolute_cost_no_hook() {
+    fn set_knob(m: &mut Machine, sym: &str, v: f32) {
+        let a = flyctrl_sym(sym) as u64;
+        m.cpu.mem_write(a, &v.to_le_bytes()).unwrap();
+    }
+    let base = { let mut m = build(); boot(&mut m); measure_period(&mut m) };
+    println!("\n[消融·无hook] 基线 = {base:.3} ms/拍");
+    for (sym, label) in [
+        ("G_ESKF_GRAV_ON", "重力辅助"),
+        ("G_ESKF_BARO_ON", "气压"),
+        ("G_ESKF_MAG_ON", "磁"),
+        ("G_ESKF_GPS_ON", "GPS 位/速"),
+    ] {
+        let mut m = build();
+        boot(&mut m);
+        set_knob(&mut m, sym, 2.0); // ★显式关闭值 = 2.0 ✓（§5.52 ✓）
+        let p = measure_period(&mut m);
+        println!("  关掉 {label:<10}: {p:.3} ms/拍 ⇒ 该路真实耗时 ≈ {:.3} ms ✓", base - p);
+    }
+}
