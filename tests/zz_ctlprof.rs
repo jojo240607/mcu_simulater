@@ -755,3 +755,25 @@ fn measure_period(m: &mut Machine) -> f64 {
 fn flyctrl_sym(name: &str) -> u32 {
     mcu_simulater::elfsym::app_sym(name)
 }
+
+/// ★**读 ESKF 通路计数**（不走 EnvHarness ⇒ 不受锁相守卫影响 ✓）
+#[test]
+fn eskf_path_counts_after_knob_fix() {
+    let mut m = build();
+    boot(&mut m);
+    for _ in 0..750 {
+        m.run_ms(4.0).unwrap();
+    }
+    let c = flyctrl_sym("ESKF_COUNTS") as u64;
+    let b = m.cpu.mem_read(c, 48).expect("读 ESKF_COUNTS 失败");
+    let g = |i: usize| u32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]]);
+    println!(
+        "\n[通路计数·开关修复后] step={} grav应用={} grav门拒={} baro={}(拒{}) gps位={}(拒{}) gps速={}(拒{}) mag={}(拒{})",
+        g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7), g(8), g(9), g(10)
+    );
+    let dt = flyctrl_sym("ESKF_LAST_DEV") as u64;
+    let d = m.cpu.mem_read(dt, 8).unwrap();
+    let fd = |i: usize| f32::from_le_bytes([d[4*i], d[4*i+1], d[4*i+2], d[4*i+3]]);
+    println!("  最近 dev = {:.4} m/s² · dev/g = {:.4}", fd(0), fd(1));
+    assert!(g(0) > 0, "step 计数为 0 ✗");
+}
