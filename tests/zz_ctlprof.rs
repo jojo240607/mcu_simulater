@@ -708,3 +708,59 @@ fn usb_cost_envharness_turn() {
         println!("[env]   {:>3}..{:>3}: 无主机 {:>4} / 有主机 {:>4} 拍（{d:+.0}%）", i * 50, (i + 1) * 50, a, b);
     }
 }
+
+/// ★★★**消融法逐路测量**（2026-09-23，§5.36 ✓）——不依赖 profiler 语义 ✓
+///
+/// 做法 ✓：逐个把某一路观测【运行期关掉】（写固件内的静态开关 ✓，经 ELF 符号定位 ✓），
+/// 测同一场景下的【控制拍周期】✓ ⇒ 周期差 = 该路每拍耗时 ✓✓
+/// （最稳 ✓：每步只改一处、只测一个数 ✓）
+#[test]
+fn abl_which_path_costs_what() {
+    fn set_knob(m: &mut Machine, sym: &str, v: f32) {
+        let a = flyctrl_sym(sym) as u64;
+        m.cpu.mem_write(a, &v.to_le_bytes()).unwrap();
+    }
+    let cases = [
+        ("G_ESKF_GPS_ON", "GPS 位/速"),
+        ("G_ESKF_BARO_ON", "气压"),
+        ("G_ESKF_MAG_ON", "磁"),
+        ("G_ESKF_GRAV_ON", "重力辅助"),
+    ];
+    println!("\n[消融] 基线 vs 关掉某一路 ⇒ 控制拍周期");
+    // 基线
+    let base = {
+        let mut m = build();
+        boot(&mut m);
+        measure_period(&mut m)
+    };
+    println!("  {:>16}: {base:.3} ms/拍", "基线（全开）");
+    for (sym, label) in cases {
+        let mut m = build();
+        boot(&mut m);
+        let _ = &mut m;
+        set_knob(&mut m, sym, 0.0);
+        let p = measure_period(&mut m);
+        println!("  {:>16}: {p:.3} ms/拍  （省 {:.3} ms ✓）", label, base - p);
+    }
+}
+
+/// 测控制拍周期 ✓（★必须照 `ctl_period_and_tick_cost` 的写法：
+/// **750 次 `run_ms(4.0)`** ✗ —— 一次 `run_ms(3000)` 会让任务挨饿 ⇒ 只得 6 拍 ✗✓）
+fn measure_period(m: &mut Machine) -> f64 {
+    const STEPS: u32 = 750;
+    let t0 = systick(m);
+    let c0 = u32at(m, CTRL_TICKS);
+    for _ in 0..STEPS {
+        m.run_ms(4.0).unwrap();
+    }
+    let t1 = systick(m);
+    let c1 = u32at(m, CTRL_TICKS);
+    let fw_ms = (t1 - t0) as f64;
+    let ticks = c1.wrapping_sub(c0).max(1) as f64;
+    fw_ms / ticks
+}
+
+
+fn flyctrl_sym(name: &str) -> u32 {
+    mcu_simulater::elfsym::app_sym(name)
+}
