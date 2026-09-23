@@ -2423,6 +2423,17 @@ impl Machine {
             .unwrap_or(0)
     }
 
+    /// ★诊断（§5.112）：(挂起设定次数, 溢出次数) ✓ —— 与 `systick_ms()`（进入次数 ✓）三方对比 ✓。
+    pub fn syst_diag_counts(&self) -> (u32, u64) {
+        match &self.scb {
+            Some(s) => {
+                let g = s.lock().unwrap();
+                (g.syst_pending_sets(), g.syst_overflows())
+            }
+            None => (0, 0),
+        }
+    }
+
     /// ★诊断（§5.111）：SysTick RVR 写入次数与溢出时刻 RVR 极值 ✓。
     pub fn syst_load_stats(&self) -> (u32, u32, u32) {
         self.scb

@@ -166,6 +166,12 @@ fn ctl_period_and_tick_cost() {
         m.retired_count() as i64 - m.scb_cycles_in() as i64,
         m.scb_cycles_in() as f64 / (m.retired_count().max(1)) as f64,
     );
+    // ★§5.112 三方对比 ✓：挂起设定次数 vs 溢出次数 vs ISR 进入次数（= systick_ms ✓）
+    let (pset, ovf) = m.syst_diag_counts();
+    let entries = m.systick_ms();
+    println!(
+        "[ctl] 三方对比：挂起设定 = {pset} · 溢出 = {ovf} · ISR 进入 = {entries}          （应三者 ≈ 相等 ✓；谁多即暴露 ✓）"
+    );
     // ★§5.111：RVR 写入次数 + 溢出时刻 RVR 极值 ⇒ 区分"运行期 RVR ≠ 168_000"✗ vs "交付过发"✗
     let (lw, lmin, lmax) = m.syst_load_stats();
     println!(

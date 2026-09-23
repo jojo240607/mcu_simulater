@@ -89,6 +89,9 @@ pub struct SystemControl {
     /// ★溢出发生时**实际生效的 RVR 极值** ✓。
     ovf_load_min: u32,
     ovf_load_max: u32,
+    /// ★§5.112 诊断：`set_sys_pending(VECTOR_SYSTICK)` 的**调用次数** ✓
+    /// （与溢出次数、ISR 进入次数三方对比 ⇒ 定位过发在"设定"还是"交付" ✓）。
+    syst_pending_sets: u32,
     /// SysTick 活动标记（CTRL.ENABLE 置位，供 block hook 跳过未激活外设的加锁 tick）
     pub active: Arc<AtomicBool>,
 }
@@ -108,6 +111,7 @@ impl SystemControl {
             syst_load_writes: 0,
             ovf_load_min: u32::MAX,
             ovf_load_max: 0,
+            syst_pending_sets: 0,
             active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -127,6 +131,7 @@ impl SystemControl {
             syst_load_writes: 0,
             ovf_load_min: u32::MAX,
             ovf_load_max: 0,
+            syst_pending_sets: 0,
             active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -145,6 +150,7 @@ impl SystemControl {
             syst_load_writes: 0,
             ovf_load_min: u32::MAX,
             ovf_load_max: 0,
+            syst_pending_sets: 0,
             active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -153,6 +159,11 @@ impl SystemControl {
     /// （COUNTFLAG 置位 + TICKINT 使能时挂起 SysTick 异常 vector 15）。
     ///
     /// 硬件语义：CVR 每周期减 1，从 LOAD 递减到 0 共 LOAD+1 个周期后溢出并自动
+    /// ★诊断（§5.112）：挂起设定次数 / 溢出次数 ✓（与 ISR 进入次数三方对比 ✓）。
+    pub fn syst_pending_sets(&self) -> u32 {
+        self.syst_pending_sets
+    }
+
     /// ★诊断（§5.111）：(RVR 写入次数, 溢出时 RVR 最小值, 最大值) ✓。
     pub fn syst_load_stats(&self) -> (u32, u32, u32) {
         (self.syst_load_writes, self.ovf_load_min, self.ovf_load_max)
@@ -184,6 +195,8 @@ impl SystemControl {
         self.syst_ctrl |= SYST_COUNTFLAG;
         if self.syst_ctrl & SYST_TICKINT != 0 {
             if let Some(nvic) = &self.nvic {
+                // ★§5.112：计数"设定挂起"次数 ✓
+                self.syst_pending_sets = self.syst_pending_sets.saturating_add(1);
                 nvic.lock().unwrap().set_sys_pending(VECTOR_SYSTICK);
             }
         }
@@ -197,11 +210,16 @@ impl SystemControl {
         if l > self.ovf_load_max { self.ovf_load_max = l; }
         // 重算 CVR：溢出后每 period 周期再次溢出（挂起位幂等，仅需推进到最终位置）
         let rem = cycles - to_next;
+        // ★§5.113 修复：CVR **从 LOAD 往下减** ⇒ 回卷后已消耗 `rem` 个周期时，
+        //   剩下的值应是 `period - 1 - (rem % period)` ✓。
+        //   旧码写 `r - 1` ✗ —— **方向反了** ✗：回卷后把计数器置成 ≈0 ⇒ 立刻再次回卷
+        //   ⇒ 溢出数被灌水 39× ✗（实测 39_212 次溢出 vs 应 ≈1000 ✓）
+        //   ⇒ 进而使"固件 ms"口径失真 ✗（锁相守卫因此失败 ✗）。
+        //   （`rem % period == 0` 时 = `period - 1` = `syst_load` ✓，与原分支一致 ✓）
         self.syst_val = if period == 0 {
             0
         } else {
-            let r = rem % period;
-            if r == 0 { self.syst_load as u64 } else { r - 1 }
+            period - 1 - (rem % period)
         };
     }
 }
