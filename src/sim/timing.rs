@@ -142,3 +142,15 @@ pub const VIRTUAL_INSNS_PER_SEC: f32 = RETIRED_BYTES_PER_MS as f32 * 1000.0;
 /// 改用 `Machine::run_ms(4.0)` 后固件时钟与场景 **1:1**（`x_sensor_rate.rs` 实测
 /// 比值 1.002），12s 持续悬停末段 |dz| 由 0.305m 收紧到 0.223m。
 pub const RETIRED_BYTES_PER_MS: usize = 95_600;
+
+/// ★定时器周期流的换算（§5.100 修复 #2）：定时器模型以「**84MHz 基准周期**」为输入
+/// （内部再按 `clk_hz / 84e6` 缩放，见 `peripheral::timer::tick`）。因此每个退休字节
+/// 应折算 `84_000 / RETIRED_BYTES_PER_MS`（= **210/239**）个基准周期，使
+/// **1 固件 ms（= `RETIRED_BYTES_PER_MS` 字节）恰为 84_000 基准周期 = 84MHz** ✓。
+///
+/// 修复前 ✗：定时器直接收到 `Δ退休字节`（= 1 字节 1 周期）⇒ 实际速率 = 仿真器字节流
+/// 速率（实测 ≈88_889 周期/固件ms ✗）⇒ 与板级声明 84_000/ms 差 +5.8% ✗，
+/// 且**随代码构成浮动** ⇒ 这正是"相位漂移 / 代码布局敏感"的根 ✓。
+pub const TIMER_CYC84_PER_BYTE_NUM: u64 = 84_000;
+/// 分母（与 [`RETIRED_BYTES_PER_MS`] 同源 ⇒ 两者不会再次分叉 ✓）。
+pub const TIMER_CYC84_PER_BYTE_DEN: u64 = RETIRED_BYTES_PER_MS as u64;

@@ -2032,6 +2032,10 @@ impl Machine {
         });
         // 数据 hook 安装标记：MPU 首次使能且未安装时停机一次，交 run() 懒安装
         let dh_installed = self.data_hook_installed.clone();
+        // ★定时器周期流的余数累加器（§5.100 #2）：`Δ字节 × 210/239` 的截断余数
+        // 逐块累积 ⇒ 长期精确、无截断漂移 ✓。置于闭包外并随 move 捕获
+        //（block hook 是 `move` 闭包，拿不到 `self` ✗）。
+        let timer_frac = std::cell::Cell::new(0u64);
         self.cpu.add_block_hook(1, 0, move |uc, _addr, size| {
             // 热路径单次原子 load，按位测试 MPU/外设激活/看门狗/中断挂起四个低频标志
             //（bench_probe：H2 独立原子 37.8 → H12 单状态字 115.1 MIPS）
@@ -2070,13 +2074,20 @@ impl Machine {
             // 与新口径不矛盾——当前生效的是「访客字节 = 虚拟周期」。
             let cycles = size as u64;
             clock.advance(cycles);
+            // ★定时器周期流（§5.100 #2 修复）：按【声明时钟 84MHz 基准】折算，
+            //   而不是直接用退休字节数 ✗（那会让定时器速率=仿真器吞吐 ⇒ 随代码浮动 ✗）。
+            //   余数累加 ⇒ 长期精确 ✓。
+            let cyc_acc = timer_frac.get()
+                + size as u64 * crate::sim::timing::TIMER_CYC84_PER_BYTE_NUM;
+            let timer_cycles = cyc_acc / crate::sim::timing::TIMER_CYC84_PER_BYTE_DEN;
+            timer_frac.set(cyc_acc % crate::sim::timing::TIMER_CYC84_PER_BYTE_DEN);
             // 快路径：BIT_ANY_ACTIVE 由外设区 MMIO 写置位（外设激活只可能发生在 MMIO 写，
             // 见 attach_peripherals 的 TICK_REGIONS 判定），block hook 免去每块全扫
             // ~20 个 active 标记（bench_probe：H10 actives 7→20，MIPS 57.9→34.7）。
             if s & BIT_ANY_ACTIVE != 0 {
                 for (t, a) in cold.timers.iter().zip(cold.tick_actives.iter()) {
                     if a.load(Ordering::Relaxed) {
-                        t.lock().unwrap().tick(cycles);
+                        t.lock().unwrap().tick(timer_cycles);
                     }
                 }
             }
