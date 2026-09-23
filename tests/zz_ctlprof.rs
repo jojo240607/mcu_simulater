@@ -138,7 +138,7 @@ fn ctl_period_and_tick_cost() {
     let c0 = u32at(&mut m, CTRL_TICKS);
     let r0 = m.retired_count();
     let vs0 = m.virtual_sec();
-    let sseq0 = u32at(&mut m, SENSOR_SEQ);
+    let sseq0 = u32at(&mut m, sensor_seq_addr());
     for _ in 0..STEPS {
         m.run_ms(4.0).unwrap();
     }
@@ -146,7 +146,7 @@ fn ctl_period_and_tick_cost() {
     let c1 = u32at(&mut m, CTRL_TICKS);
     let r1 = m.retired_count();
     let vs1 = m.virtual_sec();
-    let sseq1 = u32at(&mut m, SENSOR_SEQ);
+    let sseq1 = u32at(&mut m, sensor_seq_addr());
 
     let fw_ms = (t1 - t0) as f64;
     let ticks = c1.wrapping_sub(c0) as f64;
@@ -409,7 +409,11 @@ fn ctl_phase_breakdown() {
 
 /// 固件 RTOS 毫秒计数器（joc-base `g_tick`，RTOS_TICK_HZ=1000）。
 const G_TICK: u64 = 0x100063B4;
-const SENSOR_SEQ: u64 = 0x200116DC;
+/// ★§5.120：从 **ELF 符号表**解析（**不再硬编码地址** ✗ —— 重建会移动符号 ⇒
+/// 硬编码地址会**静默读到无关位置** ✗，制造"0 帧"这类**仪器假象** ✗，见 §5.118/§5.119 ✓）。
+fn sensor_seq_addr() -> u64 {
+    mcu_simulater::elfsym::app_sym("SENSOR_SEQ") as u64
+}
 
 /// 控制/传感器任务的**真实运行频率**。
 ///
@@ -433,7 +437,7 @@ fn task_rates_and_periods() {
     let t0 = systick(&m);
     let r0 = m.retired_count();
     let c0 = u32at(&mut m, CTRL_TICKS);
-    let q0 = u32at(&mut m, SENSOR_SEQ);
+    let q0 = u32at(&mut m, sensor_seq_addr());
 
     // 1ms 粒度采样：记录每次 CTRL_TICKS / SENSOR_SEQ(每轮+2) 变化时经过的固件毫秒
     let mut hist_ctrl = [0u32; 24];
@@ -454,7 +458,7 @@ fn task_rates_and_periods() {
             last_c = c;
             last_ct = t;
         }
-        let q = u32at(&mut m, SENSOR_SEQ);
+        let q = u32at(&mut m, sensor_seq_addr());
         if q.wrapping_sub(last_q) >= 2 {
             let d = t.wrapping_sub(last_qt) as usize;
             if d < hist_sen.len() {
@@ -467,7 +471,7 @@ fn task_rates_and_periods() {
     let fw_ms = (systick(&m) - t0) as f64;
     let retired = (m.retired_count() - r0) as f64;
     let ctrl = last_c.wrapping_sub(c0) as f64;
-    let sen = u32at(&mut m, SENSOR_SEQ).wrapping_sub(q0) as f64 / 2.0;
+    let sen = u32at(&mut m, sensor_seq_addr()).wrapping_sub(q0) as f64 / 2.0;
 
     println!(
         "[rates] 窗口 {fw_ms:.0}ms | 控制 {ctrl:.0} 拍 -> {:.2} Hz（标称 250.0，周期 {:.3}ms）",
@@ -522,14 +526,14 @@ fn task_rates_light() {
     let t0 = systick(&m);
     let r0 = m.retired_count();
     let c0 = u32at(&mut m, CTRL_TICKS);
-    let q0 = u32at(&mut m, SENSOR_SEQ);
+    let q0 = u32at(&mut m, sensor_seq_addr());
     while ((systick(&m) - t0) as u32) < MS {
         m.run_ms(1.0).unwrap();
     }
     let fw = (systick(&m) - t0) as f64;
     let retired = (m.retired_count() - r0) as f64;
     let c = u32at(&mut m, CTRL_TICKS).wrapping_sub(c0) as f64;
-    let q = u32at(&mut m, SENSOR_SEQ).wrapping_sub(q0) as f64 / 2.0;
+    let q = u32at(&mut m, sensor_seq_addr()).wrapping_sub(q0) as f64 / 2.0;
     println!(
         "[rates-light] 窗口 {fw:.0}ms | 控制 {} 拍 -> {:.2}Hz（周期 {:.3}ms） | sensors {} 轮 -> {:.2}Hz（周期 {:.3}ms） | CPU {:.1}%",
         c as u32,
@@ -569,7 +573,7 @@ fn task_rates_with_usb_host() {
     let t0 = systick(&m);
     let r0 = m.retired_count();
     let c0 = u32at(&mut m, CTRL_TICKS);
-    let q0 = u32at(&mut m, SENSOR_SEQ);
+    let q0 = u32at(&mut m, sensor_seq_addr());
     let mut drained_total = 0usize;
     while ((systick(&m) - t0) as u32) < MS {
         m.run_ms(1.0).unwrap();
@@ -580,7 +584,7 @@ fn task_rates_with_usb_host() {
     let fw = (systick(&m) - t0) as f64;
     let retired = (m.retired_count() - r0) as f64;
     let c = u32at(&mut m, CTRL_TICKS).wrapping_sub(c0) as f64;
-    let q = u32at(&mut m, SENSOR_SEQ).wrapping_sub(q0) as f64 / 2.0;
+    let q = u32at(&mut m, sensor_seq_addr()).wrapping_sub(q0) as f64 / 2.0;
     println!(
         "[rates-usbhost] 窗口 {fw:.0}ms | 控制 {} 拍 -> {:.2}Hz（{:.3}ms） | sensors {} 轮 -> {:.2}Hz（{:.3}ms） | CPU {:.1}% | 下行取走 {} 字节",
         c as u32,
@@ -634,7 +638,7 @@ fn usb_path_cost_attribution() {
         let t0 = systick(&m);
         let r0 = m.retired_count();
         let c0 = u32at(&mut m, CTRL_TICKS);
-        let q0 = u32at(&mut m, SENSOR_SEQ);
+        let q0 = u32at(&mut m, sensor_seq_addr());
 
         for step in 0..STEPS {
             if step == HOST_START {
@@ -665,7 +669,7 @@ fn usb_path_cost_attribution() {
         let fw_ms = (systick(&m) - t0) as f64;
         let retired = (m.retired_count() - r0) as f64;
         let ctrl = u32at(&mut m, CTRL_TICKS).wrapping_sub(c0) as f64;
-        let sensors = u32at(&mut m, SENSOR_SEQ).wrapping_sub(q0) as f64 / 2.0;
+        let sensors = u32at(&mut m, sensor_seq_addr()).wrapping_sub(q0) as f64 / 2.0;
         let usb_irqs = m
             .vec_entries()
             .iter()
