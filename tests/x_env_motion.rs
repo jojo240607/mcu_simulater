@@ -46,8 +46,10 @@ fn climb_height_tracks() {
         let e = h.read_est();
         e.pos[2]
     };
-    let _t0 = h.scn.t() as f64;
-        while (h.scn.t() as f64) - _t0 < (300 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+        while h.fw_ms() - _t0 < (300 * 13) {
         h.step();
         let e = h.read_est();
         if prev_pz.is_finite() {
@@ -78,8 +80,10 @@ fn cruise_velocity_tracks() {
     let mut vmax = 0.0f32;
     let mut vmin = 1e9f32;
     let mut moved = false;
-    let _t0 = h.scn.t() as f64;
-        while (h.scn.t() as f64) - _t0 < (200 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+        while h.fw_ms() - _t0 < (200 * 13) {
         h.step();
         let e = h.read_est();
         vmax = vmax.max(e.vel[0]);
@@ -106,8 +110,10 @@ fn oscillate_attitude_responds() {
     let mut h = EnvHarness::new(scn, true);
     h.run_for_ms(500 as f64 * 13.0);
     let mut max_roll = 0.0f32;
-    let _t0 = h.scn.t() as f64;
-        while (h.scn.t() as f64) - _t0 < (400 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+        while h.fw_ms() - _t0 < (400 * 13) {
         h.step();
         let e = h.read_est();
         let eu = e.euler();
@@ -153,8 +159,10 @@ fn turn_yaw_rate_tracks() {
     let mut pos_norm = 0.0f32;
     let mut max_roll = 0.0f32;
     let mut max_om_err = 0.0f32;
-    let _t0 = h.scn.t() as f64;
-        while (h.scn.t() as f64) - _t0 < (200 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+        while h.fw_ms() - _t0 < (200 * 13) {
         h.step();
         let e = h.read_est();
         let eu = e.euler();

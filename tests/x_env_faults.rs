@@ -26,8 +26,10 @@ fn imu_saturate_critical() {
     let mut h = EnvHarness::new(scn, true);
     h.run_for_ms(70 as f64 * 13.0); // 预热 0.93s（fault t=1.0 前）
     let mut saw_critical = false;
-    let _t0 = h.scn.t() as f64;
-    while (h.scn.t() as f64) - _t0 < (300 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+    while h.fw_ms() - _t0 < (300 * 13) {
         h.step();
         let e = h.read_est();
         if e.health == 2 {
@@ -49,8 +51,10 @@ fn imu_freeze_hover_no_false_positive() {
     );
     let mut h = EnvHarness::new(scn, true);
     h.run_for_ms(85 as f64 * 13.0); // 预热 1.13s（fault t=1.2 前）
-    let _t0 = h.scn.t() as f64;
-    while (h.scn.t() as f64) - _t0 < (300 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+    while h.fw_ms() - _t0 < (300 * 13) {
         h.step();
         let e = h.read_est();
         assert!(e.health == 0, "悬停中 IMU 冻结（幅值合理）不应误报，health={}", e.health);
@@ -83,8 +87,10 @@ fn gps_drop_degraded_then_recover() {
     // 恢复窗口（fault 1.0-2.5s；GPS 样本保持 500ms 延迟 + FDIR 40 拍 → 降级约
     // 1.7s，恢复约 2.7s）：检测循环 260 步（3.46s）内应已见恢复，额外 150 步兜底。
     let mut recovered = false;
-    let _t0 = h.scn.t() as f64;
-    while (h.scn.t() as f64) - _t0 < (150 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+    while h.fw_ms() - _t0 < (150 * 13) {
         h.step();
         let e = h.read_est();
         if e.health == 0 {
@@ -178,8 +184,10 @@ fn gps_jump_rejected_by_baro() {
     h.run_for_ms(80 as f64 * 13.0); // 预热 1.06s（fault t=1.2 前）
     let before = h.read_est().pos[2];
     let mut max_dev = 0.0f32;
-    let _t0 = h.scn.t() as f64;
-    while (h.scn.t() as f64) - _t0 < (210 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+    while h.fw_ms() - _t0 < (210 * 13) {
         h.step();
         let e = h.read_est();
         max_dev = max_dev.max((e.pos[2] - before).abs());
@@ -200,8 +208,10 @@ fn baro_freeze_no_false_positive() {
     );
     let mut h = EnvHarness::new(scn, true);
     h.run_for_ms(80 as f64 * 13.0); // 预热 1.06s（fault t=1.2 前）
-    let _t0 = h.scn.t() as f64;
-    while (h.scn.t() as f64) - _t0 < (210 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+    while h.fw_ms() - _t0 < (210 * 13) {
         h.step();
         let e = h.read_est();
         assert!(e.health == 0, "气压计冻结（有读数）不应触发 FDIR，health={}", e.health);
@@ -222,8 +232,10 @@ fn mag_disturb_keeps_attitude() {
     h.run_for_ms(120 as f64 * 13.0); // 预热 1.6s（fault t=2.0 前，EKF 收敛）
     let mut max_rp = 0.0f32;
     let mut health_ok = true;
-    let _t0 = h.scn.t() as f64;
-    while (h.scn.t() as f64) - _t0 < (250 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+    while h.fw_ms() - _t0 < (250 * 13) {
         h.step();
         let e = h.read_est();
         let rp = e.euler();
@@ -253,8 +265,10 @@ fn mag_freeze_keeps_attitude() {
     h.run_for_ms(120 as f64 * 13.0);
     let mut max_rp = 0.0f32;
     let mut health_ok = true;
-    let _t0 = h.scn.t() as f64;
-    while (h.scn.t() as f64) - _t0 < (250 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+    while h.fw_ms() - _t0 < (250 * 13) {
         h.step();
         let e = h.read_est();
         let rp = e.euler();

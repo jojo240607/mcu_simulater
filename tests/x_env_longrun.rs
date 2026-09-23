@@ -21,8 +21,10 @@ fn long_hover_bounded_and_alive() {
     let mut max_vel = 0.0f32;
     let mut last_adv = 0u32; // SENSOR_SEQ 冻结窗口
     let mut last_seq = seq0;
-    let _t0 = h.scn.t() as f64;
-    while (h.scn.t() as f64) - _t0 < (1600 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+    while h.fw_ms() - _t0 < (1600 * 13) {
         h.step();
         let e = h.read_est();
         max_pos = max_pos.max((e.pos[0].powi(2) + e.pos[1].powi(2) + e.pos[2].powi(2)).sqrt());
@@ -51,8 +53,10 @@ fn long_cruise_converges_and_bounded() {
     let mut vmin = 1e9f32;
     let mut vmax = 0.0f32;
     let mut pos_n = 0.0f32;
-    let _t0 = h.scn.t() as f64;
-    while (h.scn.t() as f64) - _t0 < (800 as f64 * 0.013) {
+    // ★§5.123：观察窗改用【固件毫秒】口径 ✓（原 `scn.t()` 假定 13ms/步 ✗，
+    // 实际每步 = 一个控制拍 ≈4ms ⇒ 窗口只有原意 1/3.25 ✗，见 §5.122 ✓）
+    let _t0 = h.fw_ms();
+    while h.fw_ms() - _t0 < (800 * 13) {
         h.step();
         let e = h.read_est();
         vmin = vmin.min(e.vel[0]);
