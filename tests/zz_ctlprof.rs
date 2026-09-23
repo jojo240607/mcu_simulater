@@ -755,6 +755,11 @@ fn flyctrl_sym(name: &str) -> u32 {
     mcu_simulater::elfsym::app_sym(name)
 }
 
+/// 符号是否存在（容错查找 ✓；`app_sym` 对缺失会 panic ✗）
+fn flyctrl_sym_exists(name: &str) -> bool {
+    mcu_simulater::elfsym::try_app_sym(name).is_some()
+}
+
 /// ★**读 ESKF 通路计数**（不走 EnvHarness ⇒ 不受锁相守卫影响 ✓）
 #[test]
 fn eskf_path_counts_after_knob_fix() {
@@ -799,4 +804,45 @@ fn abl_absolute_cost_no_hook() {
         let p = measure_period(&mut m);
         println!("  关掉 {label:<10}: {p:.3} ms/拍 ⇒ 该路真实耗时 ≈ {:.3} ms ✓", base - p);
     }
+}
+
+/// ★★★**按符号区间桶计退休字节**（§5.69 ✓）—— 一次列出"谁在吃字节"✓
+/// 法：对每个关心的函数符号，挂一个 [sym, sym+len) 的 block hook，累加 `size` ✓
+#[test]
+fn addr_bucketed_retired_bytes() {
+    use std::sync::atomic::{AtomicU64, Ordering as O};
+    let names = [
+        ("control_entry", 0x4000usize),
+        ("sensors_entry", 0x4000),
+        ("step_hil", 0x4000),
+        ("update_gravity", 0x2000),
+        ("update_gps_pos", 0x2000),
+        ("update_mag", 0x2000),
+        ("update_baro", 0x2000),
+        ("predict", 0x4000),
+    ];
+    let mut m = build();
+    boot(&mut m);
+    let cnt: Vec<std::sync::Arc<AtomicU64>> =
+        (0..names.len()).map(|_| std::sync::Arc::new(AtomicU64::new(0))).collect();
+    for (i, (sym, len)) in names.iter().enumerate() {
+        if !flyctrl_sym_exists(sym) { println!("  [跳过] 符号不存在: {sym}"); continue; }
+        let a = flyctrl_sym(sym) as u64;
+        let c = cnt[i].clone();
+        // 允许多个 hook 区间重叠；精确性以"落在哪个区间"为准 ✓
+        let _ = m.cpu.raw().add_block_hook(a, a + *len as u64, move |_uc, _addr, size| {
+            c.fetch_add(size as u64, O::Relaxed);
+        });
+    }
+    for _ in 0..500 {
+        m.run_ms(4.0).unwrap();
+    }
+    let total: u64 = cnt.iter().map(|c| c.load(O::Relaxed)).sum();
+    println!("\n[按符号桶计] 500 拍 · 区间内退休总量 = {total} 字节");
+    let mut rows: Vec<_> = names.iter().zip(cnt.iter()).map(|((n, _), c)| (*n, c.load(O::Relaxed))).collect();
+    rows.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+    for (n, v) in rows {
+        println!("  {n:<18} {v:>12} 字节  ({:.1}%)", 100.0 * v as f64 / total.max(1) as f64);
+    }
+    assert!(total > 0, "区间内退休量为 0 ✗ ⇒ 符号地址解析或 hook 未生效 ✗");
 }

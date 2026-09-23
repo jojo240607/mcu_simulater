@@ -145,6 +145,14 @@ fn all() -> &'static Vec<ElfSym> {
 ///
 /// 查不到时 panic——这是测试脚手架的错误（固件改动使符号消失/改名），
 /// 应在测试里立刻暴露，而不是静默用 0 地址读到垃圾。
+/// 容错版 `app_sym`：符号不存在时返回 `None` ✓（供"按区间桶计"等场景 ✓）
+pub fn try_app_sym(needle: &str) -> Option<u32> {
+    if let Some((a, _)) = cache().lock().unwrap().get(needle) {
+        return Some(*a);
+    }
+    all().iter().find(|s| s.name.contains(needle) && s.addr != 0).map(|s| s.addr)
+}
+
 pub fn app_sym(needle: &str) -> u32 {
     if let Some((a, _)) = cache().lock().unwrap().get(needle) {
         return *a;
