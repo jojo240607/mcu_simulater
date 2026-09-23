@@ -174,3 +174,36 @@ fn eskf_adapter_counters_in_firmware() {
     assert!(n_step > 0, "ESKF_COUNTS[0] (n_step) = 0 ✗ ⇒ 计数器未生效/适配器未被调用 ✗");
     println!("  ✓ 计数器有效（n_step={n_step}）✓");
 }
+
+/// ★★**读固件侧诊断快照**（§5.43 ✓）——与 H 场同刻对比，定位环境差异 ✓
+#[test]
+fn eskf_diag_snapshot_from_firmware() {
+    let scn = EnvScenario::new(Motion::Hover, Perturb::clean(), vec![]);
+    let mut h = EnvHarness::new(scn, true);
+    h.run_for_secs(8.0); // 跑 8s（必须 > boot ~5.2s ✓，否则估计器走不到第 5 步 ✗）
+    let addr = mcu_simulater::elfsym::app_sym("ESKF_DIAG") as u64;
+    let b = h.m.cpu.mem_read(addr, 64).expect("读 ESKF_DIAG 失败 ✗");
+    let f = |i: usize| f32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+    println!("\n[固件侧快照 ESKF_DIAG] 第 {} 步", f(15));
+    println!("  gyro  = [{:.6}, {:.6}, {:.6}]", f(0), f(1), f(2));
+    println!("  accel = [{:.6}, {:.6}, {:.6}]", f(3), f(4), f(5));
+    println!("  q     = [{:.6}, {:.6}, {:.6}, {:.6}] (w,x,y,z)", f(6), f(7), f(8), f(9));
+    println!("  bg    = [{:.6}, {:.6}, {:.6}]", f(10), f(11), f(12));
+    println!("  gps   = pos[2]={:.3}, pos[0]={:.3}", f(13), f(14));
+    // ★先验证【符号→RAM 读取通路】本身 ✓（拿 profiler 已证明可读的 CTRL_TICKS 对照 ✓）
+    {
+        let ct = mcu_simulater::elfsym::app_sym("CTRL_TICKS") as u64;
+        let ec = mcu_simulater::elfsym::app_sym("ESKF_COUNTS") as u64;
+        let ctv = u32::from_le_bytes(h.m.cpu.mem_read(ct, 4).unwrap().try_into().unwrap());
+        let ecv = u32::from_le_bytes(h.m.cpu.mem_read(ec, 4).unwrap().try_into().unwrap());
+        println!("  [通路自检] CTRL_TICKS(0x{ct:X})={ctv}（应>0 ✓）| ESKF_COUNTS[0](0x{ec:X})={ecv}");
+        assert!(ctv > 0, "CTRL_TICKS=0 ⇒ 符号→RAM 读取通路本身有问题 ✗（先修这个 ✗）");
+    }
+    assert!(f(15) > 0.0, "快照未采样 ✗（步数=0）⇒ 诊断机制未运行 ✗");
+    // ★物理自洽检查：悬停时 |accel| 应 ≈ g（9.81 ✓）
+    let amag = (f(3) * f(3) + f(4) * f(4) + f(5) * f(5)).sqrt();
+    println!("  |accel| = {amag:.4}（悬停应 ≈9.81 ✓）");
+    assert!((amag - 9.81).abs() < 1.0, "|accel|={amag:.3} 偏离 g ⇒ 量纲/标度可疑 ✗");
+    // ★初始姿态：悬停应接近水平 ⇒ w 应 ≈1 ✓
+    println!("  w = {:.4}（悬停应 ≈1 ✓）", f(6));
+}
