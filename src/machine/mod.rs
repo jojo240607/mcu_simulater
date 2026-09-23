@@ -59,6 +59,12 @@ struct BlockHookCold {
     mpu: Arc<Mutex<Mpu>>,
     nvic: Arc<Mutex<Nvic>>,
     timers: Vec<Arc<Mutex<dyn Peripheral>>>,
+    /// ★§5.102 ④：与该 `timers` 平行的标记 —— `true` = 该外设吃【原始字节流】
+    /// （**SCB/SysTick** ✓：其 RVR=168_000 就是"1 固件ms = 168_000 周期"的定义 ✓）；
+    /// `false` = TIM ✓，改吃【声明时钟折算流】（84MHz 基准 ✓）。
+    /// ★用 **Arc 指针同一性**判定（不用 `name()` ✗，避免逐设备加锁 ✗ —— 上一版
+    /// 用名称映射时该用例从 17s 变成 >640s ✗，见 §5.103）。
+    tick_raw: Vec<bool>,
     tick_actives: Vec<Arc<AtomicBool>>,
     /// 退休指令计数（block hook 每块累加 TB 字节≈Thumb 指令数×2；run() 按此递减预算）
     retired: Arc<AtomicU64>,
@@ -2027,6 +2033,19 @@ impl Machine {
             nvic: self.nvic.clone(),
             // 冻结时钟外设列表：所有外设已挂载，转成 Vec，block hook 免每块加锁
             //（bench_probe：H4 每块 timers.lock() 28.8 → H5 冻结无锁 47.3 MIPS）
+            // ★§5.102 ④：按 **Arc 指针同一性**标出"吃原始流"的外设（只 SCB ✓）。
+            // `Arc<Mutex<SystemControl>>` 被强制转换为 `Arc<Mutex<dyn Peripheral>>` 时
+            // **数据指针不变** ⇒ 取 `Arc::as_ptr(..) as *const () as usize` 可比 ✓。
+            tick_raw: {
+                let scb_p = self
+                    .scb
+                    .as_ref()
+                    .map(|s| Arc::as_ptr(s) as *const () as usize);
+                let ts = self.timers.lock().unwrap();
+                ts.iter()
+                    .map(|t| Some(Arc::as_ptr(t) as *const () as usize) == scb_p)
+                    .collect()
+            },
             timers: self.timers.lock().unwrap().clone(),
             // 冻结活动标记列表：所有外设已挂载，转成 Vec，block hook 快路径免加锁
             tick_actives: self.tick_actives.lock().unwrap().clone(),
@@ -2090,9 +2109,17 @@ impl Machine {
             // 见 attach_peripherals 的 TICK_REGIONS 判定），block hook 免去每块全扫
             // ~20 个 active 标记（bench_probe：H10 actives 7→20，MIPS 57.9→34.7）。
             if s & BIT_ANY_ACTIVE != 0 {
-                for (t, a) in cold.timers.iter().zip(cold.tick_actives.iter()) {
+                for ((t, a), raw) in cold
+                    .timers
+                    .iter()
+                    .zip(cold.tick_actives.iter())
+                    .zip(cold.tick_raw.iter())
+                {
                     if a.load(Ordering::Relaxed) {
-                        t.lock().unwrap().tick(timer_cycles);
+                        // ★SCB/SysTick 吃【原始流】✓（其 RVR 定义固件毫秒 ✓）；
+                        //   TIM 吃【声明时钟折算流】✓。
+                        let c = if *raw { cycles } else { timer_cycles };
+                        t.lock().unwrap().tick(c);
                     }
                 }
             }
