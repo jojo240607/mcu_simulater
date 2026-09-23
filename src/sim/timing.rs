@@ -141,7 +141,7 @@ pub const VIRTUAL_INSNS_PER_SEC: f32 = RETIRED_BYTES_PER_MS as f32 * 1000.0;
 ///
 /// 改用 `Machine::run_ms(4.0)` 后固件时钟与场景 **1:1**（`x_sensor_rate.rs` 实测
 /// 比值 1.002），12s 持续悬停末段 |dz| 由 0.305m 收紧到 0.223m。
-pub const RETIRED_BYTES_PER_MS: usize = 95_600;
+pub const RETIRED_BYTES_PER_MS: usize = 168_000;
 
 /// ★定时器周期流的换算（§5.100 修复 #2）：定时器模型以「**84MHz 基准周期**」为输入
 /// （内部再按 `clk_hz / 84e6` 缩放，见 `peripheral::timer::tick`）。因此每个退休字节
