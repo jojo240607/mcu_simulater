@@ -61,12 +61,11 @@ const OUTER: [(usize, &str); 5] = [
 
 /// 内层相位名（PROBE[0] 段号），键 = 10 + 段号。
 /// 段号 0..=7 来自 `hil.rs`（step_hil 外层），8..=11 来自 `ekf.rs`（EKF::step 内层）。
-const INNER: [(usize, &str); 4] = [
-    (18, "ESKF step 进入"),   // probe(8)  ⇒ key 10+8  ✓
-    (19, "ESKF predict 完"),  // probe(9)  ⇒ key 19
-    (20, "ESKF 重力完"),       // probe(10) ⇒ key 20
-    (21, "ESKF GPS位前"),     // probe(11) ⇒ key 21
-    // ⚠️ probe(12..15) ⇒ key 22..25 ⇒ **超出 key ≤21 的钳位** ✗（机制所限 ✓）
+const INNER: [(usize, &str); 11] = [
+    (18, "ESKF step 进入"),   (19, "ESKF predict 完"),  (20, "ESKF 重力完"),
+    (21, "ESKF GPS位前"),     (22, "ESKF GPS位后"),     (23, "ESKF GPS速后"),
+    (24, "ESKF 空速后"),      (25, "ESKF state前"),
+    (26, "hil 气压前"),       (27, "hil 气压后"),       (28, "hil 磁前"),
 ];
 
 fn u32at(m: &mut Machine, a: u64) -> u32 {
@@ -290,7 +289,7 @@ fn ctl_phase_breakdown() {
                 let hil_phase = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
                 // CTRL_PHASE==1 期间（即 step_hil 内）用内层段号，否则用外层段号
                 let key = if ctrl_phase == 1 {
-                    (10 + hil_phase.min(11)) as usize
+                    (10 + hil_phase.min(25)) as usize
                 } else {
                     ctrl_phase as usize
                 };
