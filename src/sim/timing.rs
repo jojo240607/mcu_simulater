@@ -104,7 +104,13 @@ impl VirtualClock {
 /// 剩余 ~1.4 倍为**固件固有**（EKF 每拍执行超 4ms 预算，真实 MCU 同量级），
 /// 非模拟器时钟失真。调整本值会改变所有推流外设的相对节拍，须同步复核
 /// `x_vperiph_mcusim` / `x_hil_mcusim` 闭环测试。
-pub const VIRTUAL_INSNS_PER_SEC: f32 = 172.0e6;
+/// ★虚拟时钟（秒）＝【固件时钟】口径，由 [`RETIRED_BYTES_PER_MS`] 唯一推导。
+///
+/// 历史问题（§5.98 已闭合）：本常量曾是独立的 `172.0e6` ✗，与固件时钟口径
+/// `RETIRED_BYTES_PER_MS = 95_600`（⇒ 95.6e6 字节/秒 ✗）**相差 1.80×**，
+/// 使"用虚拟时间量周期"与"用固件 ms 量周期"给出两个不同答案（2.084ms vs 3.778ms）。
+/// 现统一为**同一真值源**：`virtual秒 ≡ 固件秒`（`run_ms` 的设计意图 ✓）。
+pub const VIRTUAL_INSNS_PER_SEC: f32 = RETIRED_BYTES_PER_MS as f32 * 1000.0;
 
 /// **CPU 侧虚拟时钟**换算：固件自身时钟 1ms 对应的"退休字节"量级。
 ///

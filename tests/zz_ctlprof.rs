@@ -33,7 +33,11 @@ const HIL_PROBE: u64 = 0x2001F100;
 ///  参见 `src/sim/timing.rs` 的注释；以本文件的自校准为准。）
 ///
 /// 新代码请优先用 [`bytes_per_ms_calibrated`] 现场标定，不要依赖本常量。
-const RETIRED_BYTES_PER_MS: f64 = 136_800.0;
+// ★统一为【库内唯一真值源】（§5.98/§5.100）：本测试曾自带 136_800.0 ✗
+// 与库内 95_600 ✗ 不一致 ⇒ 同一物理量出现 5 个常量 ⇒ 仪器口径漂移。
+// 现直接引用库常量，杜绝再次分叉 ✓。
+const RETIRED_BYTES_PER_MS: f64 =
+    mcu_simulater::sim::timing::RETIRED_BYTES_PER_MS as f64;
 /// 历史（错误）值，仅用于打印“虚高倍数”做溯源对照。
 const LEGACY_BYTES_PER_MS: f64 = 92_000.0;
 
