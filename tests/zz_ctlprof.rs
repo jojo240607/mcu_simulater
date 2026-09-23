@@ -61,30 +61,12 @@ const OUTER: [(usize, &str); 5] = [
 
 /// 内层相位名（PROBE[0] 段号），键 = 10 + 段号。
 /// 段号 0..=7 来自 `hil.rs`（step_hil 外层），8..=11 来自 `ekf.rs`（EKF::step 内层）。
-const INNER: [(usize, &str); 23] = [
-    (8,  "  └ESKF step 进入"),
-    (9,  "  └ESKF predict 完"),
-    (10, "  └ESKF 重力完"),
-    (11, "  └ESKF GPS位前"),
-    (12, "  └ESKF GPS位后"),
-    (13, "  └ESKF GPS速后"),
-    (14, "  └ESKF 空速后"),
-    (15, "  └ESKF state前"),
-    (16, "  └step_hil 气压前"),
-    (17, "  └step_hil 气压后"),
-    (18, "  └step_hil 磁前"),
-    (30, "S1 循环顶"),
-    (31, "S2 IMU读完"),
-    (32, "S3 气压读完"),
-    (33, "S4 GPS读完"),
-    (34, "S5 RC读完"),
-    (40, "C40 控制段1"),
-    (41, "C41 控制段2"),
-    (42, "C42 控制段3"),
-    (43, "C43 控制段4"),
-    (44, "C44 控制段5"),
-    (45, "C45 控制段6"),
-    (46, "C46 控制段7"),
+const INNER: [(usize, &str); 4] = [
+    (18, "ESKF step 进入"),   // probe(8)  ⇒ key 10+8  ✓
+    (19, "ESKF predict 完"),  // probe(9)  ⇒ key 19
+    (20, "ESKF 重力完"),       // probe(10) ⇒ key 20
+    (21, "ESKF GPS位前"),     // probe(11) ⇒ key 21
+    // ⚠️ probe(12..15) ⇒ key 22..25 ⇒ **超出 key ≤21 的钳位** ✗（机制所限 ✓）
 ];
 
 fn u32at(m: &mut Machine, a: u64) -> u32 {
