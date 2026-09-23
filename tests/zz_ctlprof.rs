@@ -133,12 +133,14 @@ fn ctl_period_and_tick_cost() {
     let t0 = systick(&m);
     let c0 = u32at(&mut m, CTRL_TICKS);
     let r0 = m.retired_count();
+    let vs0 = m.virtual_sec();
     for _ in 0..STEPS {
         m.run_ms(4.0).unwrap();
     }
     let t1 = systick(&m);
     let c1 = u32at(&mut m, CTRL_TICKS);
     let r1 = m.retired_count();
+    let vs1 = m.virtual_sec();
 
     let fw_ms = (t1 - t0) as f64;
     let ticks = c1.wrapping_sub(c0) as f64;
@@ -151,6 +153,15 @@ fn ctl_period_and_tick_cost() {
         ticks,
         fw_ms / ticks,
         ticks * 1000.0 / fw_ms
+    );
+    // ★判决性验证（§5.95/§5.96）：改用【虚拟时间口径】(retired / VIRTUAL_INSNS_PER_SEC ✓，
+    //   与 clock.rs 文档同款仪器 ✓，量化远细于 1ms) 量周期 ⇒ 排除 SysTick-ms 时基假象 ✗。
+    let virt_ms = (vs1 - vs0) as f64 * 1000.0;
+    println!(
+        "[ctl] ★周期(虚拟时间口径) {:.3}ms → {:.1}Hz （虚拟/fw_ms 之比 {:.4}×）",
+        virt_ms / ticks,
+        ticks * 1000.0 / virt_ms,
+        virt_ms / fw_ms,
     );
     // **自校准**：若 CPU 不空转，则 `retired/fw_ms` 就是“字节/固件ms”真值。
     // 用它换算才得到真实耗时；先打印出来以便与其它常量对比溯源。
