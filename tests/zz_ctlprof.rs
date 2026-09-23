@@ -846,3 +846,42 @@ fn addr_bucketed_retired_bytes() {
     }
     assert!(total > 0, "区间内退休量为 0 ✗ ⇒ 符号地址解析或 hook 未生效 ✗");
 }
+
+/// ★★★**按地址直方图**（§5.70 ✓，不需符号 ✓、天然避开内联 ✗）
+/// 每 2KB 一桶，统计退休量 ⇒ 列出最热地址段 ⇒ 再用符号反查函数名 ✓
+#[test]
+fn addr_histogram_retired_bytes() {
+    use std::sync::atomic::{AtomicU64, Ordering as O};
+    const SHIFT: u32 = 11; // 2KB
+    const NB: usize = 512; // 覆盖 1MB flash（0x0800_0000 起 ✓）
+    let bufs: Vec<std::sync::Arc<AtomicU64>> =
+        (0..NB).map(|_| std::sync::Arc::new(AtomicU64::new(0))).collect();
+    let mut m = build();
+    boot(&mut m);
+    {
+        let b: Vec<_> = bufs.iter().map(|x| x.clone()).collect();
+        m.cpu.raw().add_block_hook(2, 0, move |_uc, addr, size| {
+            // ★flash 基址 0x0800_0000 ⇒ 必须先减掉（否则右移后远超 NB ✗）
+            let i = (addr.wrapping_sub(0x0800_0000) >> SHIFT) as usize;
+            if i < NB {
+                b[i].fetch_add(size as u64, O::Relaxed);
+            }
+        }).unwrap();
+    }
+    for _ in 0..500 {
+        m.run_ms(4.0).unwrap();
+    }
+    let total: u64 = bufs.iter().map(|x| x.load(O::Relaxed)).sum();
+    let mut rows: Vec<(usize, u64)> = bufs.iter().enumerate()
+        .map(|(i, x)| (i, x.load(O::Relaxed))).filter(|(_, v)| *v > 0).collect();
+    rows.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+    println!("\n[地址直方图] 500 拍 · 总退休 = {total} 字节 · 非空桶 {} 个", rows.len());
+    for (i, v) in rows.iter().take(14) {
+        println!(
+            "  0x{:08X}..0x{:08X}  {:>12} 字节  ({:.1}%)",
+            0x0800_0000u64 + ((*i as u64) << SHIFT), 0x0800_0000u64 + (((*i + 1) as u64) << SHIFT) - 1, v,
+            100.0 * *v as f64 / total.max(1) as f64
+        );
+    }
+    assert!(total > 0, "直方图全空 ✗ ⇒ hook 未生效 ✗");
+}
