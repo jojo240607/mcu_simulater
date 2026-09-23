@@ -139,3 +139,38 @@ fn accel_bias_step_tolerated() {
     assert!(max_vel < 2.0, "加计偏置阶跃后速度应有界（<2m/s），实际 {max_vel:.2}m/s");
     assert_eq!(wh, 0, "加计偏置阶跃不应触发 FDIR（health={wh}）");
 }
+
+/// ★★★**读固件里 ESKF 适配器的逐通路计数**（§5.27 的定位手段 ✓）
+///
+/// 目的 ✓：回答"固件上 ESKF 实际收到了哪些观测、各多少次"✗✓
+/// （"先证明机制在运行" ✓）—— 比盲猜"哪一路缺失"快得多 ✓。
+///
+/// 计数由 `flyctrl_core::estimator::eskf_estimator::ESKF_COUNTS`（`#[used]` ✓）
+/// 经 ELF 符号 `ESKF_COUNTS` 暴露 ✓（M 场已具备 `elfsym::app_sym` ✓）。
+#[test]
+fn eskf_adapter_counters_in_firmware() {
+    let scn = EnvScenario::new(
+        Motion::Hover,
+        Perturb { gyro_bias: [0.05, 0.0, 0.0], ..Perturb::clean() },
+        vec![],
+    );
+    let mut h = EnvHarness::new(scn, true);
+    h.run_for_secs(12.0); // 跑 12s 固件时间（含 boot ✓）
+
+    let names = [
+        "n_step", "n_grav_applied", "★n_grav_gated", "n_baro", "n_baro_rejected",
+        "n_gps_pos", "n_gps_pos_rejected", "n_gps_vel", "n_gps_vel_rejected",
+        "n_mag", "n_mag_rejected", "n_mag_reanchored",
+    ];
+    let addr = mcu_simulater::elfsym::app_sym("ESKF_COUNTS") as u64;
+    let b = h.m.cpu.mem_read(addr, 48).expect("读 ESKF_COUNTS 失败 ✗");
+    println!("\n[固件内 ESKF 通路计数] 地址 0x{addr:08X}（12×u32 ✓）");
+    for i in 0..12 {
+        let v = u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+        println!("  {:>20}: {v}", names[i]);
+    }
+    // ★机制自检（防"计数器根本没被写"✗）：step 必须非零 ✓
+    let n_step = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    assert!(n_step > 0, "ESKF_COUNTS[0] (n_step) = 0 ✗ ⇒ 计数器未生效/适配器未被调用 ✗");
+    println!("  ✓ 计数器有效（n_step={n_step}）✓");
+}

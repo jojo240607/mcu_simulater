@@ -323,8 +323,13 @@ impl EnvHarness {
         }
         self.steps += 1;
         // 锁相漂移守卫（照 x_hover_noise 模板 ✓）：长期均值必须贴合名义控制周期 ✓
+        // ★锁相基准 = 【首拍末】（照 `x_hover_noise` 模板 ✓）：
+        //   开机到首拍有 ~200ms 初始化 ✗ ⇒ 若以【构造时】为 0 点，首步就会"漂移 200ms"✗✓
+        if self.step0_ms == 0 {
+            self.step0_ms = self.m.systick_ms();
+        }
         let elapsed = self.m.systick_ms() - self.step0_ms;
-        let expect = (self.steps as f64 * 4.0) as u64; // 名义控制周期 4ms（250Hz）
+        let expect = ((self.steps - 1) as f64 * 4.0) as u64; // 名义控制周期 4ms（250Hz）
         if elapsed.abs_diff(expect) > 200 {
             panic!("[clock] 锁相漂移过大：固件 {elapsed}ms vs 名义 {expect}ms（步 {}）", self.steps);
         }
