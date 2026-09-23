@@ -158,6 +158,14 @@ fn ctl_period_and_tick_cost() {
         fw_ms / ticks,
         ticks * 1000.0 / fw_ms
     );
+    // ★§5.105 探针：SCB 实收周期 vs 退休字节 ⇒ 不等即暴露喂流口径漏 ✓
+    println!(
+        "[ctl] SCB 实收周期 = {} · retired = {} · 差 = {} · 比值 = {:.4}",
+        m.scb_cycles_in(),
+        m.retired_count(),
+        m.retired_count() as i64 - m.scb_cycles_in() as i64,
+        m.scb_cycles_in() as f64 / (m.retired_count().max(1)) as f64,
+    );
     // ★SysTick 实读（§5.102）：RVR/CTRL ⇒ 直接看固件把 1ms 定成多少周期，
     //   用它取代猜测 ✓（0xE000E014=RVR, 0xE000E010=CTRL）。
     let rvr = u32at(&mut m, 0xE000_E014);

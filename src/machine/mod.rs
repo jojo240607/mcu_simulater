@@ -2421,6 +2421,14 @@ impl Machine {
             .unwrap_or(0)
     }
 
+    /// ★诊断（§5.105）：SCB 实收周期累计（应 == `retired_count()` ✓）。
+    pub fn scb_cycles_in(&self) -> u64 {
+        self.scb
+            .as_ref()
+            .map(|s| s.lock().unwrap().syst_cycles_in())
+            .unwrap_or(0)
+    }
+
     /// 固件自身时钟（SysTick 毫秒）。供 [`crate::clock::McuClock`] 做闭环对齐断言。
     pub fn systick_ms(&self) -> u64 {
         self.systick_ticks()

@@ -80,6 +80,10 @@ pub struct SystemControl {
     /// 「异常进入次数」计毫秒就会**少记** ✗ ⇒ 固件 ms 比真实 ms 长（实测 1.14×，
     /// 且随代码布局/块大小浮动 ✗ —— 这正是"布局敏感"的根之一 ✓）。
     syst_overflows: u64,
+    /// ★诊断（§5.105）：SCB **实收**周期累计（在 [`Peripheral::tick`] 入口加 ✓，
+    /// 含 SysTick 未使能的时段 ✓）。用它对比 `Machine::retired_count()` 即可判定
+    /// "SCB 收到的周期数是否 = 退休字节数" ✓（若不等 ⇒ 喂流口径有漏 ✓）。
+    syst_cycles_in: u64,
     /// SysTick 活动标记（CTRL.ENABLE 置位，供 block hook 跳过未激活外设的加锁 tick）
     pub active: Arc<AtomicBool>,
 }
@@ -95,6 +99,7 @@ impl SystemControl {
             syst_load: 0,
             syst_val: 0,
             syst_overflows: 0,
+            syst_cycles_in: 0,
             active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -110,6 +115,7 @@ impl SystemControl {
             syst_load: 0,
             syst_val: 0,
             syst_overflows: 0,
+            syst_cycles_in: 0,
             active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -124,6 +130,7 @@ impl SystemControl {
             syst_load: 0,
             syst_val: 0,
             syst_overflows: 0,
+            syst_cycles_in: 0,
             active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -132,6 +139,11 @@ impl SystemControl {
     /// （COUNTFLAG 置位 + TICKINT 使能时挂起 SysTick 异常 vector 15）。
     ///
     /// 硬件语义：CVR 每周期减 1，从 LOAD 递减到 0 共 LOAD+1 个周期后溢出并自动
+    /// ★诊断（§5.105）：SCB 实收周期累计（应 == `Machine::retired_count()` ✓）。
+    pub fn syst_cycles_in(&self) -> u64 {
+        self.syst_cycles_in
+    }
+
     /// SysTick 溢出累计（= 固件毫秒数 ✓，见 [`Self::syst_overflows`] 字段说明）。
     pub fn syst_overflows(&self) -> u64 {
         self.syst_overflows
@@ -295,6 +307,8 @@ impl Peripheral for SystemControl {
     }
 
     fn tick(&mut self, cycles: u64) {
+        // ★诊断：先记实收（含未使能态 ✓），再走 SysTick 语义 ✓。
+        self.syst_cycles_in = self.syst_cycles_in.saturating_add(cycles);
         self.syst_tick(cycles);
     }
 }
