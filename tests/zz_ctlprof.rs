@@ -166,6 +166,13 @@ fn ctl_period_and_tick_cost() {
         m.retired_count() as i64 - m.scb_cycles_in() as i64,
         m.scb_cycles_in() as f64 / (m.retired_count().max(1)) as f64,
     );
+    // ★§5.107：实收周期 / 溢出数 ⇒ 应恰为 RVR+1 = 168_000 ✓；偏小即计数式 bug ✓
+    let ovf = m.systick_ms().max(1);
+    println!(
+        "[ctl] 溢出数 = {} · 实收/溢出 = **{:.1}** （应 = 168000 ✓）",
+        m.systick_ms(),
+        m.scb_cycles_in() as f64 / ovf as f64,
+    );
     // ★SysTick 实读（§5.102）：RVR/CTRL ⇒ 直接看固件把 1ms 定成多少周期，
     //   用它取代猜测 ✓（0xE000E014=RVR, 0xE000E010=CTRL）。
     let rvr = u32at(&mut m, 0xE000_E014);
