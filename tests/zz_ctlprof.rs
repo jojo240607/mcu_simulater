@@ -166,6 +166,13 @@ fn ctl_period_and_tick_cost() {
         m.retired_count() as i64 - m.scb_cycles_in() as i64,
         m.scb_cycles_in() as f64 / (m.retired_count().max(1)) as f64,
     );
+    // ★§5.111：RVR 写入次数 + 溢出时刻 RVR 极值 ⇒ 区分"运行期 RVR ≠ 168_000"✗ vs "交付过发"✗
+    let (lw, lmin, lmax) = m.syst_load_stats();
+    println!(
+        "[ctl] RVR 写入次数 = {lw} · 溢出时刻 RVR ∈ [{}, {}] （应恒 = 167999 ✓）",
+        if lmin == u32::MAX { 0 } else { lmin },
+        lmax
+    );
     // ★§5.107：实收周期 / 溢出数 ⇒ 应恰为 RVR+1 = 168_000 ✓；偏小即计数式 bug ✓
     let ovf = m.systick_ms().max(1);
     println!(

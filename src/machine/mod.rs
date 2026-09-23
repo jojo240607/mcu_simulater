@@ -2423,6 +2423,14 @@ impl Machine {
             .unwrap_or(0)
     }
 
+    /// ★诊断（§5.111）：SysTick RVR 写入次数与溢出时刻 RVR 极值 ✓。
+    pub fn syst_load_stats(&self) -> (u32, u32, u32) {
+        self.scb
+            .as_ref()
+            .map(|s| s.lock().unwrap().syst_load_stats())
+            .unwrap_or((0, 0, 0))
+    }
+
     /// ★诊断（§5.105）：SCB 实收周期累计（应 == `retired_count()` ✓）。
     pub fn scb_cycles_in(&self) -> u64 {
         self.scb

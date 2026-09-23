@@ -84,6 +84,11 @@ pub struct SystemControl {
     /// 含 SysTick 未使能的时段 ✓）。用它对比 `Machine::retired_count()` 即可判定
     /// "SCB 收到的周期数是否 = 退休字节数" ✓（若不等 ⇒ 喂流口径有漏 ✓）。
     syst_cycles_in: u64,
+    /// ★§5.111 诊断：RVR 被**写入的次数** ✓（区分"运行期 RVR ≠ 168_000"✗ vs "交付过发"✗）。
+    syst_load_writes: u32,
+    /// ★溢出发生时**实际生效的 RVR 极值** ✓。
+    ovf_load_min: u32,
+    ovf_load_max: u32,
     /// SysTick 活动标记（CTRL.ENABLE 置位，供 block hook 跳过未激活外设的加锁 tick）
     pub active: Arc<AtomicBool>,
 }
@@ -100,6 +105,9 @@ impl SystemControl {
             syst_val: 0,
             syst_overflows: 0,
             syst_cycles_in: 0,
+            syst_load_writes: 0,
+            ovf_load_min: u32::MAX,
+            ovf_load_max: 0,
             active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -116,6 +124,9 @@ impl SystemControl {
             syst_val: 0,
             syst_overflows: 0,
             syst_cycles_in: 0,
+            syst_load_writes: 0,
+            ovf_load_min: u32::MAX,
+            ovf_load_max: 0,
             active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -131,6 +142,9 @@ impl SystemControl {
             syst_val: 0,
             syst_overflows: 0,
             syst_cycles_in: 0,
+            syst_load_writes: 0,
+            ovf_load_min: u32::MAX,
+            ovf_load_max: 0,
             active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -139,6 +153,11 @@ impl SystemControl {
     /// （COUNTFLAG 置位 + TICKINT 使能时挂起 SysTick 异常 vector 15）。
     ///
     /// 硬件语义：CVR 每周期减 1，从 LOAD 递减到 0 共 LOAD+1 个周期后溢出并自动
+    /// ★诊断（§5.111）：(RVR 写入次数, 溢出时 RVR 最小值, 最大值) ✓。
+    pub fn syst_load_stats(&self) -> (u32, u32, u32) {
+        (self.syst_load_writes, self.ovf_load_min, self.ovf_load_max)
+    }
+
     /// ★诊断（§5.105）：SCB 实收周期累计（应 == `Machine::retired_count()` ✓）。
     pub fn syst_cycles_in(&self) -> u64 {
         self.syst_cycles_in
@@ -172,6 +191,10 @@ impl SystemControl {
         //   **溢出次数**计 ✓ —— 否则大块推进会少记 ⇒ 固件时钟变慢 ✗。
         let n_over = 1 + if period == 0 { 0 } else { (cycles - to_next) / period };
         self.syst_overflows = self.syst_overflows.saturating_add(n_over);
+        // ★§5.111：记下溢出时**生效的 RVR**（极值 ✓）⇒ 若 min/max ≠ 167_999 ⇒ 运行期被改写 ✗
+        let l = self.syst_load;
+        if l < self.ovf_load_min { self.ovf_load_min = l; }
+        if l > self.ovf_load_max { self.ovf_load_max = l; }
         // 重算 CVR：溢出后每 period 周期再次溢出（挂起位幂等，仅需推进到最终位置）
         let rem = cycles - to_next;
         self.syst_val = if period == 0 {
@@ -279,6 +302,7 @@ impl Peripheral for SystemControl {
                 Ok(())
             }
             SYST_LOAD_OFF => {
+                self.syst_load_writes = self.syst_load_writes.saturating_add(1);
                 self.syst_load = value;
                 Ok(())
             }
