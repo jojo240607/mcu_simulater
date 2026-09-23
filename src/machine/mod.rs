@@ -167,6 +167,9 @@ pub struct Machine {
     last_virt_retired: std::cell::Cell<u64>,
     /// 异常入场计数（按向量号，诊中断暴风/唤醒停滞用；Switch 停机每进一次加 1）
     vec_entries: std::cell::RefCell<Vec<u64>>,
+    /// ★SCB 句柄（§5.102）：`systick_ticks()` 改取 **SysTick 溢出次数** ✓
+    /// （旧实现按「异常进入次数」✗ ⇒ 大块推进时溢出被合并 ⇒ 固件毫秒少记 ✗）。
+    scb: Option<Arc<Mutex<SystemControl>>>,
     /// `run_ms` 的累计目标（固件 SysTick 拍数）：过冲跨调用携带，长期无漂移
     run_ms_target: u64,
     /// 最近一次异常抢占前的 PC（= 被中断块的 PC，诊在何处不停被抢）
@@ -283,6 +286,7 @@ impl Machine {
             retired_insts: Arc::new(AtomicU64::new(0)),
             last_virt_retired: std::cell::Cell::new(0),
             vec_entries: std::cell::RefCell::new(vec![0u64; 97]),
+            scb: None,
             run_ms_target: 0,
             last_switch_pc: std::cell::Cell::new(0),
             fault: None,
@@ -876,6 +880,7 @@ impl Machine {
         bus.lock()
             .unwrap()
             .attach(SCB_BASE as u32, SCB_SIZE, "SCB", scb.clone())?;
+        self.scb = Some(scb.clone());   // ★§5.102：留句柄以取溢出计数 ✓
         // SysTick 定时器随虚拟时钟推进：加入周期外设列表（block hook 按 active 标记
         // 跳过未激活外设；SysTick 活动标记由 CTRL.ENABLE 置位）
         self.timers.lock().unwrap().push(scb.clone());
@@ -2376,6 +2381,12 @@ impl Machine {
 
     /// 固件 SysTick 已发生的次数（= 固件自身时钟推进的毫秒数）。
     fn systick_ticks(&self) -> u64 {
+        // ★§5.102：优先用【SysTick 溢出次数】✓（= 固件毫秒的真值 ✓）。
+        // 旧口径「异常进入次数」✗ 在推进块较大时会**合并**多次溢出 ⇒ 少记 ⇒
+        // 固件 ms 比真实 ms 长（实测 1.14× ✗，且随代码布局浮动 ✗）。
+        if let Some(scb) = &self.scb {
+            return scb.lock().unwrap().syst_overflows();
+        }
         self.vec_entries
             .borrow()
             .get(15)

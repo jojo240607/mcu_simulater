@@ -75,6 +75,11 @@ pub struct SystemControl {
     syst_load: u32,
     /// SYST_CVR 当前值（递减计数，内部以 u64 推进）
     syst_val: u64,
+    /// ★SysTick **溢出累计**（§5.102）：固件毫秒的精确口径 ✓。
+    /// 旧实现只置挂起位（幂等 ✗）⇒ 一次 tick 内多次溢出被**合并** ⇒ 若按
+    /// 「异常进入次数」计毫秒就会**少记** ✗ ⇒ 固件 ms 比真实 ms 长（实测 1.14×，
+    /// 且随代码布局/块大小浮动 ✗ —— 这正是"布局敏感"的根之一 ✓）。
+    syst_overflows: u64,
     /// SysTick 活动标记（CTRL.ENABLE 置位，供 block hook 跳过未激活外设的加锁 tick）
     pub active: Arc<AtomicBool>,
 }
@@ -89,6 +94,7 @@ impl SystemControl {
             syst_ctrl: 0,
             syst_load: 0,
             syst_val: 0,
+            syst_overflows: 0,
             active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -103,6 +109,7 @@ impl SystemControl {
             syst_ctrl: 0,
             syst_load: 0,
             syst_val: 0,
+            syst_overflows: 0,
             active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -116,6 +123,7 @@ impl SystemControl {
             syst_ctrl: 0,
             syst_load: 0,
             syst_val: 0,
+            syst_overflows: 0,
             active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -124,6 +132,11 @@ impl SystemControl {
     /// （COUNTFLAG 置位 + TICKINT 使能时挂起 SysTick 异常 vector 15）。
     ///
     /// 硬件语义：CVR 每周期减 1，从 LOAD 递减到 0 共 LOAD+1 个周期后溢出并自动
+    /// SysTick 溢出累计（= 固件毫秒数 ✓，见 [`Self::syst_overflows`] 字段说明）。
+    pub fn syst_overflows(&self) -> u64 {
+        self.syst_overflows
+    }
+
     /// 重载 LOAD。挂起位为电平（多次溢出仅保持置位），故一次 tick 内多次溢出
     /// 与一次等价，仅需重算剩余计数。
     fn syst_tick(&mut self, cycles: u64) {
@@ -143,6 +156,10 @@ impl SystemControl {
                 nvic.lock().unwrap().set_sys_pending(VECTOR_SYSTICK);
             }
         }
+        // ★累计溢出次数（§5.102）：挂起位是幂等的 ✗，但"固件毫秒"必须按
+        //   **溢出次数**计 ✓ —— 否则大块推进会少记 ⇒ 固件时钟变慢 ✗。
+        let n_over = 1 + if period == 0 { 0 } else { (cycles - to_next) / period };
+        self.syst_overflows = self.syst_overflows.saturating_add(n_over);
         // 重算 CVR：溢出后每 period 周期再次溢出（挂起位幂等，仅需推进到最终位置）
         let rem = cycles - to_next;
         self.syst_val = if period == 0 {

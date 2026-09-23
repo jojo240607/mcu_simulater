@@ -158,6 +158,14 @@ fn ctl_period_and_tick_cost() {
         fw_ms / ticks,
         ticks * 1000.0 / fw_ms
     );
+    // ★SysTick 实读（§5.102）：RVR/CTRL ⇒ 直接看固件把 1ms 定成多少周期，
+    //   用它取代猜测 ✓（0xE000E014=RVR, 0xE000E010=CTRL）。
+    let rvr = u32at(&mut m, 0xE000_E014);
+    let ctrl = u32at(&mut m, 0xE000_E010);
+    println!(
+        "[ctl] SysTick RVR={} (0x{rvr:08X}) CTRL=0x{ctrl:08X} (ENABLE={}, TICKINT={}, CLKSOURCE={})",
+        rvr, ctrl & 1, (ctrl >> 1) & 1, (ctrl >> 2) & 1
+    );
     // ★判决性验证（§5.95/§5.96）：改用【虚拟时间口径】(retired / VIRTUAL_INSNS_PER_SEC ✓，
     //   与 clock.rs 文档同款仪器 ✓，量化远细于 1ms) 量周期 ⇒ 排除 SysTick-ms 时基假象 ✗。
     let virt_ms = (vs1 - vs0) as f64 * 1000.0;
