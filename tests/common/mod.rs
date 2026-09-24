@@ -221,6 +221,10 @@ impl EnvHarness {
     pub fn new(mut scn: EnvScenario, prefill: bool) -> Self {
         let elf = artifact::joc_base_elf();
         let app = artifact::flyctrl_real_app_bin();
+        // ★符号解析必须与所加载 bin 同 feature（§5.130）：.app_globals 段内偏移
+        // 随 feature 漂移（hil vs real 的 SENSOR_SEQ 差 +0xE1C），默认的
+        // flyctrl/app.elf 可能是其它 feature 的 ELF ⇒ 探针错位。
+        mcu_simulater::elfsym::use_app_elf(mcu_simulater::artifact::flyctrl_real_app_elf());
         let mut m = Machine::new_m4f().unwrap();
         m.map_stm32f407_layout().unwrap();
         let st = Arc::new(Mutex::new(FlySimState::default()));

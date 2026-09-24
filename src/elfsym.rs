@@ -101,11 +101,28 @@ pub fn symbols(path: &Path) -> Vec<ElfSym> {
     out
 }
 
+/// 显式指定符号解析所用 app ELF（进程级，首次 `app_sym` 前设置）。
+///
+/// §5.130：app.elf 曾被每次构建覆盖（last-build-wins），而 .app_globals 段内
+/// 符号偏移随 feature 漂移（实测 hil vs real 的 SENSOR_SEQ 差 +0xE1C）⇒ 加载
+/// real-sensors app.bin 的测试必须先把解析目标指向同 feature 的 ELF
+/// （`artifact::flyctrl_real_app_elf()`），否则符号探针全部错位。
+/// 重复设置以首次为准（同进程内加载同一 bin，值恒定）。
+pub fn use_app_elf(p: PathBuf) {
+    let _ = OVERRIDE.set(p);
+}
+
+static OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
 /// flyctrl 固件 ELF 路径（符号解析的对象）。
 ///
 /// 与 app.bin 同源：`flyctrl/app.elf`。允许 env `JOC_APP_FLYCTRL_ELF` 覆盖
-/// （与 `scripts/integrate.sh` 的产物导出约定一致）。
+/// （与 `scripts/integrate.sh` 的产物导出约定一致），以及进程级
+/// [`use_app_elf`] 显式指定（优先级最高，§5.130）。
 pub fn flyctrl_app_elf() -> PathBuf {
+    if let Some(p) = OVERRIDE.get() {
+        return p.clone();
+    }
     if let Ok(p) = std::env::var("JOC_APP_FLYCTRL_ELF") {
         return PathBuf::from(p);
     }

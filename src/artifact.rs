@@ -26,6 +26,10 @@ pub const ENV_JOC_BASE_ELF: &str = "JOC_BASE_ELF";
 pub const ENV_APP_FLYCTRL: &str = "JOC_APP_FLYCTRL";
 /// 环境变量：flyctrl real-sensors feature 固件 app.bin（见 [`flyctrl_real_app_bin`]）。
 pub const ENV_APP_FLYCTRL_REAL: &str = "JOC_APP_FLYCTRL_REAL";
+/// 环境变量：flyctrl real-sensors feature 固件 ELF（符号解析用，见 [`flyctrl_real_app_elf`]）。
+pub const ENV_APP_FLYCTRL_REAL_ELF: &str = "JOC_APP_FLYCTRL_REAL_ELF";
+/// 环境变量：flyctrl hil feature 固件 ELF（符号解析用，与 elfsym::flyctrl_app_elf 同名约定）。
+pub const ENV_APP_FLYCTRL_ELF: &str = "JOC_APP_FLYCTRL_ELF";
 /// 环境变量：joc-drvtest-app app.bin。
 pub const ENV_APP_DRVTEST: &str = "JOC_APP_DRVTEST";
 /// 环境变量：joc-rtos-app-sdk app.bin。
@@ -145,6 +149,38 @@ pub fn flyctrl_real_app_bin() -> PathBuf {
         ENV_APP_FLYCTRL_REAL,
         &["/tmp/flyctrl_real.bin", "flyctrl/app_real.bin"],
         &["/tmp/flyctrl_real.bin"],
+    )
+}
+
+/// flyctrl **real-sensors feature** 固件 ELF（elfsym 符号解析用）。
+///
+/// ★必须与实际加载的 app.bin **同 feature**（§5.130）：.app_globals 段基址固定
+/// 但段内符号偏移随 feature 漂移（实测 hil vs real 的 `SENSOR_SEQ` 差 +0xE1C），
+/// 跨 feature 的 bin/ELF 组合会让符号探针全部读错位（x_env_* 家族曾因此
+/// 100% 失败）。配套构建侧：`build_app.py` 按 feature 命名 ELF 并同步到
+/// `/tmp/flyctrl_real.elf` + `flyctrl/app_real.elf`。
+///
+/// 解析优先级：
+/// 1. env `JOC_APP_FLYCTRL_REAL_ELF`；
+/// 2. `/tmp/flyctrl_real.elf`（build_app.py real-sensors 构建同步落点）；
+/// 3. 壳工程内 `flyctrl/app_real.elf`；
+/// 4. 兜底默认 `flyctrl/app.elf`（旧行为；若它属其它 feature 会有错配风险，
+///    构建侧已按 feature 命名，正常不会走到）。
+pub fn flyctrl_real_app_elf() -> PathBuf {
+    resolve(
+        ENV_APP_FLYCTRL_REAL_ELF,
+        &["/tmp/flyctrl_real.elf", "flyctrl/app_real.elf"],
+        &["/tmp/flyctrl_real.elf", "flyctrl/app.elf"],
+    )
+}
+
+/// flyctrl **hil feature** 固件 ELF（elfsym 符号解析用，与 `JOC_APP_FLYCTRL`
+/// 指向的 hil app.bin 同 feature；§5.130 同 [`flyctrl_real_app_elf`]）。
+pub fn flyctrl_hil_app_elf() -> PathBuf {
+    resolve(
+        ENV_APP_FLYCTRL_ELF,
+        &["/tmp/flyctrl_hil.elf", "flyctrl/app_hil.elf"],
+        &["/tmp/flyctrl_hil.elf", "flyctrl/app.elf"],
     )
 }
 

@@ -45,6 +45,8 @@ fn seq(m: &mut Machine) -> u32 {
 fn sensor_rate_and_fw_clock_alignment() {
     let sys = artifact::joc_base_elf();
     let app = artifact::flyctrl_real_app_bin();
+    // ★bin/ELF 同 feature（§5.130，见 common/mod.rs 同款注释）
+    mcu_simulater::elfsym::use_app_elf(mcu_simulater::artifact::flyctrl_real_app_elf());
     assert!(sys.exists() && app.exists());
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();

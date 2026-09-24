@@ -21,6 +21,8 @@ fn sym(name: &str) -> u64 {
 fn flyctrl_real_sensors_via_toml_topology() {
     let elf = artifact::joc_base_elf();
     let app = artifact::flyctrl_real_app_bin();
+    // ★bin/ELF 同 feature（§5.130，见 common/mod.rs 同款注释）
+    mcu_simulater::elfsym::use_app_elf(mcu_simulater::artifact::flyctrl_real_app_elf());
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     // 从设备由 TOML 拓扑装配（而非代码侧 attach_default_*）

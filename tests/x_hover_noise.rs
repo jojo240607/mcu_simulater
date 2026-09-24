@@ -117,6 +117,8 @@ fn hover_60s_noisy() {
     init_log();
     let sys = artifact::joc_base_elf();
     let app = artifact::flyctrl_real_app_bin();
+    // ★bin/ELF 同 feature（§5.130，见 common/mod.rs 同款注释）
+    mcu_simulater::elfsym::use_app_elf(mcu_simulater::artifact::flyctrl_real_app_elf());
     assert!(sys.exists(), "minimal elf 缺失");
     assert!(app.exists(), "real-sensors app 缺失：{} —— 先跑 ./scripts/build.sh real-sensors，或用 JOC_APP_FLYCTRL_REAL 指向产物", app.display());
 
