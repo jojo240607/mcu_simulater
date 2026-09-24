@@ -410,7 +410,8 @@ fn hover_60s_noisy() {
             let mut max_horiz = 0.0f32;
             let mut max_v = 0.0f32;
             for &(_, p, v) in seg {
-                let dz = (p[2] - HOVER_D).abs();
+                // ★帧转换（§5.131 修）：同 x_hover_env——HOVER_D(NED) vs p[2](ENU)
+                let dz = (p[2] + HOVER_D).abs();
                 let horiz = ((p[0] - p0[0]).powi(2) + (p[1] - p0[1]).powi(2)).sqrt();
                 let vs = (v[0].powi(2) + v[1].powi(2) + v[2].powi(2)).sqrt();
                 max_dz = max_dz.max(dz);
@@ -455,7 +456,8 @@ fn hover_60s_noisy() {
     if n > SETTLE_STEPS {
         let seg = &traj[SETTLE_STEPS as usize..n as usize];
         for &(_, p, v) in seg {
-            let dz = (p[2] - HOVER_D).abs();
+            // ★帧转换（§5.131 修）：同上——HOVER_D(NED) vs p[2](ENU)
+            let dz = (p[2] + HOVER_D).abs();
             assert!(dz < 3.0, "高度失稳：dz={dz:.2}m @pos=({:.2},{:.2},{:.2})", p[0], p[1], p[2]);
             // 水平位置在 ALT_HOLD 下**不做位置保持**（位置环旁路）→ 位置是自由积分，
             // 随逼真噪声/加计零偏漂移（实测 5~20m）。因此**不因位置漂移判负**：

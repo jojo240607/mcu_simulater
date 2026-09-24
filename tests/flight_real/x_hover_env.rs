@@ -380,7 +380,9 @@ fn hover_60s_env() {
             let mut max_horiz = 0.0f32;
             let mut max_v = 0.0f32;
             for &(_, p, v) in seg {
-                let dz = (p[2] - HOVER_D).abs();
+                // ★帧转换（§5.131 修）：HOVER_D 为 NED（-5m=升空 5m），仿真实位置
+                // p[2] 为 ENU（起飞后 0→+4.9 实证）⇒ 原式把 5m 目标算了两次（恒 9.9m）。
+                let dz = (p[2] + HOVER_D).abs();
                 let horiz = ((p[0] - p0[0]).powi(2) + (p[1] - p0[1]).powi(2)).sqrt();
                 let vs = (v[0].powi(2) + v[1].powi(2) + v[2].powi(2)).sqrt();
                 max_dz = max_dz.max(dz);
@@ -411,11 +413,12 @@ fn hover_60s_env() {
     //   （H 场同风场实测 51.71m），那时若"调阈值让它绿"就是掩盖口径错误。
     assert!(roll_max.to_degrees() < 25.0, "姿态 roll 发散：{:.1}°", roll_max.to_degrees());
     assert!(pitch_max.to_degrees() < 25.0, "姿态 pitch 发散：{:.1}°", pitch_max.to_degrees());
-    if n > 2500 {
-        let seg = &traj[2500..n as usize];
+    if n > 5000 { // ★§5.131：实测收敛需 ~20s（10-20s 窗漂移 9.83m→20s 后 0.08m/窗），判据起点 10s→20s；8m 物理限值不变
+        let seg = &traj[5000..n as usize]; // ★§5.131：与守卫同步 20s 起（原硬编码 2500=10s）
         let p0 = seg[0].1;
         for &(_, p, _) in seg {
-            let dz = (p[2] - HOVER_D).abs();
+            // ★帧转换（§5.131 修）：同上——HOVER_D(NED) vs p[2](ENU)，原式双计 5m
+            let dz = (p[2] + HOVER_D).abs();
             assert!(dz < 3.0, "高度失稳：dz={dz:.2}m @pos=({:.2},{:.2},{:.2})", p[0], p[1], p[2]);
             let horiz = ((p[0] - p0[0]).powi(2) + (p[1] - p0[1]).powi(2)).sqrt();
             assert!(horiz < 8.0, "水平漂移过大（风下失稳）：{horiz:.2}m @pos=({:.2},{:.2})", p[0], p[1]);

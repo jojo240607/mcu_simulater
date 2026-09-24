@@ -326,6 +326,8 @@ fn hover_60s_demo() {
     // 分段统计；判定段取 20-60s（跳过起飞过渡期）
     for (a, b) in [(0.0, 10.0), (10.0, 20.0), (20.0, 35.0)] {
         let (p, v) = seg(a, b);
+        // ★§5.131：demo 的 FlySimState 位置为 NED（与 env/noise 的 ENU 相反，实证悬停 p2≈-5.2），
+        // 原式即正确——勿「统一」成 +HOVER_D（2026-09-24 曾误改后回退）
         let dz = (p[2] - HOVER_D as f64).abs();
         let horiz = (p[0] * p[0] + p[1] * p[1]).sqrt();
         eprintln!(
