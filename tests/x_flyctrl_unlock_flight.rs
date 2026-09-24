@@ -80,9 +80,14 @@ fn unlock_and_fly_over_virtual_peripherals() {
             if line.contains("armed=true") {
                 armed_seen = true;
             }
-            // m=[a,b,c,d]：提取 4 个电机指令
-            if let Some(mi) = line.rfind("m=[") {
-                let tail = &line[mi + 3..];
+            // m_permille=[a,b,c,d]（2026-09-23 hb 定点化改名 17b733b；旧名 m=[ 兼容回退）：
+            // 提取 4 个电机指令
+            let mi = line
+                .rfind("m_permille=[")
+                .map(|i| i + "m_permille=[".len())
+                .or_else(|| line.rfind("m=[").map(|i| i + "m=[".len()));
+            if let Some(mi) = mi {
+                let tail = &line[mi..];
                 let end = tail.find(']').unwrap_or(0);
                 let vals: Vec<f32> = tail[..end]
                     .split(',')
