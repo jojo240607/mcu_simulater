@@ -7,6 +7,7 @@
 //! 回中性 1500）→ 解锁位清零（armed=0）。场景用 RcStuck 在 t=0 强置 ch4=2000
 //! 模拟遥控器解锁开关拨到高位。
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::EnvHarness;

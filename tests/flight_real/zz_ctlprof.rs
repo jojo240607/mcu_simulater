@@ -11,6 +11,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::EnvHarness;

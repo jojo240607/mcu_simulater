@@ -11,6 +11,7 @@
 //!
 //! 断言用**每 50 步的推进量**而非绝对拍数：只要任一区间推进为 0，即判定停滞。
 
+#[path = "../common/mod.rs"]
 mod common;
 use common::EnvHarness;
 use mcu_simulater::env::scenario::{EnvScenario, Motion, Perturb};

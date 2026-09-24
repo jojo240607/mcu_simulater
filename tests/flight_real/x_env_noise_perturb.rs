@@ -5,6 +5,7 @@
 //! 现有断言仍是按旧前提设计的（**有界性/稳态量级**而非时间对齐动态跟踪），
 //! 在 1:1 时钟下可以加强——列为待办，**尚未重写**。
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::EnvHarness;

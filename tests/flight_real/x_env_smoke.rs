@@ -7,6 +7,7 @@
 //! - SENSOR_SEQ 持续推进（sensors 任务不冻结）；
 //! - 无非法指令 / 无 panic。
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{EnvHarness, EstReadout};

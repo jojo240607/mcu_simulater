@@ -21,6 +21,7 @@
 //! 构建前置：`cd joc-base && cmake --build build_rel`（minimal elf）、
 //! `./scripts/build.sh real-sensors`（产出 `/tmp/flyctrl_real.bin`）。
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use std::sync::{Arc, Mutex};

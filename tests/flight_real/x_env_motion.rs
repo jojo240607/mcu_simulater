@@ -14,6 +14,7 @@
 //! 刻意不做相位对齐的动态跟踪）。在 1:1 时钟下这些断言**可以且应当加强**
 //! （相位/幅值对齐）——列为待办，**尚未重写**。
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::EnvHarness;

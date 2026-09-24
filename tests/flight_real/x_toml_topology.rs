@@ -26,7 +26,7 @@ fn flyctrl_real_sensors_via_toml_topology() {
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
     // 从设备由 TOML 拓扑装配（而非代码侧 attach_default_*）
-    let toml = include_str!("../examples/topology_flyctrl.toml");
+    let toml = include_str!("../../examples/topology_flyctrl.toml");
     let nodes = mcu_simulater::config::apply_topology(&m, toml).expect("拓扑装配失败");
     assert_eq!(nodes.len(), 6, "拓扑应有 6 个从设备（1 SPI + 3 I2C + 2 UART）");
     // 验证装配结果：spi3 挂 1（bmi088）、i2c3 挂 3、usart2/usart3 各挂 1

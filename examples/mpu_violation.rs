@@ -24,8 +24,8 @@ fn main() {
     println!("复位：SP=0x{:08X}  PC=0x{:08X}", m.initial_sp, pc);
 
     println!("== 执行固件（firmware/mpu_violation）==");
-    match m.run(200_000) {
-        Ok(()) => println!("run() 正常返回（未触发 MPU 违规）"),
+    match m.run_ms(100.0) {
+        Ok(()) => println!("run_ms(100) 正常返回（未触发 MPU 违规）"),
         Err(e) => {
             println!("run() 返回 MemManageFault：");
             println!("  Display: {e}");

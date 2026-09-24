@@ -2,6 +2,8 @@
 name = "mcu_simulater"
 version = "0.1.0"
 edition = "2024"
+# tests/ 子目录不被 cargo 自动发现 ⇒ 显式声明（文件尾 [[test]] 列表）
+autotests = false
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
@@ -18,3 +20,332 @@ fly-sim-core = { path = "../fly-simulater/fly-sim-core", features = ["phy"] }
 fly-sim-hil = { path = "../fly-simulater/fly-sim-hil" }
 flyctrl-core = { path = "../flyctrl/core" }
 mavlink-core = { path = "../mavlink-core" }
+
+# 集成测试目标：tests/ 子目录不被 cargo 自动发现，显式声明（目标名保持不变，
+# integrate.sh / h_verify.sh / 文档的 --test <名> 全部无需改动）。分类见 docs/test-inventory.md。
+# 飞控业务测试（real-sensors 固件，A 类）
+[[test]]
+name = "x_env_faults"
+path = "tests/flight_real/x_env_faults.rs"
+
+[[test]]
+name = "x_env_longrun"
+path = "tests/flight_real/x_env_longrun.rs"
+
+[[test]]
+name = "x_env_motion"
+path = "tests/flight_real/x_env_motion.rs"
+
+[[test]]
+name = "x_env_noise_perturb"
+path = "tests/flight_real/x_env_noise_perturb.rs"
+
+[[test]]
+name = "x_env_rc"
+path = "tests/flight_real/x_env_rc.rs"
+
+[[test]]
+name = "x_env_smoke"
+path = "tests/flight_real/x_env_smoke.rs"
+
+[[test]]
+name = "x_fault_injection"
+path = "tests/flight_real/x_fault_injection.rs"
+
+[[test]]
+name = "x_flyctrl_real_sensors"
+path = "tests/flight_real/x_flyctrl_real_sensors.rs"
+
+[[test]]
+name = "x_flyctrl_unlock_flight"
+path = "tests/flight_real/x_flyctrl_unlock_flight.rs"
+
+[[test]]
+name = "x_hover_demo"
+path = "tests/flight_real/x_hover_demo.rs"
+
+[[test]]
+name = "x_hover_env"
+path = "tests/flight_real/x_hover_env.rs"
+
+[[test]]
+name = "x_hover_noise"
+path = "tests/flight_real/x_hover_noise.rs"
+
+[[test]]
+name = "x_sensor_rate"
+path = "tests/flight_real/x_sensor_rate.rs"
+
+[[test]]
+name = "x_task_stall"
+path = "tests/flight_real/x_task_stall.rs"
+
+[[test]]
+name = "x_toml_topology"
+path = "tests/flight_real/x_toml_topology.rs"
+
+[[test]]
+name = "x_vperiph_mcusim"
+path = "tests/flight_real/x_vperiph_mcusim.rs"
+
+[[test]]
+name = "zz_ctlprof"
+path = "tests/flight_real/zz_ctlprof.rs"
+
+# 飞控业务测试（默认固件，B 类）
+[[test]]
+name = "x_flyctrl_app"
+path = "tests/flight_default/x_flyctrl_app.rs"
+
+[[test]]
+name = "x_flyctrl_modes"
+path = "tests/flight_default/x_flyctrl_modes.rs"
+
+# HIL 双机闭环（hil 固件，C 类）
+[[test]]
+name = "x_hil_mcusim"
+path = "tests/hil/x_hil_mcusim.rs"
+
+[[test]]
+name = "x_shmem_mcusim"
+path = "tests/hil/x_shmem_mcusim.rs"
+
+# 平台层：MCU 模型 / jOS / SDK / 总线（D 类）
+[[test]]
+name = "debug_unmapped"
+path = "tests/platform/debug_unmapped.rs"
+
+[[test]]
+name = "m0_acceptance"
+path = "tests/platform/m0_acceptance.rs"
+
+[[test]]
+name = "m10_pwr"
+path = "tests/platform/m10_pwr.rs"
+
+[[test]]
+name = "m11_rtc"
+path = "tests/platform/m11_rtc.rs"
+
+[[test]]
+name = "m12_dcmi"
+path = "tests/platform/m12_dcmi.rs"
+
+[[test]]
+name = "m13_fsmc"
+path = "tests/platform/m13_fsmc.rs"
+
+[[test]]
+name = "m14_sdio"
+path = "tests/platform/m14_sdio.rs"
+
+[[test]]
+name = "m15_can"
+path = "tests/platform/m15_can.rs"
+
+[[test]]
+name = "m16_usb"
+path = "tests/platform/m16_usb.rs"
+
+[[test]]
+name = "m17_gpio_fghi"
+path = "tests/platform/m17_gpio_fghi.rs"
+
+[[test]]
+name = "m18_malloc"
+path = "tests/platform/m18_malloc.rs"
+
+[[test]]
+name = "m1_mmio"
+path = "tests/platform/m1_mmio.rs"
+
+[[test]]
+name = "m2_irq"
+path = "tests/platform/m2_irq.rs"
+
+[[test]]
+name = "m2_mpu"
+path = "tests/platform/m2_mpu.rs"
+
+[[test]]
+name = "m3_peripherals"
+path = "tests/platform/m3_peripherals.rs"
+
+[[test]]
+name = "m4_dma"
+path = "tests/platform/m4_dma.rs"
+
+[[test]]
+name = "m4_dma2"
+path = "tests/platform/m4_dma2.rs"
+
+[[test]]
+name = "m4_exti"
+path = "tests/platform/m4_exti.rs"
+
+[[test]]
+name = "m4_mpu"
+path = "tests/platform/m4_mpu.rs"
+
+[[test]]
+name = "m4_rcc"
+path = "tests/platform/m4_rcc.rs"
+
+[[test]]
+name = "m4_wdog"
+path = "tests/platform/m4_wdog.rs"
+
+[[test]]
+name = "m5_adc"
+path = "tests/platform/m5_adc.rs"
+
+[[test]]
+name = "m5_i2c_dma"
+path = "tests/platform/m5_i2c_dma.rs"
+
+[[test]]
+name = "m5_i2c_irq"
+path = "tests/platform/m5_i2c_irq.rs"
+
+[[test]]
+name = "m5_spi_dma"
+path = "tests/platform/m5_spi_dma.rs"
+
+[[test]]
+name = "m5_spi_irq"
+path = "tests/platform/m5_spi_irq.rs"
+
+[[test]]
+name = "m5_terminal"
+path = "tests/platform/m5_terminal.rs"
+
+[[test]]
+name = "m5_tim_dma"
+path = "tests/platform/m5_tim_dma.rs"
+
+[[test]]
+name = "m5_uart"
+path = "tests/platform/m5_uart.rs"
+
+[[test]]
+name = "m5_usart_dma"
+path = "tests/platform/m5_usart_dma.rs"
+
+[[test]]
+name = "m6_tim9_14"
+path = "tests/platform/m6_tim9_14.rs"
+
+[[test]]
+name = "m6_tim_advanced"
+path = "tests/platform/m6_tim_advanced.rs"
+
+[[test]]
+name = "m7_dac"
+path = "tests/platform/m7_dac.rs"
+
+[[test]]
+name = "m8_crc"
+path = "tests/platform/m8_crc.rs"
+
+[[test]]
+name = "m9_rng"
+path = "tests/platform/m9_rng.rs"
+
+[[test]]
+name = "m_fpca_probe"
+path = "tests/platform/m_fpca_probe.rs"
+
+[[test]]
+name = "m_jos_acceptance"
+path = "tests/platform/m_jos_acceptance.rs"
+
+[[test]]
+name = "m_jos_diag"
+path = "tests/platform/m_jos_diag.rs"
+
+[[test]]
+name = "m_unicorn_bn_bug"
+path = "tests/platform/m_unicorn_bn_bug.rs"
+
+[[test]]
+name = "m_vfp_clamp_repro"
+path = "tests/platform/m_vfp_clamp_repro.rs"
+
+[[test]]
+name = "x_bus_trace"
+path = "tests/platform/x_bus_trace.rs"
+
+[[test]]
+name = "x_checkpoint"
+path = "tests/platform/x_checkpoint.rs"
+
+[[test]]
+name = "x_digital_defect"
+path = "tests/platform/x_digital_defect.rs"
+
+[[test]]
+name = "x_fault_script"
+path = "tests/platform/x_fault_script.rs"
+
+[[test]]
+name = "x_gdb_server"
+path = "tests/platform/x_gdb_server.rs"
+
+[[test]]
+name = "x_jos_app"
+path = "tests/platform/x_jos_app.rs"
+
+[[test]]
+name = "x_jos_hb"
+path = "tests/platform/x_jos_hb.rs"
+
+[[test]]
+name = "x_jos_p2"
+path = "tests/platform/x_jos_p2.rs"
+
+[[test]]
+name = "x_jos_plain"
+path = "tests/platform/x_jos_plain.rs"
+
+[[test]]
+name = "x_jos_storm_diag"
+path = "tests/platform/x_jos_storm_diag.rs"
+
+[[test]]
+name = "x_monitor_repl"
+path = "tests/platform/x_monitor_repl.rs"
+
+[[test]]
+name = "x_telemetry"
+path = "tests/platform/x_telemetry.rs"
+
+# 驱动测试（joc-drvtest-app 固件，D 类）
+[[test]]
+name = "x_bench_mips"
+path = "tests/drvtest/x_bench_mips.rs"
+
+[[test]]
+name = "x_drvtest"
+path = "tests/drvtest/x_drvtest.rs"
+
+[[test]]
+name = "x_sched_assert_ctx"
+path = "tests/drvtest/x_sched_assert_ctx.rs"
+
+[[test]]
+name = "x_sys_retire_calib"
+path = "tests/drvtest/x_sys_retire_calib.rs"
+
+# bench / 杂项（E 类）
+[[test]]
+name = "bench_mips"
+path = "tests/bench/bench_mips.rs"
+
+[[test]]
+name = "bench_probe"
+path = "tests/bench/bench_probe.rs"
+
+[[test]]
+name = "bench_tb"
+path = "tests/bench/bench_tb.rs"
+

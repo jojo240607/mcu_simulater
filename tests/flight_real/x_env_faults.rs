@@ -10,6 +10,7 @@
 //! imu_stale_timeout=20 拍 = **0.08s**（不是原先估的 1.3s / 0.7s）。
 //! 现有场景窗口比该阈值大得多，故断言仍成立（只是余量比原先以为的更大）。
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::EnvHarness;
