@@ -254,7 +254,10 @@ fn hover_60s_demo() {
             // ⇒ 固件收到假磁场、与真实姿态对打（x_hover_env 实测使 pitch 从
             // 16.49° 恶化到 35.30°）。改用 `sim.last_mag()` 后，两场磁输入同源
             // （同一世界场 + 同一套 SensorConfig 噪声/硬铁），H 场结论才可被 M 场验收。
-            st.mag = Some(sim.last_mag());
+            // ★§5.136 A/B（临时）：不注入 PHY 场 ⇒ 走 vperiph 姿态推导回退（与冒烟同源）
+            if std::env::var("DEMO_NO_MAG_INJECT").is_err() {
+                st.mag = Some(sim.last_mag());
+            }
         }
 
         // 固件推进已移至上方的 `run_one_control_tick`（锁相）。
