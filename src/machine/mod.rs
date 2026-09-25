@@ -903,16 +903,13 @@ impl Machine {
             SCB_BASE,
             SCB_BASE + SCB_SIZE as u64,
             move |uc, ty, addr, size, value| {
-                if let Some(access) = mem_type_to_access(ty) {
-                    let fault = {
-                        let m = mpu_mmio.lock().unwrap();
-                        m.check(addr as u32, access, cpu_privileged(uc)).err()
-                    };
-                    if let Some(f) = fault {
-                        fault_and_stop(uc, &mpu_mmio, f);
-                        return true;
-                    }
-                }
+                // ★§5.136：PPB（0xE000E000 含 SCB/ICSR/NVIC/SysTick）**不受 MPU 数据访问检查**
+                //   （ARMv7-M 架构：MPU-based fault 不适用于 PPB；PPB 由系统/特权规则管理）。
+                //   原实现把固件 MPU 区域套到本窗口 ⇒ 当固件区域恰好覆盖 PPB 且 AP 不允许时
+                //   **误报 MemManageFault**（实测：SysTick 处理器首条 `ldr r0,[0xE000ED04]`
+                //   读 ICSR 被判未映射，mcu 停死）——且固件区域布局随二进制变 ⇒ 表现为
+                //   "改动二进制就崩"的假象 ✗。此处不再做 MPU 检查 ✓
+                let _ = (&uc, &ty, &size, &value);
                 match ty {
                     MemType::READ => {
                         if let Ok(v) = bus2.lock().unwrap().read(addr as u32, size as u32) {
