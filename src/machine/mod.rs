@@ -2738,6 +2738,41 @@ impl Machine {
         );
         self.cpu.reg_write(RegisterARM::PC, (handler | 1) as u64)?;
 
+        // ★§5.136：绕开 Unicorn 2.1.5「带 hook 的新译 TB 首条指令副作用丢失」怪癖——
+        //   异常入口把 PC 跳到处理器入口 ⇒ 该处是新译块首条，首条副作用会被吞掉
+        //   （实测：处理器首条 `ldr r3,[pc,#12]` 未写入 r3 ⇒ 次条读 0x00000005 未映射
+        //   ⇒ READ_UNMAPPED 停死）。对策：此处在模拟器侧【预执行】首条 16 位
+        //   PC 相对字面量装载（Thumb `ldr rX,[pc,#imm]`，编码 01001 Rt imm8），
+        //   完成后 PC 前移 2 字节 ⇒ 该条不再经过坏翻译，其余指令照常执行。
+        //   注：仅覆盖最常见的首条形态；其他形态仍可能触发 upstream 怪癖（见台账）。
+        {
+            let pc_now = (handler & !1) as u64;
+            let ins = u16::from_le_bytes(
+                self.cpu.mem_read(pc_now, 2)?.try_into().unwrap(),
+            );
+            if ins & 0xF800 == 0x4800 {
+                // ldr Rt, [pc, #imm*4]（PC 对齐到 4，Rt 含 8..15 的 32 位情形不在此编码内）
+                let rt = (ins & 0x7) as usize;
+                let imm = ((ins & 0xFF) as u64) * 4;
+                let lit_addr = ((pc_now + 4) & !3) + imm;
+                let lit = u32::from_le_bytes(
+                    self.cpu.mem_read(lit_addr, 4)?.try_into().unwrap(),
+                );
+                let reg = match rt {
+                    0 => RegisterARM::R0,
+                    1 => RegisterARM::R1,
+                    2 => RegisterARM::R2,
+                    3 => RegisterARM::R3,
+                    4 => RegisterARM::R4,
+                    5 => RegisterARM::R5,
+                    6 => RegisterARM::R6,
+                    _ => RegisterARM::R7,
+                };
+                self.cpu.reg_write(reg, lit as u64)?;
+                self.cpu.reg_write(RegisterARM::PC, (pc_now + 2) | 1)?;
+            }
+        }
+
         // NVIC 状态：清挂起（外部中断清 ISPR+置 IABR 活跃；系统异常清 sys_pending）、
         // 压异常栈（表示该异常活跃，供 EXC_RETURN 返回时弹栈）
         let mut n = self.nvic.lock().unwrap();
