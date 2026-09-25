@@ -220,11 +220,22 @@ fn phy_hover_smoke_10s() {
         }
         if _step % 250 == 0 {
             let sym = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
-            let b = m.lock().unwrap().cpu.mem_read(sym("EST_STATE"), 28).unwrap();
-            let f: Vec<f32> = (0..7).map(|i| f32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]])).collect();
+            let b = m.lock().unwrap().cpu.mem_read(sym("EST_STATE"), 44).unwrap();
+            let f: Vec<f32> = (0..11).map(|i| f32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]])).collect();
+            // 估计姿态（四元数 f[7..11]）欧拉角（deg）
+            let (ew, ex, ey, ez) = (f[7], f[8], f[9], f[10]);
+            let eroll = (2.0f32 * (ew * ex + ey * ez)).atan2(1.0 - 2.0 * (ex * ex + ey * ey)).to_degrees();
+            let epitch = (2.0f32 * (ew * ey - ez * ex)).asin().to_degrees();
+            let eyaw = (2.0f32 * (ew * ez + ex * ey)).atan2(1.0 - 2.0 * (ey * ey + ez * ez)).to_degrees();
+            // 真值姿态（PHY plant）
+            let (troll, tpitch, tyaw) = if let Some((p2, _v2)) = last {
+                let _ = p2;
+                (0.0f32, 0.0f32, 0.0f32)
+            } else { (0.0, 0.0, 0.0) };
             let mt = read_thrust(&m);
-            eprintln!("[loop] t={:.0}s est=({:+.2},{:+.2},{:+.2}) mot=[{:.2},{:.2},{:.2},{:.2}]",
-                _step as f32 * 0.004, f[1], f[2], f[3], mt[0], mt[1], mt[2], mt[3]);
+            let _ = (troll, tpitch, tyaw);
+            eprintln!("[loop] t={:.0}s att_est=({:+.1},{:+.1},{:+.1})° mot=[{:.2},{:.2},{:.2},{:.2}] est=({:+.2},{:+.2},{:+.2})",
+                _step as f32 * 0.004, eroll, epitch, eyaw, mt[0], mt[1], mt[2], mt[3], f[1], f[2], f[3]);
         }
         if _step % 1250 == 0 {
             eprintln!("[phy-smoke] t={:.0}s pos=({:.2},{:.2},{:.2}) vel=({:.2},{:.2},{:.2}) tilt={:.1}° drift={:.2}m",
