@@ -156,7 +156,15 @@ fn hover_60s_demo() {
     // ---- 35s 闭环：每步 4ms，8750 步；起飞台保持 → 升空 → 持续悬停 ----
     let mut sim = SimLoop::new(
         PhySdkWorld::create_empty(),
-        &VehicleConfig::default_quad(),
+        {
+            // ★§5.136 实验（可逆）：电机时间常数 τ 0.05 → 0.01（姿态滞后 5× 更小）
+            //   目的：验证"姿态环真实滞后 ⇒ 外环相位裕度不足 ⇒ 俯仰极限环"假设
+            let mut cfg = VehicleConfig::default_quad();
+            if std::env::var("PHY_TAU_FAST").is_ok() {
+                cfg.motor_tau = 0.01;
+            }
+            &*Box::leak(Box::new(cfg))
+        },
         0.004,
         None,
         SensorConfig::default(),
@@ -173,7 +181,6 @@ fn hover_60s_demo() {
     let mut last_state = None;
     // 锁相基准（开机后首拍末为 0 点）
     let mut fw_ms0: Option<u64> = None;
-    let mut yaw_sat_reported = 0;
 
     for step in 0..15_000u64 {
         // ---- 锁相步进（2026-09-21）---- 同 `x_hover_noise`：以控制拍为时基，
@@ -253,24 +260,6 @@ fn hover_60s_demo() {
         // 固件推进已移至上方的 `run_one_control_tick`（锁相）。
         // 历史：`run_ms(4.0)`（比裸 `run(字节预算)` 好，但仍让相位自由漂移：
         // `run(300_000)`≈3.26ms（0.82×）、`run(688_000)`≈7.2ms（1.80× → 过积分发散））。
-
-        // ★§5.136 探针：yaw 设定点/姿态误差/速率指令/混控四路（每 25 拍 + 饱和事件）
-        if step % 25 == 0 || yaw_sat_reported < 5 {
-            let sym = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
-            let rd = |s: u64, n: usize| -> Vec<f32> {
-                let b = m.lock().unwrap().cpu.mem_read(s, 4 * n).unwrap();
-                (0..n).map(|i| f32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]])).collect()
-            };
-            let y = rd(sym("DBG_YAW"), 10);
-            let mt = rd(sym("DBG_MOTOR"), 4);
-            let yaw_cmd = (mt[0] + mt[2]) - (mt[1] + mt[3]);
-            let sat = yaw_cmd.abs() > 1.5;
-            if sat && yaw_sat_reported < 5 { yaw_sat_reported += 1; }
-            if step % 25 == 0 || sat {
-                eprintln!("Y step={} yaw_sp={:+.4} err=({:+.4},{:+.4},{:+.4}) rcmd=({:+.3},{:+.3},{:+.3}) omega=({:+.3},{:+.3},{:+.3}) mot=[{:.2},{:.2},{:.2},{:.2}] yawd={:+.2}{}",
-                    step, y[0], y[1], y[2], y[3], y[4], y[5], y[6], y[7], y[8], y[9], mt[0], mt[1], mt[2], mt[3], yaw_cmd, if sat {" ←饱和"} else {""});
-            }
-        }
 
         if step % 250 == 0 {
             let ekf_z = read_ekf_z(&m);

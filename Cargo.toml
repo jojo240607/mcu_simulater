@@ -73,6 +73,10 @@ name = "x_hover_noise"
 path = "tests/flight_real/x_hover_noise.rs"
 
 [[test]]
+name = "x_phy_hover_smoke"
+path = "tests/flight_real/x_phy_hover_smoke.rs"
+
+[[test]]
 name = "x_sensor_rate"
 path = "tests/flight_real/x_sensor_rate.rs"
 
