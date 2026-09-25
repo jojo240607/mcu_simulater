@@ -70,10 +70,8 @@ fn long_cruise_converges_and_bounded() {
     // **但现象仍然存在**：EKF 水平速度实测 4~5 vs 真值 3（偏高但有界）。
     // 旧解释（“慢 8 倍放大位置观测交叉协方差”）随之失效，**真实根因待重定**
     // （候选：`r_vel=0.3` 偏松 / GPS 20Hz 帧间样本保持）。故仍只断言**有界**。
-    // ★§5.131：下界 0.5→0.2。P 协方差限幅（ESKF 修复，防 43° 单拍姿态跳变）后，
-    //   巡航中 est vel 存在【单拍良性瞬态】下探 0.21（health Nominal、轨迹不变 54.4m、
-    //   vmax 不变）——有界性断言意图不变，仅适配新滤波工作点（A/B 实测 0.205 vs 2.200）。
+    // 诊断直读（每次运行都打印，供跨会话对比滤波工作点）
     eprintln!("[longrun] vmin={vmin:.3} vmax={vmax:.3} pos_n={pos_n:.2}");
-    assert!(vmin > 0.2 && vmax < 6.5, "长巡航北向速度应有界（min={vmin:.2} max={vmax:.2}，真值 3）");
+    assert!(vmin > 0.5 && vmax < 6.5, "长巡航北向速度应有界（min={vmin:.2} max={vmax:.2}，真值 3）");
     assert!(pos_n > 5.0, "长巡航位置应显著北移（>5m，实际 {pos_n:.1}m）");
 }
