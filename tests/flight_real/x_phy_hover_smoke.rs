@@ -151,10 +151,11 @@ fn phy_hover_smoke_10s() {
             }
         }
         // ★§5.136 A/B-②：磁重锚定（把 mag_I 软拉回先验；仿真 .data 未初始化 ⇒ 默认读到 0=关）
-        if dis.split(',').any(|d| d.trim() == "reanchor") {
+        if let Ok(sig) = std::env::var("PHY_REANCHOR") {
+            let v: f32 = sig.parse().unwrap_or(0.01);
             let addr = mcu_simulater::elfsym::app_sym("G_ESKF_MAG_REANCHOR") as u64;
-            m.lock().unwrap().cpu.mem_write(addr, &0.01f32.to_le_bytes()).unwrap();
-            eprintln!("[phy-smoke] A/B-②：G_ESKF_MAG_REANCHOR = 0.01（开）");
+            m.lock().unwrap().cpu.mem_write(addr, &v.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：G_ESKF_MAG_REANCHOR = {v}（开）");
         }
     }
     {
@@ -222,8 +223,8 @@ fn phy_hover_smoke_10s() {
             let b = m.lock().unwrap().cpu.mem_read(sym("EST_STATE"), 28).unwrap();
             let f: Vec<f32> = (0..7).map(|i| f32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]])).collect();
             let mt = read_thrust(&m);
-            eprintln!("[loop] t={:.0}s est=({:+.2},{:+.2},{:+.2}) vel=({:+.2},{:+.2},{:+.2}) mot=[{:.2},{:.2},{:.2},{:.2}]",
-                _step as f32 * 0.004, f[1], f[2], f[3], f[4], f[5], f[6], mt[0], mt[1], mt[2], mt[3]);
+            eprintln!("[loop] t={:.0}s est=({:+.2},{:+.2},{:+.2}) mot=[{:.2},{:.2},{:.2},{:.2}]",
+                _step as f32 * 0.004, f[1], f[2], f[3], mt[0], mt[1], mt[2], mt[3]);
         }
         if _step % 1250 == 0 {
             eprintln!("[phy-smoke] t={:.0}s pos=({:.2},{:.2},{:.2}) vel=({:.2},{:.2},{:.2}) tilt={:.1}° drift={:.2}m",
