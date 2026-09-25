@@ -173,6 +173,7 @@ fn hover_60s_demo() {
     let mut last_state = None;
     // 锁相基准（开机后首拍末为 0 点）
     let mut fw_ms0: Option<u64> = None;
+    let mut yaw_sat_reported = 0;
 
     for step in 0..15_000u64 {
         // ---- 锁相步进（2026-09-21）---- 同 `x_hover_noise`：以控制拍为时基，
@@ -192,7 +193,11 @@ fn hover_60s_demo() {
         let thrust = motors.iter().sum::<f32>();
         max_thrust = max_thrust.max(thrust);
 
-        let (st, imu_true) = if held && thrust < 0.05 {
+        // ★§5.136：释放判据 0.05 → 1.5（近悬停推力才离台）。原判据"一有推力就放开"会在
+        //   混控远未达悬停时释放飞行器 ⇒ 释放瞬间姿态被扰（实测俯仰角速度 4.1 rad/s）
+        //   ⇒ 触发姿态极限环（混控饱和）⇒ 大范围游走。物理上应"推力超过重力才离台"
+        //   （四路归一化推力之和 ≈2.0 为悬停）✓
+        let (st, imu_true) = if held && thrust < 1.5 {
             (None, flyctrl_core::vehicle::ImuSample {
                 accel: [
                     flyctrl_core::units::MeterPerSecondSquared(0.0),
@@ -248,6 +253,24 @@ fn hover_60s_demo() {
         // 固件推进已移至上方的 `run_one_control_tick`（锁相）。
         // 历史：`run_ms(4.0)`（比裸 `run(字节预算)` 好，但仍让相位自由漂移：
         // `run(300_000)`≈3.26ms（0.82×）、`run(688_000)`≈7.2ms（1.80× → 过积分发散））。
+
+        // ★§5.136 探针：yaw 设定点/姿态误差/速率指令/混控四路（每 25 拍 + 饱和事件）
+        if step % 25 == 0 || yaw_sat_reported < 5 {
+            let sym = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
+            let rd = |s: u64, n: usize| -> Vec<f32> {
+                let b = m.lock().unwrap().cpu.mem_read(s, 4 * n).unwrap();
+                (0..n).map(|i| f32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]])).collect()
+            };
+            let y = rd(sym("DBG_YAW"), 10);
+            let mt = rd(sym("DBG_MOTOR"), 4);
+            let yaw_cmd = (mt[0] + mt[2]) - (mt[1] + mt[3]);
+            let sat = yaw_cmd.abs() > 1.5;
+            if sat && yaw_sat_reported < 5 { yaw_sat_reported += 1; }
+            if step % 25 == 0 || sat {
+                eprintln!("Y step={} yaw_sp={:+.4} err=({:+.4},{:+.4},{:+.4}) rcmd=({:+.3},{:+.3},{:+.3}) omega=({:+.3},{:+.3},{:+.3}) mot=[{:.2},{:.2},{:.2},{:.2}] yawd={:+.2}{}",
+                    step, y[0], y[1], y[2], y[3], y[4], y[5], y[6], y[7], y[8], y[9], mt[0], mt[1], mt[2], mt[3], yaw_cmd, if sat {" ←饱和"} else {""});
+            }
+        }
 
         if step % 250 == 0 {
             let ekf_z = read_ekf_z(&m);
