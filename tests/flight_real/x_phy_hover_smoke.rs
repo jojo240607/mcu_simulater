@@ -150,6 +150,12 @@ fn phy_hover_smoke_10s() {
                 eprintln!("[phy-smoke] 消融：{symname} = 2.0（关）");
             }
         }
+        // ★§5.136 A/B-②：磁重锚定（把 mag_I 软拉回先验；仿真 .data 未初始化 ⇒ 默认读到 0=关）
+        if dis.split(',').any(|d| d.trim() == "reanchor") {
+            let addr = mcu_simulater::elfsym::app_sym("G_ESKF_MAG_REANCHOR") as u64;
+            m.lock().unwrap().cpu.mem_write(addr, &0.01f32.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B-②：G_ESKF_MAG_REANCHOR = 0.01（开）");
+        }
     }
     {
         let mut st = state.lock().unwrap();
