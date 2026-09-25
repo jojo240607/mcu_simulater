@@ -151,6 +151,11 @@ fn phy_hover_smoke_10s() {
             }
         }
         // ★§5.136 A/B-②：磁重锚定（把 mag_I 软拉回先验；仿真 .data 未初始化 ⇒ 默认读到 0=关）
+        if std::env::var("PHY_FREEZE_BIAS").is_ok() {
+            let addr = mcu_simulater::elfsym::app_sym("G_ESKF_FREEZE_BIAS") as u64;
+            m.lock().unwrap().cpu.mem_write(addr, &1.0f32.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：G_ESKF_FREEZE_BIAS = 1（冻结零偏修正）");
+        }
         if let Ok(sig) = std::env::var("PHY_REANCHOR") {
             let v: f32 = sig.parse().unwrap_or(0.01);
             let addr = mcu_simulater::elfsym::app_sym("G_ESKF_MAG_REANCHOR") as u64;
