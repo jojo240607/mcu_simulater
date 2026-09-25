@@ -1,6 +1,7 @@
 //! 虚拟外设总线协议级验证：flyctrl real-sensors（真实传感器驱动）经模拟器
 //! 虚拟从设备读到数据——IMU=BMI088 挂 SPI3（板级 "spi2" 设备=SPI3）、
-//! baro/mag 挂 I2C3（固件 i2c2，DMA 引擎搬运）。
+//! baro 挂 I2C3（固件 i2c2）、mag 挂 I2C1（固件 i2c0）——★§5.136 起两传感器**分总线**
+//! 各自 DMA 搬运（消除共享 I2C 的事务交错/相位耦合）。
 //!
 //! 里程碑（控制台日志）：
 //!   mounted  = "RUST app mounted"
@@ -20,12 +21,13 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
     let app = artifact::flyctrl_real_app_bin();
     let mut m = Machine::new_m4f().unwrap();
     m.map_stm32f407_layout().unwrap();
-    // 虚拟外设：IMU=BMI088 挂 SPI3（port 3），baro/mag 挂 I2C3（port 3，
-    // 固件 i2c2 走 DMA）；baro 高度基准与虚拟 GPS（alt=4.0）对齐，
-    // EKF 高度收敛到 4m 而非海平面 0m。
+    // 虚拟外设：IMU=BMI088 挂 SPI3（port 3）；baro 挂 I2C3（port 3 / 固件 i2c2）；
+    // mag 挂 I2C1（port 1 / 固件 i2c0）★§5.136 分总线；baro 高度基准与虚拟 GPS
+    // （alt=4.0）对齐，EKF 高度收敛到 4m 而非海平面 0m。
     m.attach_default_sensors_with_baro_height(4.0);
     assert_eq!(m.spi.lock().unwrap()[2].lock().unwrap().slaves().len(), 1); // bmi088
-    assert_eq!(m.i2c.lock().unwrap()[2].lock().unwrap().slave_count(), 3); // I2C3
+    assert_eq!(m.i2c.lock().unwrap()[2].lock().unwrap().slave_count(), 2); // I2C3：bmp280+mpu6050
+    assert_eq!(m.i2c.lock().unwrap()[0].lock().unwrap().slave_count(), 1); // ★I2C1：qmc5883（磁，§5.136 分总线）
     // UART 推流从设备：gps→uart1(USART2 port2)、sbus→uart2(USART3 port3)
     m.attach_default_uart_slaves();
     m.load_elf(&elf).unwrap();
@@ -125,9 +127,16 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
     println!("=== end ===");
     let cnt = {
         let i2c_vec = m.i2c.lock().unwrap();
-        let i = i2c_vec[2].lock().unwrap(); // I2C3：bmp280(1)/qmc5883(2) 被固件读取（mpu6050(0) 保留不读）
+        // 读计数：I2C3 = [mpu6050(0,不读), bmp280(1,读)]；I2C1 = [qmc5883(0,读)]（§5.136 分总线）
+        let i = i2c_vec[2].lock().unwrap();
         let sl = i.slaves();
-        (sl[0].read_count(), sl[1].read_count(), sl[2].read_count())
+        // ★§5.136：磁已挪到 I2C1 ⇒ 一并取该总线的读计数（磁从设备索引 0）
+        let mag_reads = {
+            let j = i2c_vec[0].lock().unwrap();
+            let sj = j.slaves();
+            sj[0].read_count()
+        };
+        (sl[0].read_count(), sl[1].read_count(), mag_reads)
     };
     let spi_cnt = {
         let spi_vec = m.spi.lock().unwrap();
@@ -155,7 +164,8 @@ fn flyctrl_real_sensors_over_virtual_i2c() {
     assert!(imu_ok, "IMU(BMI088) 未经 SPI3 虚拟从设备读到数据（imu_ok=false）");
     assert!(baro_ok, "Baro(BMP280) 未经 I2C3 虚拟从设备读到数据（baro=false）");
     assert!(gps_ok, "GPS(u-blox) 未经 UART 推流从设备读到 NMEA（gps=false）");
-    assert!(mag_ok, "Mag(QMC5883) 未经 I2C3 虚拟从设备读到数据（mag=false，hb 行 mag 字段）");
-    assert!(cnt.1 > 0 && cnt.2 > 0, "I2C3 从设备无读取（bmp280(1)/qmc5883(2)，DMA 引擎未工作？）");
+    assert!(mag_ok, "Mag(QMC5883) 未经 I2C1 虚拟从设备读到数据（mag=false，hb 行 mag 字段）");
+    assert!(cnt.1 > 0, "I2C3 的 bmp280 无读取（DMA 引擎未工作？）");
+    assert!(cnt.2 > 0, "★I2C1 的 qmc5883 无读取（§5.136 分总线后磁应走 I2C1）");
     assert!(spi_cnt > 0, "SPI3 从设备无读取（bmi088 未工作）");
 }

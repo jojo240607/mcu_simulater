@@ -582,13 +582,18 @@ impl Machine {
         // real-sensors 的 ImuBmi088("bmi088") 对应——注意板级设备名 "spi2" 实际是
         // SPI3 外设（g_spi2），故从设备必须挂在 SPI 端口 3（x_drvtest 同此约定）。
         self.register_spi_slave(3, Box::new(default_bmi088((4, 7), (4, 8)).with_source(FlySimSource::new(st.clone(), FlySimKind::Imu))));
-        // I2C 总线：固件 baro/mag 走 i2c2(I2C3)——I2C1 的 DMA1_Stream6 与 uart1(USART2)
-        // TX 冲突（固件 dma_acquire 流级互斥），I2C3 用 Stream4/2 空闲。
+        // I2C 总线（★§5.136：baro 与 mag **分挂两条独立 I2C、各自 DMA**）：
+        //   · 气压计 -> i2c2(I2C3)：TX S4 / RX S2 ✓
+        //   · 磁力计 -> i2c0(I2C1)：TX S6（USART2_TX 已让出，改走 S7）/ RX S0 ✓
+        //   动因：两传感器共享一条 I2C 时事务交错/相位耦合会扰动磁样本时间特性，
+        //   而 SIL（干净样本）稳定 ⇒ 分总线消除该耦合（台账 §5.136 补遗 21）。
         self.register_i2c_slave(3, Box::new(mpu6050(FlySimSource::new(st.clone(), FlySimKind::Imu))));
         self.register_i2c_slave(3, Box::new(bmp280(FlySimSource::new(st.clone(), FlySimKind::Baro))));
         // 磁力计用 FlySimSource(Mag)：世界系恒定地磁场随姿态旋转到机体（真机模型），
         // 取代 StaticMag 固定机体磁场（yaw 观测恒定 → 磁锚定拉回航向）。
-        self.register_i2c_slave(3, Box::new(qmc5883(FlySimSource::new(st, FlySimKind::Mag))));
+        // ★§5.136：磁力计改用 **独立 I2C1**（port 1）——与气压计(I2C3/port 3)分总线、
+        //   各自 DMA；I2C1 的 RX=S0 独占（固件口径）✓，TX=S6 由 USART2_TX 让出 ✓
+        self.register_i2c_slave(1, Box::new(qmc5883(FlySimSource::new(st, FlySimKind::Mag))));
     }
 
     /// [HIL 虚拟外设直通] 用 fly_sim 共享状态装配 UART 推流（gps/sbus）。
@@ -621,7 +626,7 @@ impl Machine {
         // I2C 从设备挂 I2C3（port 3）：见 attach_flysim_sensors 的 DMA 冲突说明
         self.register_i2c_slave(3, Box::new(mpu6050(StaticImu::default())));
         self.register_i2c_slave(3, Box::new(bmp280(StaticBaro::at_height(baro_height))));
-        self.register_i2c_slave(3, Box::new(qmc5883(StaticMag::default())));
+        self.register_i2c_slave(1, Box::new(qmc5883(StaticMag::default()))); // ★§5.136：磁 -> I2C1
     }
 
     /// 装配总线事务嗅探器（调试平台 P0-1）：把同一嗅探器注入到全部已挂载
@@ -1164,7 +1169,7 @@ impl Machine {
                                 let (stream, channel) = match *p {
                                     1 => (0, 3), // SPI1_RX: DMA2_Stream0_Channel3
                                     2 => (3, 0), // SPI2_RX: DMA1_Stream3_Channel0
-                                    3 => (0, 0), // SPI3_RX: DMA1_Stream0_Channel0
+                                    3 => (0, 0), // SPI3_RX: DMA1_S0_CH0（与固件 dma_hal 一致 ✓；板级注释的 S2 系过时 ✗）
                                     _ => return,
                                 };
                                 ctrl.lock()
@@ -1770,24 +1775,27 @@ impl Machine {
             move |ev: &Event| {
                 if let Event::UartDma { port, dir } = ev {
                     let (ctrl, stream, channel) = match (*port, *dir) {
-                        // USART1：DMA2_Stream7_Channel4(TX) / DMA2_Stream2_Channel4(RX)
+                        // ★§5.136：本表需与固件板级路由（joc-base/board/stm32f4_discovery.c
+                        //   + dma_hal.c）严格一致，否则外设 DMA 在仿真里搬错流（历史分歧：
+                        //   USART1_RX(仿真 S2→固件 S5)、USART2_TX(S6→S7) 已对齐 ✓；
+                        //   SPI3_RX 仿真 S0 = 固件 dma_hal S0 ✓（板级注释 S2 过时，勿照抄）。
+                        // USART1：TX DMA2_S7_CH4 / RX DMA2_S5_CH4（板级口径）
                         (1, DmaDir::MemToPeriph) => (dma2.clone(), 7, 4),
-                        (1, DmaDir::PeriphToMem) => (dma2.clone(), 2, 4),
-                        // USART2：DMA1_Stream6_Channel4(TX) / DMA1_Stream5_Channel4(RX)
-                        (2, DmaDir::MemToPeriph) => (dma1.clone(), 6, 4),
+                        (1, DmaDir::PeriphToMem) => (dma2.clone(), 5, 4),
+                        // USART2：TX DMA1_S7_CH4（★改：原 S6 与 I2C1_TX 硬冲突 ⇒ 改走
+                        //   RM0090 第二条硬件流）/ RX DMA1_S5_CH4
+                        (2, DmaDir::MemToPeriph) => (dma1.clone(), 7, 4),
                         (2, DmaDir::PeriphToMem) => (dma1.clone(), 5, 4),
-                        // USART3：DMA1_Stream3_Channel4(TX) / DMA1_Stream1_Channel4(RX)
+                        // USART3：DMA1_S3_CH4(TX) / DMA1_S1_CH4(RX)
                         (3, DmaDir::MemToPeriph) => (dma1.clone(), 3, 4),
                         (3, DmaDir::PeriphToMem) => (dma1.clone(), 1, 4),
-                        // UART4：DMA1_Stream4_Channel4(TX) / DMA1_Stream2_Channel4(RX)
+                        // UART4：DMA1_S4_CH4(TX) / DMA1_S2_CH4(RX)
                         (4, DmaDir::MemToPeriph) => (dma1.clone(), 4, 4),
                         (4, DmaDir::PeriphToMem) => (dma1.clone(), 2, 4),
-                        // UART5：DMA1_Stream7_Channel4(TX) / DMA1_Stream0_Channel4(RX)
+                        // UART5：DMA1_S7_CH4(TX) / DMA1_S0_CH4(RX)
                         (5, DmaDir::MemToPeriph) => (dma1.clone(), 7, 4),
                         (5, DmaDir::PeriphToMem) => (dma1.clone(), 0, 4),
-                        // USART6：DMA2_Stream6_Channel5(TX) / DMA2_Stream1_Channel5(RX)
-                        (6, DmaDir::MemToPeriph) => (dma2.clone(), 6, 5),
-                        (6, DmaDir::PeriphToMem) => (dma2.clone(), 1, 5),
+                        // USART6：板级用 IRQ（TX/RX 均不下 DMA）⇒ 无流条目（到这就 return）
                         _ => return,
                     };
                     ctrl.lock()
@@ -1852,7 +1860,7 @@ impl Machine {
                         let (rctrl, rstream, rchannel) = match *port {
                             1 => (dma2.clone(), 0, 3), // SPI1_RX: DMA2_Stream0_Channel3
                             2 => (dma1.clone(), 3, 0), // SPI2_RX: DMA1_Stream3_Channel0
-                            3 => (dma1.clone(), 0, 0), // SPI3_RX: DMA1_Stream0_Channel0
+                            3 => (dma1.clone(), 0, 0), // SPI3_RX: DMA1_S0_CH0（与固件 dma_hal 一致 ✓）
                             _ => return,
                         };
                         rctrl.lock()
