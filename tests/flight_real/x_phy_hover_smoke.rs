@@ -217,6 +217,14 @@ fn phy_hover_smoke_10s() {
             max_drift = max_drift.max(drift);
             last = Some((pos, vel));
         }
+        if _step % 250 == 0 {
+            let sym = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
+            let b = m.lock().unwrap().cpu.mem_read(sym("EST_STATE"), 28).unwrap();
+            let f: Vec<f32> = (0..7).map(|i| f32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]])).collect();
+            let mt = read_thrust(&m);
+            eprintln!("[loop] t={:.0}s est=({:+.2},{:+.2},{:+.2}) vel=({:+.2},{:+.2},{:+.2}) mot=[{:.2},{:.2},{:.2},{:.2}]",
+                _step as f32 * 0.004, f[1], f[2], f[3], f[4], f[5], f[6], mt[0], mt[1], mt[2], mt[3]);
+        }
         if _step % 1250 == 0 {
             eprintln!("[phy-smoke] t={:.0}s pos=({:.2},{:.2},{:.2}) vel=({:.2},{:.2},{:.2}) tilt={:.1}° drift={:.2}m",
                 _step as f32 * 0.004, pos[0], pos[1], pos[2], vel[0], vel[1], vel[2], max_tilt, max_drift);
