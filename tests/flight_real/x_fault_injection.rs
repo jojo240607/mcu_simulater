@@ -21,13 +21,16 @@ use unicorn_engine::RegisterARM;
 use mcu_simulater::artifact;
 use mcu_simulater::machine::Machine;
 
-/// 读取从设备成功读计数（i2c3: 0=mpu6050, 1=bmp280, 2=qmc5883）。
-/// 固件 baro/mag 走 i2c2(I2C3)——I2C1 的 DMA1_Stream6 与 uart1 TX 冲突。
+/// 读取从设备成功读计数。★§5.136 拓扑变更后（用户要求）：**磁力计独立到 I2C1**，
+/// 气压计仍在 I2C3 ⇒ 返回 (mpu6050@I2C3, bmp280@I2C3, qmc5883@I2C1) ✓
+/// （此前三者同挂 I2C3 ⇒ `len=3`；现 I2C3 仅 2 个从设备 ⇒ 原 `sl[2]` 越界 ✗）
 fn i2c1_read_counts(m: &Machine) -> (u64, u64, u64) {
     let i2c_vec = m.i2c.lock().unwrap();
-    let i = i2c_vec[2].lock().unwrap();
-    let sl = i.slaves();
-    (sl[0].read_count(), sl[1].read_count(), sl[2].read_count())
+    let i3 = i2c_vec[2].lock().unwrap();
+    let s3 = i3.slaves();
+    let i1 = i2c_vec[0].lock().unwrap();
+    let s1 = i1.slaves();
+    (s3[0].read_count(), s3[1].read_count(), s1[0].read_count())
 }
 
 /// 装配 flyctrl real-sensors 全链路；`fault_spi_imu=true` 时开机即对
@@ -190,8 +193,8 @@ fn midrun_nack_isolates_slave() {
     // mpu6050(0x68) 从设备保留但不再被读（读计数恒 0）。隔离验证改用 mag。
     assert!(before.2 > 0, "基线 qmc5883 应已有成功读，得 {before:?}");
 
-    // 阶段 2：注入 NACK 到 qmc5883(mag)
-    assert!(m.inject_i2c_nack(3, 0x0D, true), "未命中 qmc5883");
+    // 阶段 2：注入 NACK 到 qmc5883(mag)。★§5.136 拓扑：mag 已迁至 **I2C1（port 1）** ✓
+    assert!(m.inject_i2c_nack(1, 0x0D, true), "未命中 qmc5883（I2C1/0x0D ✓）");
     // 阶段 3：继续运行，确认 qmc5883 读计数冻结、bmp280 继续增长
     let mut after = before;
     let mut stable_rounds = 0u32;
