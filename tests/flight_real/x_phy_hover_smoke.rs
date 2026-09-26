@@ -151,6 +151,13 @@ fn phy_hover_smoke_10s() {
             }
         }
         // ★§5.136 A/B-②：磁重锚定（把 mag_I 软拉回先验；仿真 .data 未初始化 ⇒ 默认读到 0=关）
+        if let Ok(mode_s) = std::env::var("PHY_MAG_MODE") {
+            // ★§5.136 A/B：G_ESKF_MAG_YAW_ON 旋钮（2.0=强制 heading、3.0=强制 3D、其余=默认）
+            let v: f32 = mode_s.parse().unwrap_or(0.0);
+            let addr = mcu_simulater::elfsym::app_sym("G_ESKF_MAG_YAW_ON") as u64;
+            m.lock().unwrap().cpu.mem_write(addr, &v.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：G_ESKF_MAG_YAW_ON = {v}（2=heading / 3=3D）");
+        }
         if std::env::var("PHY_FREEZE_BIAS").is_ok() {
             let addr = mcu_simulater::elfsym::app_sym("G_ESKF_FREEZE_BIAS") as u64;
             m.lock().unwrap().cpu.mem_write(addr, &1.0f32.to_le_bytes()).unwrap();
