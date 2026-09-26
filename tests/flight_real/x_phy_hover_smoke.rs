@@ -151,6 +151,17 @@ fn phy_hover_smoke_10s() {
             }
         }
         // ★§5.136 A/B-②：磁重锚定（把 mag_I 软拉回先验；仿真 .data 未初始化 ⇒ 默认读到 0=关）
+        if let Ok(qs) = std::env::var("PHY_GYR_NOTCH_Q") {
+            let qv: f32 = qs.parse().unwrap_or(0.0);
+            let addr = mcu_simulater::elfsym::app_sym("G_ESKF_GYR_NOTCH_Q") as u64;
+            m.lock().unwrap().cpu.mem_write(addr, &qv.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：陀螺陷波 Q = {qv}");
+        }
+        if std::env::var("PHY_BYPASS_NOTCH").is_ok() {
+            let addr = mcu_simulater::elfsym::app_sym("G_ESKF_BYPASS_GYR_NOTCH") as u64;
+            m.lock().unwrap().cpu.mem_write(addr, &2.0f32.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：旁路陀螺陷波 ✓");
+        }
         if let Ok(mode_s) = std::env::var("PHY_MAG_MODE") {
             // ★§5.136 A/B：G_ESKF_MAG_YAW_ON 旋钮（2.0=强制 heading、3.0=强制 3D、其余=默认）
             let v: f32 = mode_s.parse().unwrap_or(0.0);
@@ -188,6 +199,10 @@ fn phy_hover_smoke_10s() {
         Some(fly_sim_core::physics::ContactModel::default()),
         vec![],
     );
+    // ★§5.136：PHY_INJECT_MAG=1 ⇒ 注入【物理引擎世界场】作为磁（与 x_hover_demo 同源 ✓）
+    //   缺省走 vperiph 回退场（惰性磁 ⇒ 与真机语义不符，仅作冒烟）；复现/回归用注入模式 ✓
+    let inject_mag = std::env::var("PHY_INJECT_MAG").is_ok();
+    eprintln!("[phy-smoke] 磁注入 = {inject_mag}（PHY_INJECT_MAG=1 复现真机语义 ✓）");
     let mut held = true;
     let mut max_tilt = 0.0f32;
     let mut max_dz = 0.0f32;
@@ -267,6 +282,11 @@ fn phy_hover_smoke_10s() {
             st.baro_pa = 101_325.0 * (-h / 8434.5).exp();
             st.rc_ch[4] = 2000.0;
             st.rc_ch[5] = 2000.0;
+            // ★§5.136：按开关注入【物理引擎世界场】作为磁（与 x_hover_demo 同源 ✓）
+            //   不注入时走 vperiph 回退场 = "惰性磁"（实测完美但与真机语义不符 ✗）
+            if inject_mag {
+                st.mag = Some(sim.last_mag());
+            }
         }
     }
     // ★§5.136：dump 固件 console（找 t≈10s 的事件）
