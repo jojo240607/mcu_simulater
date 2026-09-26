@@ -151,6 +151,12 @@ fn phy_hover_smoke_10s() {
             }
         }
         // ★§5.136 A/B-②：磁重锚定（把 mag_I 软拉回先验；仿真 .data 未初始化 ⇒ 默认读到 0=关）
+        if let Ok(ds) = std::env::var("PHY_MAG_DELAY") {
+            let dv: f32 = ds.parse().unwrap_or(0.0);
+            let addr = mcu_simulater::elfsym::app_sym("G_ESKF_MAG_DELAY_MS") as u64;
+            m.lock().unwrap().cpu.mem_write(addr, &dv.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：磁延迟补偿 = {dv} ms");
+        }
         if let Ok(qs) = std::env::var("PHY_GYR_NOTCH_Q") {
             let qv: f32 = qs.parse().unwrap_or(0.0);
             let addr = mcu_simulater::elfsym::app_sym("G_ESKF_GYR_NOTCH_Q") as u64;
@@ -244,6 +250,13 @@ fn phy_hover_smoke_10s() {
             let drift = (pos[0] * pos[0] + pos[1] * pos[1]).sqrt();
             max_drift = max_drift.max(drift);
             last = Some((pos, vel));
+        }
+        if _step % 250 == 0 {
+            let sym = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
+            let b = m.lock().unwrap().cpu.mem_read(sym("DBG_MAGI"), 40).unwrap();
+            let g: Vec<f32> = (0..10).map(|i| f32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]])).collect();
+            eprintln!("[mag] t={:.0}s mag_i=({:+.3},{:+.3},{:+.3}) mag_b=({:+.3},{:+.3},{:+.3}) aligned={:.0} dist={:.0} appl={:.0} skip={:.0}",
+                _step as f32 * 0.004, g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9]);
         }
         if _step % 250 == 0 {
             let sym = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
