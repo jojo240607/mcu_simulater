@@ -40,6 +40,10 @@ pub struct PhyBackendImpl {
     steps: u64,
     /// 本后端是否已初始化摇杆中位（一次性 ✓；避免每步覆盖测试设置的通道 ✗）
     rc_init: bool,
+    /// ★§5.144 摇杆 override（MAVLink 语义 ✓）：`Some([ch1..ch4])` 时**每步**写入固件
+    /// `G_RC_OVERRIDE`（PWM µs ✓，ch1=roll/ch2=pitch/ch3=throttle/ch4=yaw ✓）并刷新
+    /// 时间戳（超时 2s ✓ `uplink::get_rc_override` 口径 ✓）
+    rc_override: Option<[u16; 4]>,
 }
 
 impl PhyBackendImpl {
@@ -55,7 +59,15 @@ impl PhyBackendImpl {
             Some(ContactModel::default()),
             vec![],
         );
-        Self { sim, inject_mag, steps: 0, rc_init: false }
+        Self { sim, inject_mag, steps: 0, rc_init: false, rc_override: None }
+    }
+}
+
+impl PhyBackendImpl {
+    /// ★§5.144：设置摇杆 override（PWM µs，ch1..ch4 ✓）；`None` ⇒ 关闭 ✓
+    /// 每步自动刷新时间戳（固件超时判据 2s ✓）
+    pub fn set_rc_override(&mut self, ch: Option<[u16; 4]>) {
+        self.rc_override = ch;
     }
 }
 
@@ -65,6 +77,10 @@ impl PhyBackend for PhyBackendImpl {
     }
 
     fn step_plant(&mut self, m: &mut Machine, st: &Arc<Mutex<FlySimState>>) {
+        // ★§5.144：摇杆 override（每步写入 + 刷新时间戳 ✓ 固件超时 2s ✓）
+        if let Some(ch) = self.rc_override {
+            write_rc_override(m, ch);
+        }
         // ① 读取固件执行器输出（4 路 PWM → 归一化推力 ✓，同 x_phy_hover_smoke）
         let motors = read_thrust(m);
         let cmd = flyctrl_core::vehicle::ActuatorCmd { motor: motors };
@@ -120,6 +136,21 @@ impl PhyBackend for PhyBackendImpl {
             s.rc_ch[5] = 2000.0;
         }
     }
+}
+
+/// ★§5.144：写固件 `G_RC_OVERRIDE`（PWM µs ✓）并刷新 valid/tick（MAVLink override 语义 ✓）。
+/// 固件侧：`uplink::get_rc_override()`（超时 >200 ticks × 10ms = 2s ⇒ 每步刷新即可 ✓）
+fn write_rc_override(m: &mut Machine, ch: [u16; 4]) {
+    let sym = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
+    let a = sym("G_RC_OVERRIDE");
+    for (i, v) in ch.iter().enumerate() {
+        let _ = m.cpu.mem_write(a + (i as u64) * 2, &v.to_le_bytes());
+    }
+    let _ = m.cpu.mem_write(sym("G_RC_OVERRIDE_VALID"), &[1u8]);
+    // 时间戳：用固件自身的 `G_APP_TICKS`（单调 10ms ✓）⇒ 与超时判据同源 ✓
+    let tb = m.cpu.mem_read(sym("G_APP_TICKS.0"), 4).unwrap_or_default();
+    let t = u32::from_le_bytes([tb[0], tb[1], tb[2], tb[3]]);
+    let _ = m.cpu.mem_write(sym("G_RC_OVERRIDE_TICK"), &t.to_le_bytes());
 }
 
 /// 读 4 路 PWM 的 CCR/ARR → 归一化推力（同 `x_phy_hover_smoke` ✓）

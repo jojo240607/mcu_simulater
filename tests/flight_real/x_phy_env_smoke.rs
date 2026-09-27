@@ -81,3 +81,40 @@ fn phy_disturbance_recovered() {
     assert!(final_tilt < 10.0, "扰动后姿态应被拉回（<10°），实际 {final_tilt:.2}°");
     assert_eq!(worst_health, 0, "扰动不应触发 FDIR（health={worst_health}）");
 }
+
+/// ★§5.144 PHY 化迁移③：**摇杆机动（待办）** —— 已完成基础设施，但尚未打通固件通路。
+///
+/// 已定位的事实（本轮实测 ✓，供后续接手）：
+///  · `G_RC_OVERRIDE`/`_VALID`/`_TICK` 已 `#[no_mangle]` 导出 ✓（`uplink.rs` ✓）
+///  · 后端 `set_rc_override()` 每步写入 + 刷新时间戳 ✓ **写入确认生效**：
+///    读回 `[1281,1600,1500,1500] valid=1` ✓（ch1 被固件改写 ⇒ 固件确实在处理 ✓）
+///  · 但 20s 内北向速度恒 0 ✗ ⇒ 通路未打通（候选：模式档位 `rc.mode` 来源、
+///    `rc.fresh`/模式分支、LOITER 下 `LOITER_NUDGE_GAIN` 路径 ✓，见
+///    `app/src/flyctrl/control.rs:324-362`）
+///  · 排查工具：`dbg est` 输出（本构建未启用 VERBOSE ✓）、CTRL_TICKS/G_CMD_MODE 探针
+///    （`G_CMD_MODE` 符号名需核实 ✓）
+#[test]
+#[ignore = "§5.144：RC override 通路待打通（基础设施已完成 ✓，见注释）"]
+fn phy_rc_forward_moves_north() {
+    let secs: u64 = std::env::var("PHY_ENV_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let scn = EnvScenario::new(Motion::Hover, Perturb::clean(), vec![]);
+    let mut h = EnvHarness::new(scn, true);
+    let mut phy = PhyBackendImpl::new(true);
+    phy.set_rc_override(Some([1500, 1600, 1500, 1500]));
+    h.phy = Some(Box::new(phy));
+    h.run_for_ms(400 as f64 * 13.0);
+    let mut max_vn = 0.0f32;
+    let mut worst_health = 0u32;
+    let t0 = h.fw_ms();
+    while h.fw_ms() - t0 < (secs * 1000) as u64 {
+        h.step();
+        let e = h.read_est();
+        max_vn = max_vn.max(e.vel[0]);
+        worst_health = worst_health.max(e.health);
+    }
+    let e = h.read_est();
+    eprintln!("[phy-env] 摇杆机动 {secs}s | max_vn={max_vn:.2}m/s 末北向={:.2}m health={worst_health}", e.pos[0]);
+    assert!(max_vn > 0.5, "北向速度应响应前推摇杆（>0.5m/s），实际 {max_vn:.2}m/s");
+    assert!(e.pos[0] > 1.0, "应向北产生位移（>1m），实际 {:.2}m", e.pos[0]);
+    assert_eq!(worst_health, 0, "摇杆机动不应触发 FDIR（health={worst_health}）");
+}
