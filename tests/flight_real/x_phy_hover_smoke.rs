@@ -175,6 +175,27 @@ fn phy_hover_smoke_10s() {
             m.lock().unwrap().cpu.mem_write(addr, &v.to_le_bytes()).unwrap();
             eprintln!("[phy-smoke] A/B：G_ESKF_MAG_YAW_ON = {v}（2=heading / 3=3D）");
         }
+        if let Ok(mp) = std::env::var("PHY_MAG_PERIOD") {
+            let v: u32 = mp.parse().unwrap_or(15);
+            // aid_period 是结构体字段（非全局符号）⇒ 用符号读偏移不可行 ⇒ 改 poke 全局旋钮
+            // 由 G_ESKF_MAG_PERIOD 覆盖（见 eskf_estimator）
+            let a = mcu_simulater::elfsym::app_sym("G_ESKF_MAG_PERIOD") as u64;
+            m.lock().unwrap().cpu.mem_write(a, &(v as f32).to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：G_ESKF_MAG_PERIOD = {v}");
+        }
+        if let Ok(rk) = std::env::var("PHY_R_MAG_K") {
+            let v: f32 = rk.parse().unwrap_or(1.0);
+            let a = mcu_simulater::elfsym::app_sym("G_ESKF_R_MAG_K") as u64;
+            m.lock().unwrap().cpu.mem_write(a, &v.to_le_bytes()).unwrap();
+            let rd = m.lock().unwrap().cpu.mem_read(a, 4).unwrap();
+            eprintln!("[phy-smoke] A/B：G_ESKF_R_MAG_K = {v} (读回={})", f32::from_le_bytes([rd[0], rd[1], rd[2], rd[3]]));
+        }
+        if let Ok(vf) = std::env::var("PHY_VAR_FLOOR") {
+            let v: f32 = vf.parse().unwrap_or(1.0);
+            let a = mcu_simulater::elfsym::app_sym("G_ESKF_VAR_FLOOR") as u64;
+            m.lock().unwrap().cpu.mem_write(a, &v.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：G_ESKF_VAR_FLOOR = {v}");
+        }
         if std::env::var("PHY_MAG_FREEZE_B").is_ok() {
             let a = mcu_simulater::elfsym::app_sym("G_ESKF_MAG_FREEZE_B") as u64;
             m.lock().unwrap().cpu.mem_write(a, &2.0f32.to_le_bytes()).unwrap();
@@ -217,7 +238,8 @@ fn phy_hover_smoke_10s() {
         let mut st = state.lock().unwrap();
         st.rc_ch[4] = 2000.0; // 解锁
         st.rc_ch[3] = 1500.0;
-        st.rc_ch[5] = 2000.0; // LOITER（§5.136：位置环开启）
+        // ★§5.139 判定旋钮：PHY_NO_LOITER=1 ⇒ 位置环关闭（姿态/自稳模式 ✓）
+        st.rc_ch[5] = if std::env::var("PHY_NO_LOITER").is_ok() { 1000.0 } else { 2000.0 };
     }
 
     // ★PHY 引擎（真实转动动力学）—— 本测试是 PHY 路径的快速守门 + 整定仪表
@@ -240,6 +262,8 @@ fn phy_hover_smoke_10s() {
     eprintln!("[phy-smoke] 磁注入 = {inject_mag}（PHY_INJECT_MAG=1 复现真机语义 ✓）");
     let mut held = true;
     let mut max_tilt = 0.0f32;
+    let mut true_roll_deg = 0.0f32;
+    let mut true_pitch_deg = 0.0f32;
     let mut max_dz = 0.0f32;
     let mut max_drift = 0.0f32;
     let mut last = None;
@@ -282,6 +306,8 @@ fn phy_hover_smoke_10s() {
         if let Some(s) = st {
             let r = s.att.roll().abs().max(s.att.pitch().abs()).to_degrees();
             max_tilt = max_tilt.max(r);
+            true_roll_deg = s.att.roll().to_degrees();
+            true_pitch_deg = s.att.pitch().to_degrees();
             let dz = (pos[2] - HOVER_D).abs();
             max_dz = max_dz.max(dz);
             let drift = (pos[0] * pos[0] + pos[1] * pos[1]).sqrt();
@@ -324,7 +350,7 @@ fn phy_hover_smoke_10s() {
             let h = -(d + 5.0);
             st.baro_pa = 101_325.0 * (-h / 8434.5).exp();
             st.rc_ch[4] = 2000.0;
-            st.rc_ch[5] = 2000.0;
+            st.rc_ch[5] = if std::env::var("PHY_NO_LOITER").is_ok() { 1000.0 } else { 2000.0 };
             // ★§5.136：按开关注入【物理引擎世界场】作为磁（与 x_hover_demo 同源 ✓）
             //   不注入时走 vperiph 回退场 = "惰性磁"（实测完美但与真机语义不符 ✗）
             if inject_mag {
