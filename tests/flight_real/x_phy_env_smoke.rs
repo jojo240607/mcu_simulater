@@ -127,3 +127,83 @@ fn phy_rc_forward_moves_north() {
     assert!(horiz > 1.0, "摇杆应产生水平位移（>1m），实际 {horiz:.2}m");
     assert_eq!(worst_health, 0, "摇杆机动不应触发 FDIR（health={worst_health}）");
 }
+
+/// ★§5.143 PHY 化迁移④：**长跑**（真动力学 + 任务活性）。
+///
+/// 口径（与 `x_env_longrun::long_hover_bounded_and_alive` 一致 ✓）：估计有界 + 健康 0 +
+/// **`SENSOR_SEQ` 持续推进**（任务不冻结 ✓）；真值由真刚体产生 ✓。
+#[test]
+fn phy_long_hover_bounded_and_alive() {
+    let secs: u64 = std::env::var("PHY_ENV_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+    let scn = EnvScenario::new(Motion::Hover, Perturb::clean(), vec![]);
+    let mut h = EnvHarness::new(scn, true);
+    h.phy = Some(Box::new(PhyBackendImpl::new(true)));
+    h.run_for_ms(400 as f64 * 13.0); // 预热（起飞 + 收敛 ✓）
+
+    let seq0 = h.read_sensor_seq();
+    let mut max_pos = 0.0f32;
+    let mut max_hvel = 0.0f32;
+    let mut worst_health = 0u32;
+    let mut last_adv = 0u32;
+    let mut last_seq = seq0;
+    let t0 = h.fw_ms();
+    while h.fw_ms() - t0 < (secs * 1000) {
+        h.step();
+        let e = h.read_est();
+        max_pos = max_pos.max((e.pos[0].powi(2) + e.pos[1].powi(2) + e.pos[2].powi(2)).sqrt());
+        max_hvel = max_hvel.max((e.vel[0].powi(2) + e.vel[1].powi(2)).sqrt());
+        worst_health = worst_health.max(e.health);
+        let sq = h.read_sensor_seq();
+        if sq > last_seq {
+            last_adv = 0;
+        } else {
+            last_adv += 1;
+            assert!(last_adv < 20, "SENSOR_SEQ 连续 {last_adv} 步未推进（任务冻结？）");
+        }
+        last_seq = sq;
+    }
+    let seq1 = h.read_sensor_seq();
+    eprintln!(
+        "[phy-env] 长跑 {secs}s | max_pos={max_pos:.2}m max_hvel={max_hvel:.2}m/s health={worst_health} SENSOR_SEQ {seq0}→{seq1}"
+    );
+    assert!(max_pos < 8.0, "PHY 长跑位置应有界（<8m），实际 {max_pos:.2}m");
+    assert!(max_hvel < 3.0, "PHY 长跑水平速度应有界（<3m/s），实际 {max_hvel:.2}m/s");
+    assert_eq!(worst_health, 0, "PHY 长跑不应触发 FDIR（health={worst_health}）");
+    assert!(seq1 > seq0, "SENSOR_SEQ 应持续推进（{seq0}→{seq1}）");
+}
+
+/// ★§5.143 PHY 化迁移⑤：**传感器零偏容忍**（真动力学 + 恒定加计偏置）。
+///
+/// 口径（与 `x_env_noise_perturb::accel_bias_tolerated` 一致 ✓）：恒定加计偏置下
+/// 速度/位置**有界不失控** + 健康 0；但真值由**真刚体**产生 ⇒ 更能体现"闭环能否容忍"
+/// （偏置会经控制回路放大 ✓ 更苛刻 ✓）。
+#[test]
+fn phy_accel_bias_tolerated() {
+    let secs: u64 = std::env::var("PHY_ENV_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
+    let scn = EnvScenario::new(
+        Motion::Hover,
+        Perturb { accel_bias: [0.3, 0.2, 0.3], ..Perturb::clean() },
+        vec![],
+    );
+    let mut h = EnvHarness::new(scn, true);
+    h.phy = Some(Box::new(PhyBackendImpl::new(true)));
+    h.run_for_ms(400 as f64 * 13.0); // 预热（起飞 + 收敛 ✓）
+
+    let mut max_pos = 0.0f32;
+    let mut max_vel = 0.0f32;
+    let mut worst_health = 0u32;
+    let t0 = h.fw_ms();
+    while h.fw_ms() - t0 < (secs * 1000) {
+        h.step();
+        let e = h.read_est();
+        max_pos = max_pos.max((e.pos[0].powi(2) + e.pos[1].powi(2) + e.pos[2].powi(2)).sqrt());
+        max_vel = max_vel.max((e.vel[0].powi(2) + e.vel[1].powi(2) + e.vel[2].powi(2)).sqrt());
+        worst_health = worst_health.max(e.health);
+    }
+    eprintln!(
+        "[phy-env] 加计偏置 {secs}s | max_pos={max_pos:.2}m max_vel={max_vel:.2}m/s health={worst_health}"
+    );
+    assert!(max_vel < 8.0, "加计偏置下速度应有界（<8m/s），实际 {max_vel:.2}m/s");
+    assert!(max_pos < 12.0, "加计偏置下位置应有界（<12m），实际 {max_pos:.2}m");
+    assert_eq!(worst_health, 0, "加计偏置不应触发 FDIR（health={worst_health}）");
+}
