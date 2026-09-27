@@ -233,6 +233,9 @@ fn phy_hover_smoke_10s() {
     );
     // ★§5.136：PHY_INJECT_MAG=1 ⇒ 注入【物理引擎世界场】作为磁（与 x_hover_demo 同源 ✓）
     //   缺省走 vperiph 回退场（惰性磁 ⇒ 与真机语义不符，仅作冒烟）；复现/回归用注入模式 ✓
+    // ★§5.139 判定旋钮：`PHY_STATIC=1` ⇒ **真值姿态固定为水平、电机不驱动 plant**
+    //   （断开"控制→机体运动"回路 ✓）⇒ 用于判定真机链 3D 失稳是【闭环】还是【滤波器】
+    let static_plant = std::env::var("PHY_STATIC").is_ok();
     let inject_mag = std::env::var("PHY_INJECT_MAG").is_ok();
     eprintln!("[phy-smoke] 磁注入 = {inject_mag}（PHY_INJECT_MAG=1 复现真机语义 ✓）");
     let mut held = true;
@@ -258,6 +261,14 @@ fn phy_hover_smoke_10s() {
                 ],
                 gyro: [flyctrl_core::units::RadianPerSecond(0.0); 3],
             })
+        } else if static_plant {
+            // ★隔离闭环：电机效率置 0 ⇒ 无推力/无力矩 ⇒ 机体保持静止水平 ✓
+            //   （姿态真值恒定 ⇒ "控制→机体运动→观测"回路断开 ✓）
+            held = false;
+            sim.set_motor_eff([0.0; 4]);
+            let cmd = ActuatorCmd { motor: motors };
+            let st = sim.step_hil(&cmd);
+            (Some(st), sim.last_imu())
         } else {
             held = false;
             let cmd = ActuatorCmd { motor: motors };
@@ -276,13 +287,6 @@ fn phy_hover_smoke_10s() {
             let drift = (pos[0] * pos[0] + pos[1] * pos[1]).sqrt();
             max_drift = max_drift.max(drift);
             last = Some((pos, vel));
-        }
-        if _step % 250 == 0 {
-            let sym = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
-            let b = m.lock().unwrap().cpu.mem_read(sym("DBG_MAGI"), 40).unwrap();
-            let g: Vec<f32> = (0..10).map(|i| f32::from_le_bytes([b[4*i], b[4*i+1], b[4*i+2], b[4*i+3]])).collect();
-            eprintln!("[mag] t={:.0}s mag_i=({:+.3},{:+.3},{:+.3}) mag_b=({:+.3},{:+.3},{:+.3}) aligned={:.0} dist={:.0} appl={:.0} skip={:.0}",
-                _step as f32 * 0.004, g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9]);
         }
         if _step % 250 == 0 {
             let sym = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
