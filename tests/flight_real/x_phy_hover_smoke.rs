@@ -175,6 +175,22 @@ fn phy_hover_smoke_10s() {
             m.lock().unwrap().cpu.mem_write(addr, &v.to_le_bytes()).unwrap();
             eprintln!("[phy-smoke] A/B：G_ESKF_MAG_YAW_ON = {v}（2=heading / 3=3D）");
         }
+        if let Ok(ps) = std::env::var("PHY_MAG_PRIOR") {
+            let v: Vec<f32> = ps.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if v.len() == 3 {
+                for (sym, val) in [("G_ESKF_MAG_I_PRIOR_X", v[0]), ("G_ESKF_MAG_I_PRIOR_Y", v[1]), ("G_ESKF_MAG_I_PRIOR_Z", v[2])] {
+                    let a = mcu_simulater::elfsym::app_sym(sym) as u64;
+                    m.lock().unwrap().cpu.mem_write(a, &val.to_le_bytes()).unwrap();
+                }
+                eprintln!("[phy-smoke] A/B：磁先验 = {v:?}");
+            }
+        }
+        if let Ok(rs) = std::env::var("PHY_MAG_RESET_PERIOD") {
+            let v: f32 = rs.parse().unwrap_or(167.0);
+            let addr = mcu_simulater::elfsym::app_sym("G_ESKF_MAG_RESET_PERIOD") as u64;
+            m.lock().unwrap().cpu.mem_write(addr, &v.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：G_ESKF_MAG_RESET_PERIOD = {v}（周期性重锚 ✓）");
+        }
         if std::env::var("PHY_MAG_FREEZE").is_ok() {
             let addr = mcu_simulater::elfsym::app_sym("G_ESKF_MAG_FREEZE") as u64;
             m.lock().unwrap().cpu.mem_write(addr, &2.0f32.to_le_bytes()).unwrap();
