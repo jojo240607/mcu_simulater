@@ -175,6 +175,30 @@ fn phy_hover_smoke_10s() {
             m.lock().unwrap().cpu.mem_write(addr, &v.to_le_bytes()).unwrap();
             eprintln!("[phy-smoke] A/B：G_ESKF_MAG_YAW_ON = {v}（2=heading / 3=3D）");
         }
+        if let Ok(l) = std::env::var("PHY_MAG_LPF_MS") {
+            let v: f32 = l.parse().unwrap_or(0.0);
+            let a = mcu_simulater::elfsym::app_sym("G_ESKF_MAG_PRE_LPF_MS") as u64;
+            m.lock().unwrap().cpu.mem_write(a, &v.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：G_ESKF_MAG_PRE_LPF_MS = {v}");
+        }
+        if let Ok(g) = std::env::var("PHY_GATE") {
+            let v: f32 = g.parse().unwrap_or(5.0);
+            let a = mcu_simulater::elfsym::app_sym("G_ESKF_GATE") as u64;
+            m.lock().unwrap().cpu.mem_write(a, &v.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：G_ESKF_GATE = {v}");
+        }
+        if let Ok(k) = std::env::var("PHY_ATT_KP") {
+            let v: f32 = k.parse().unwrap_or(3.0);
+            let a = mcu_simulater::elfsym::app_sym("G_ATT_KP") as u64;
+            m.lock().unwrap().cpu.mem_write(a, &v.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：G_ATT_KP = {v}");
+        }
+        if let Ok(k) = std::env::var("PHY_ATT_KD") {
+            let v: f32 = k.parse().unwrap_or(0.3);
+            let a = mcu_simulater::elfsym::app_sym("G_ATT_KD") as u64;
+            m.lock().unwrap().cpu.mem_write(a, &v.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：G_ATT_KD = {v}");
+        }
         if let Ok(mp) = std::env::var("PHY_MAG_PERIOD") {
             let v: u32 = mp.parse().unwrap_or(15);
             // aid_period 是结构体字段（非全局符号）⇒ 用符号读偏移不可行 ⇒ 改 poke 全局旋钮
