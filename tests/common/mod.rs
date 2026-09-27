@@ -13,6 +13,15 @@ use mcu_simulater::env::scenario::EnvScenario;
 use mcu_simulater::machine::Machine;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
+pub mod phy_backend;
+
+/// ★§5.143 PHY 化后端接口：把 `EnvHarness` 的运动学场景换成**真动力学**（`SimLoop::step_hil` ✓）。
+/// 实现者持有 `SimLoop<PhySdkWorld>`，按固件执行器指令推进刚体并回写 `FlySimState` ✓
+pub trait PhyBackend {
+    /// 按固件当前执行器输出推进一个物理步，并回写传感器状态（姿态/位置/磁/IMU ✓）
+    fn step_plant(&mut self, m: &mut Machine, st: &Arc<Mutex<FlySimState>>);
+}
+
 /// 单步场景时间（毫秒）——**整数毫秒**（固件 SysTick 是 1ms 粒度）。
 ///
 /// 闭环步进 = **以固件控制拍为唯一时基** ✓（`clock::run_one_control_tick` ✓）：
@@ -197,6 +206,9 @@ pub struct EnvHarness {
     pub last_hb: Option<HbLine>,
     /// 虚拟 USB 主机（被动模型，由本步进驱动）
     pub usb_host: UsbHostModel,
+    /// ★§5.143 PHY 化：可选**真动力学**后端。`Some` 时 `step()` 用
+    /// `SimLoop::step_hil(真实刚体)` 取代 `scn.advance(运动学)` ✓
+    pub phy: Option<Box<dyn PhyBackend>>,
 }
 
 /// 解析后的 hb 心跳行。
@@ -263,6 +275,7 @@ impl EnvHarness {
             log_pos: 0,
             last_hb: None,
             usb_host: UsbHostModel::new(),
+            phy: None,
         }
     }
 
@@ -318,12 +331,17 @@ impl EnvHarness {
         run_one_control_tick(&mut self.m).expect("run_one_control_tick 失败");
         let t_after = self.m.systick_ms();
         // ③ 按【实测流逝】推进场景（自洽 ✓：不假设 dt ✗）
-        let elapsed_ms = (t_after.saturating_sub(t_before)) as f32;
-        let dt = if elapsed_ms > 0.0 { elapsed_ms } else { 1.0 };
-        self.scn.advance(dt / 1000.0);
-        {
-            let mut st = self.st.lock().unwrap();
-            self.scn.write_state(&mut st);
+        //    ★§5.143：若挂了 PHY 后端 ⇒ 用**真动力学**推进（取代运动学 ✓）
+        if let Some(ref mut phy) = self.phy {
+            phy.step_plant(&mut self.m, &self.st);
+        } else {
+            let elapsed_ms = (t_after.saturating_sub(t_before)) as f32;
+            let dt = if elapsed_ms > 0.0 { elapsed_ms } else { 1.0 };
+            self.scn.advance(dt / 1000.0);
+            {
+                let mut st = self.st.lock().unwrap();
+                self.scn.write_state(&mut st);
+            }
         }
         self.steps += 1;
         // 锁相漂移守卫（照 x_hover_noise 模板 ✓）：长期均值必须贴合名义控制周期 ✓
