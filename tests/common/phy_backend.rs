@@ -72,6 +72,21 @@ impl PhyBackendImpl {
 }
 
 impl PhyBackend for PhyBackendImpl {
+    fn pre_tick(&mut self, m: &mut Machine) {
+        // ★§5.145：在固件控制拍**读取之前**写摇杆 override（否则读到上一拍/首拍为 0 ✗）
+        if let Some(ch) = self.rc_override {
+            write_rc_override(m, ch);
+        }
+    }
+
+    fn pre_tick_state(&mut self, st: &Arc<Mutex<FlySimState>>) {
+        // ★§5.145：模式开关/解锁必须在**每拍读取之前**写入（固件/虚拟外设会改写
+        //   `rc_ch[5]` 档位 ⇒ 拍后写无效 ✗ 实测 `rc_ch[5]=500 ⇒ 档 0 ⇒ STABILIZE`）
+        let mut s = st.lock().unwrap();
+        s.rc_ch[4] = 2000.0; // 解锁
+        s.rc_ch[5] = 2000.0; // LOITER（位置环 ✓）
+    }
+
     fn disturb_torque(&mut self, tau: [f64; 3]) {
         self.sim.disturb_torque_impulse(tau);
     }
@@ -123,17 +138,19 @@ impl PhyBackend for PhyBackendImpl {
             // 气压：由高度换算（NED 向下正 ⇒ h = −z ✓）
             let h = -pd;
             s.baro_pa = 101_325.0 * (-(h - HOVER_ALT_REF) / 8434.5).exp();
-            // ★一次性初始化：全部通道置中位（1500 ✓ 同 x_hover_demo 口径），
-            //   之后**不覆盖其他通道** ⇒ 测试可设摇杆（如 rc_ch[1] 前推 ✓）
+            // ★§5.145 一次性初始化（首拍）：**只填零通道**为中位 1500 ✓，
+            //   **绝不覆盖测试已显式设置的通道** ✓（实测教训：无条件写会抹掉模式/摇杆 ✗）
+            //   之后每拍只保持"解锁"（`rc_ch[4]`）✓，模式等由测试/场景掌控 ✓
             if !self.rc_init {
                 for c in s.rc_ch.iter_mut() {
-                    *c = 1500.0;
+                    if *c == 0.0 {
+                        *c = 1500.0;
+                    }
                 }
                 self.rc_init = true;
             }
-            // 解锁 + LOITER（每步保持 ✓）
+            // 解锁（每步保持 ✓）；**模式 `rc_ch[5]` 与摇杆通道不由后端写** ✓（§5.145）
             s.rc_ch[4] = 2000.0;
-            s.rc_ch[5] = 2000.0;
         }
     }
 }

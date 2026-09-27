@@ -167,7 +167,12 @@ pub fn try_app_sym(needle: &str) -> Option<u32> {
     if let Some((a, _)) = cache().lock().unwrap().get(needle) {
         return Some(*a);
     }
-    all().iter().find(|s| s.name.contains(needle) && s.addr != 0).map(|s| s.addr)
+    // ★§5.145：精确名优先（同 `app_sym` ✓）
+    all()
+        .iter()
+        .find(|s| s.name == needle && s.addr != 0)
+        .or_else(|| all().iter().find(|s| s.name.contains(needle) && s.addr != 0))
+        .map(|s| s.addr)
 }
 
 pub fn app_sym(needle: &str) -> u32 {
@@ -175,9 +180,14 @@ pub fn app_sym(needle: &str) -> u32 {
         return *a;
     }
     let syms = all();
+    // ★§5.145 修复（机械性 ✓）：**精确名优先**，其次才是子串匹配。
+    //   原实现只做 `contains` ⇒ 查 `G_RC_OVERRIDE` 会命中 `G_RC_OVERRIDE_VALID`（先出现 ✗）
+    //   ⇒ 读到错误地址 ⇒ 写入被丢弃（PHY 摇杆通路实测"谜之无效"的根因 ✓）。
+    //   精确优先对既有子串用法**完全兼容**（名字唯一时两者相同 ✓）。
     let hit = syms
         .iter()
-        .find(|s| s.name.contains(needle) && s.addr != 0)
+        .find(|s| s.name == needle)
+        .or_else(|| syms.iter().find(|s| s.name.contains(needle) && s.addr != 0))
         .unwrap_or_else(|| {
             panic!(
                 "ELF 符号未找到: {needle:?}（ELF={}，共 {} 个符号）——固件符号改名/被裁掉了？",

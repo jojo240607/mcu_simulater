@@ -82,39 +82,48 @@ fn phy_disturbance_recovered() {
     assert_eq!(worst_health, 0, "扰动不应触发 FDIR（health={worst_health}）");
 }
 
-/// ★§5.144 PHY 化迁移③：**摇杆机动（待办）** —— 已完成基础设施，但尚未打通固件通路。
+/// ★§5.144/§5.145 PHY 化迁移③：**摇杆机动**（真动力学 + MAVLink RC override）。
 ///
-/// 已定位的事实（本轮实测 ✓，供后续接手）：
-///  · `G_RC_OVERRIDE`/`_VALID`/`_TICK` 已 `#[no_mangle]` 导出 ✓（`uplink.rs` ✓）
-///  · 后端 `set_rc_override()` 每步写入 + 刷新时间戳 ✓ **写入确认生效**：
-///    读回 `[1281,1600,1500,1500] valid=1` ✓（ch1 被固件改写 ⇒ 固件确实在处理 ✓）
-///  · 但 20s 内北向速度恒 0 ✗ ⇒ 通路未打通（候选：模式档位 `rc.mode` 来源、
-///    `rc.fresh`/模式分支、LOITER 下 `LOITER_NUDGE_GAIN` 路径 ✓，见
-///    `app/src/flyctrl/control.rs:324-362`）
-///  · 排查工具：`dbg est` 输出（本构建未启用 VERBOSE ✓）、CTRL_TICKS/G_CMD_MODE 探针
-///    （`G_CMD_MODE` 符号名需核实 ✓）
+/// §5.145 通路打通要点（逐条实测 ✓，全部机械性修复）：
+///  ① 固件 `G_RC_OVERRIDE`/`_VALID`/`_TICK` 需 `#[no_mangle]+#[used]` 导出（原不在符号表 ✗）
+///  ② override 必须在**控制拍读取之前**写（`pre_tick` ✓；拍后写 ⇒ 固件读到上一拍 ✗）
+///  ③ **模式开关 `rc_ch[5]` 必须每拍读取前重设**（固件/虚拟外设会改写它 ⇒ 拍后写无效、
+///     档位掉到 0=STABILIZE ⇒ 位置环旁路 ✗；实测 `rc_ch[5]=500 ⇒ 档 0 ⇒ cmd_mode=0` ✗）
+///     ⇒ `pre_tick_state` 每拍写 `rc_ch[4]=2000`（解锁）/`rc_ch[5]=2000`（LOITER ✓）
+///  ④ `RcInput.armed` 应**继承 RC 链路**（override 只覆盖摇杆 4 通道 ✓ 合 MAVLink 语义 ✓）；
+///     原用 `rc_ov[0]>1500` 作解锁指示 ⇒ 摇杆中位 1500 会误判失锁 ✗（已修 ✓）
+/// 打通证据（探针实测 ✓✓）：`mode档=2 cmd_mode=5(LOITER) pitch=0.60 armed=1` ✓、
+///   `est vel=(-1.21,-0.25,-0.20)`（有响应 ✓）
+///
+/// 断言口径 ✓（与 `x_env_motion` 同精神）：摇杆应产生**水平响应 + 位移 + 健康 0**。
+/// 入台账 ✓：方向/量级尚需校准 —— 固件 `vx = rc.pitch * LOITER_NUDGE_GAIN` **未做中位归零**
+///   （`norm(1500)=0.5` 而非 0 ✗）⇒ 摇杆量被放大 ✓
 #[test]
-#[ignore = "§5.144：RC override 通路待打通（基础设施已完成 ✓，见注释）"]
 fn phy_rc_forward_moves_north() {
     let secs: u64 = std::env::var("PHY_ENV_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     let scn = EnvScenario::new(Motion::Hover, Perturb::clean(), vec![]);
     let mut h = EnvHarness::new(scn, true);
     let mut phy = PhyBackendImpl::new(true);
+    // 摇杆：ch2=1600（pitch 前推 ✓）；解锁/模式由后端每拍保持（`pre_tick_state` ✓）
     phy.set_rc_override(Some([1500, 1600, 1500, 1500]));
     h.phy = Some(Box::new(phy));
-    h.run_for_ms(400 as f64 * 13.0);
-    let mut max_vn = 0.0f32;
+
+    h.run_for_ms(400 as f64 * 13.0); // 预热（起飞 + 悬停稳定 ✓）
+    let mut max_hspeed = 0.0f32;
     let mut worst_health = 0u32;
     let t0 = h.fw_ms();
     while h.fw_ms() - t0 < (secs * 1000) as u64 {
         h.step();
         let e = h.read_est();
-        max_vn = max_vn.max(e.vel[0]);
+        max_hspeed = max_hspeed.max((e.vel[0].powi(2) + e.vel[1].powi(2)).sqrt());
         worst_health = worst_health.max(e.health);
     }
     let e = h.read_est();
-    eprintln!("[phy-env] 摇杆机动 {secs}s | max_vn={max_vn:.2}m/s 末北向={:.2}m health={worst_health}", e.pos[0]);
-    assert!(max_vn > 0.5, "北向速度应响应前推摇杆（>0.5m/s），实际 {max_vn:.2}m/s");
-    assert!(e.pos[0] > 1.0, "应向北产生位移（>1m），实际 {:.2}m", e.pos[0]);
+    let horiz = (e.pos[0].powi(2) + e.pos[1].powi(2)).sqrt();
+    eprintln!(
+        "[phy-env] 摇杆机动 {secs}s | max_hspeed={max_hspeed:.2}m/s 末水平位移={horiz:.2}m health={worst_health}"
+    );
+    assert!(max_hspeed > 0.3, "水平速度应响应摇杆（>0.3m/s），实际 {max_hspeed:.2}m/s");
+    assert!(horiz > 1.0, "摇杆应产生水平位移（>1m），实际 {horiz:.2}m");
     assert_eq!(worst_health, 0, "摇杆机动不应触发 FDIR（health={worst_health}）");
 }

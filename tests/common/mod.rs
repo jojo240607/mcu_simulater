@@ -22,6 +22,10 @@ pub trait PhyBackend {
     fn step_plant(&mut self, m: &mut Machine, st: &Arc<Mutex<FlySimState>>);
     /// 施加力矩脉冲（N·m·s ✓）——抗扰场景用（默认 no-op ⇒ 后端可不实现 ✓）
     fn disturb_torque(&mut self, _tau: [f64; 3]) {}
+    /// 控制拍**之前**的钩子（默认 no-op ✓）：用于把摇杆 override 等输入在固件读取前写入 ✓
+    fn pre_tick(&mut self, _m: &mut Machine) {}
+    /// 控制拍**之前**写 `FlySimState`（模式开关/解锁等 ✓；默认 no-op ✓）
+    fn pre_tick_state(&mut self, _st: &Arc<Mutex<FlySimState>>) {}
 }
 
 /// 单步场景时间（毫秒）——**整数毫秒**（固件 SysTick 是 1ms 粒度）。
@@ -330,6 +334,12 @@ impl EnvHarness {
         use mcu_simulater::clock::run_one_control_tick;
         // ② 固件推进恰好一拍控制（内部轮询固件符号 CTRL_TICKS ✓，不改固件行为 ✓）
         let t_before = self.m.systick_ms();
+        // ★§5.145：若挂了 PHY 后端且有摇杆 override ⇒ 控制拍**之前**也写一次
+        //   （固件在拍内读 override ✓；此前只在拍后写 ⇒ 读到的是上一拍（首拍为 0）✗）
+        if let Some(ref mut phy) = self.phy {
+            phy.pre_tick(&mut self.m);
+            phy.pre_tick_state(&self.st);
+        }
         run_one_control_tick(&mut self.m).expect("run_one_control_tick 失败");
         let t_after = self.m.systick_ms();
         // ③ 按【实测流逝】推进场景（自洽 ✓：不假设 dt ✗）
