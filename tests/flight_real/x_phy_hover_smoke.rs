@@ -175,6 +175,11 @@ fn phy_hover_smoke_10s() {
             m.lock().unwrap().cpu.mem_write(addr, &v.to_le_bytes()).unwrap();
             eprintln!("[phy-smoke] A/B：G_ESKF_MAG_YAW_ON = {v}（2=heading / 3=3D）");
         }
+        if std::env::var("PHY_MAG_FREEZE_B").is_ok() {
+            let a = mcu_simulater::elfsym::app_sym("G_ESKF_MAG_FREEZE_B") as u64;
+            m.lock().unwrap().cpu.mem_write(a, &2.0f32.to_le_bytes()).unwrap();
+            eprintln!("[phy-smoke] A/B：G_ESKF_MAG_FREEZE_B = 2（冻结硬铁 ✓）");
+        }
         if let Ok(ps) = std::env::var("PHY_MAG_PRIOR") {
             let v: Vec<f32> = ps.split(',').filter_map(|x| x.trim().parse().ok()).collect();
             if v.len() == 3 {
