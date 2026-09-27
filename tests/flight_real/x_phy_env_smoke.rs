@@ -40,3 +40,44 @@ fn phy_hover_bounded_and_healthy() {
     assert!(max_tilt < 45.0, "PHY 悬停姿态应有界（<45°），实际 {max_tilt:.1}°");
     assert_eq!(worst_health, 0, "PHY 悬停不应触发 FDIR（health={worst_health}）");
 }
+
+/// ★§5.143 PHY 化迁移②：**机动/扰动场景**（真动力学下的鲁棒性）。
+///
+/// 说明 ✓：摇杆机动需 **MAVLink RC override**（固件经 `rc_ov` 取摇杆 ✓，非虚拟外设
+/// `FlySimState.rc_ch` ✗）⇒ 该基础设施另立目标。本迁移改做**扰动注入**（无需摇杆 ✓）：
+/// 施加力矩脉冲 ⇒ 真动力学下机身被扰 ⇒ 断言**姿态被拉回且有界**（闭环抗扰 ✓）。
+#[test]
+fn phy_disturbance_recovered() {
+    let secs: u64 = std::env::var("PHY_ENV_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let scn = EnvScenario::new(Motion::Hover, Perturb::clean(), vec![]);
+    let mut h = EnvHarness::new(scn, true);
+    h.phy = Some(Box::new(PhyBackendImpl::new(true)));
+    h.run_for_ms(400 as f64 * 13.0); // 预热（起飞 + 悬停稳定 ✓）
+
+    let mut max_tilt = 0.0f32;
+    let mut worst_health = 0u32;
+    let mut peak = 0.0f32;
+    let t0 = h.fw_ms();
+    let mut k = 0u32;
+    while h.fw_ms() - t0 < (secs * 1000) as u64 {
+        h.step();
+        // 在 t≈5s / 10s 处各施加一次力矩脉冲（经 `PhyBackendImpl` 的 plant ✓）
+        k += 1;
+        if k == 1250 || k == 2500 {
+            if let Some(ref mut phy) = h.phy {
+                phy.disturb_torque([0.6, 0.0, 0.0]); // 绕 x 脉冲（N·m·s ✓）
+            }
+        }
+        let e = h.read_est();
+        let tilt = e.euler()[0].abs().max(e.euler()[1].abs());
+        max_tilt = max_tilt.max(tilt);
+        peak = peak.max(tilt);
+        worst_health = worst_health.max(e.health);
+    }
+    let e = h.read_est();
+    let final_tilt = e.euler()[0].abs().max(e.euler()[1].abs());
+    eprintln!("[phy-env] 抗扰 {secs}s | peak_tilt={peak:.1}° max_tilt={max_tilt:.1}° 末态={final_tilt:.2}° health={worst_health}");
+    assert!(max_tilt < 45.0, "扰动下姿态应有界（<45°），实际 {max_tilt:.1}°");
+    assert!(final_tilt < 10.0, "扰动后姿态应被拉回（<10°），实际 {final_tilt:.2}°");
+    assert_eq!(worst_health, 0, "扰动不应触发 FDIR（health={worst_health}）");
+}

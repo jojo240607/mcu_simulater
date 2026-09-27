@@ -38,6 +38,8 @@ pub struct PhyBackendImpl {
     inject_mag: bool,
     /// 起始真值（用于 `FlySimState` 的位置/姿态回写基准 ✓）
     steps: u64,
+    /// 本后端是否已初始化摇杆中位（一次性 ✓；避免每步覆盖测试设置的通道 ✗）
+    rc_init: bool,
 }
 
 impl PhyBackendImpl {
@@ -53,11 +55,15 @@ impl PhyBackendImpl {
             Some(ContactModel::default()),
             vec![],
         );
-        Self { sim, inject_mag, steps: 0 }
+        Self { sim, inject_mag, steps: 0, rc_init: false }
     }
 }
 
 impl PhyBackend for PhyBackendImpl {
+    fn disturb_torque(&mut self, tau: [f64; 3]) {
+        self.sim.disturb_torque_impulse(tau);
+    }
+
     fn step_plant(&mut self, m: &mut Machine, st: &Arc<Mutex<FlySimState>>) {
         // ① 读取固件执行器输出（4 路 PWM → 归一化推力 ✓，同 x_phy_hover_smoke）
         let motors = read_thrust(m);
@@ -101,7 +107,15 @@ impl PhyBackend for PhyBackendImpl {
             // 气压：由高度换算（NED 向下正 ⇒ h = −z ✓）
             let h = -pd;
             s.baro_pa = 101_325.0 * (-(h - HOVER_ALT_REF) / 8434.5).exp();
-            // 解锁 + LOITER（位置环 ✓；与 env 家族既有口径一致 ✓）
+            // ★一次性初始化：全部通道置中位（1500 ✓ 同 x_hover_demo 口径），
+            //   之后**不覆盖其他通道** ⇒ 测试可设摇杆（如 rc_ch[1] 前推 ✓）
+            if !self.rc_init {
+                for c in s.rc_ch.iter_mut() {
+                    *c = 1500.0;
+                }
+                self.rc_init = true;
+            }
+            // 解锁 + LOITER（每步保持 ✓）
             s.rc_ch[4] = 2000.0;
             s.rc_ch[5] = 2000.0;
         }

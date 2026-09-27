@@ -20,6 +20,8 @@ pub mod phy_backend;
 pub trait PhyBackend {
     /// 按固件当前执行器输出推进一个物理步，并回写传感器状态（姿态/位置/磁/IMU ✓）
     fn step_plant(&mut self, m: &mut Machine, st: &Arc<Mutex<FlySimState>>);
+    /// 施加力矩脉冲（N·m·s ✓）——抗扰场景用（默认 no-op ⇒ 后端可不实现 ✓）
+    fn disturb_torque(&mut self, _tau: [f64; 3]) {}
 }
 
 /// 单步场景时间（毫秒）——**整数毫秒**（固件 SysTick 是 1ms 粒度）。
