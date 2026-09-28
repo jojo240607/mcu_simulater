@@ -20,6 +20,7 @@ use fly_sim_core::sim::SimLoop;
 use fly_sim_core::{ControllerKind, PhySdkWorld, SensorConfig};
 use flyctrl_core::config::VehicleConfig;
 use mcu_simulater::machine::Machine;
+use mcu_simulater::env::scenario::Perturb;
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
 use super::PhyBackend;
@@ -40,6 +41,12 @@ pub struct PhyBackendImpl {
     steps: u64,
     /// 本后端是否已初始化摇杆中位（一次性 ✓；避免每步覆盖测试设置的通道 ✗）
     rc_init: bool,
+    /// ★§5.147 传感扰动（加计/陀螺零偏、阶跃等 ✓）：PHY 后端**绕过**运动学
+    /// `scn.write_state` ⇒ 扰动须由后端自行施加（否则"零偏测例"会静默失效 ✗ 实测
+    /// `gyro_bias=[0.05,0,0]` 下 `max_tilt=0.00°` ✗）
+    pub perturb: Perturb,
+    /// 已流逝时间（秒 ✓，用于 `accel_bias_step` 的阶跃判据 ✓）
+    t_secs: f32,
     /// ★§5.144 摇杆 override（MAVLink 语义 ✓）：`Some([ch1..ch4])` 时**每步**写入固件
     /// `G_RC_OVERRIDE`（PWM µs ✓，ch1=roll/ch2=pitch/ch3=throttle/ch4=yaw ✓）并刷新
     /// 时间戳（超时 2s ✓ `uplink::get_rc_override` 口径 ✓）
@@ -59,11 +66,24 @@ impl PhyBackendImpl {
             Some(ContactModel::default()),
             vec![],
         );
-        Self { sim, inject_mag, steps: 0, rc_init: false, rc_override: None }
+        Self {
+            sim,
+            inject_mag,
+            steps: 0,
+            rc_init: false,
+            rc_override: None,
+            perturb: Perturb::clean(),
+            t_secs: 0.0,
+        }
     }
 }
 
 impl PhyBackendImpl {
+    /// ★§5.147：设置传感扰动（与 `EnvScenario` 的 `Perturb` 同义 ✓）
+    pub fn set_perturb(&mut self, p: Perturb) {
+        self.perturb = p;
+    }
+
     /// ★§5.144：设置摇杆 override（PWM µs，ch1..ch4 ✓）；`None` ⇒ 关闭 ✓
     /// 每步自动刷新时间戳（固件超时判据 2s ✓）
     pub fn set_rc_override(&mut self, ch: Option<[u16; 4]>) {
@@ -97,6 +117,7 @@ impl PhyBackend for PhyBackendImpl {
             write_rc_override(m, ch);
         }
         // ① 读取固件执行器输出（4 路 PWM → 归一化推力 ✓，同 x_phy_hover_smoke）
+        self.t_secs += 0.004; // 控制拍 ≈4ms ✓（用于阶跃判据 ✓）
         let motors = read_thrust(m);
         let cmd = flyctrl_core::vehicle::ActuatorCmd { motor: motors };
         // ② 真动力学推进一步（由执行器驱动刚体 ✓）
@@ -122,15 +143,24 @@ impl PhyBackend for PhyBackendImpl {
                 world.vel[1].0 as f32,
                 world.vel[2].0 as f32,
             ];
+            // ★§5.147：施加传感扰动（加计/陀螺零偏 + 阶跃 ✓；与 `scenario.rs:382-396` 同义 ✓）
+            let mut bias = self.perturb.accel_bias;
+            if let Some((bt, d)) = self.perturb.accel_bias_step {
+                if self.t_secs >= bt {
+                    for k in 0..3 {
+                        bias[k] += d[k];
+                    }
+                }
+            }
             s.imu_acc = [
-                imu.accel[0].0 as f32,
-                imu.accel[1].0 as f32,
-                imu.accel[2].0 as f32,
+                imu.accel[0].0 as f32 + bias[0],
+                imu.accel[1].0 as f32 + bias[1],
+                imu.accel[2].0 as f32 + bias[2],
             ];
             s.imu_gyr = [
-                imu.gyro[0].0 as f32,
-                imu.gyro[1].0 as f32,
-                imu.gyro[2].0 as f32,
+                imu.gyro[0].0 as f32 + self.perturb.gyro_bias[0],
+                imu.gyro[1].0 as f32 + self.perturb.gyro_bias[1],
+                imu.gyro[2].0 as f32 + self.perturb.gyro_bias[2],
             ];
             if self.inject_mag {
                 s.mag = Some(self.sim.last_mag());

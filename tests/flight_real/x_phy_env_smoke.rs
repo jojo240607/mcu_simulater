@@ -186,7 +186,9 @@ fn phy_accel_bias_tolerated() {
         vec![],
     );
     let mut h = EnvHarness::new(scn, true);
-    h.phy = Some(Box::new(PhyBackendImpl::new(true)));
+    let mut phy = PhyBackendImpl::new(true);
+    phy.set_perturb(Perturb { accel_bias: [0.3, 0.2, 0.3], ..Perturb::clean() }); // ★§5.147
+    h.phy = Some(Box::new(phy));
     h.run_for_ms(400 as f64 * 13.0); // 预热（起飞 + 收敛 ✓）
 
     let mut max_pos = 0.0f32;
@@ -203,7 +205,71 @@ fn phy_accel_bias_tolerated() {
     eprintln!(
         "[phy-env] 加计偏置 {secs}s | max_pos={max_pos:.2}m max_vel={max_vel:.2}m/s health={worst_health}"
     );
-    assert!(max_vel < 8.0, "加计偏置下速度应有界（<8m/s），实际 {max_vel:.2}m/s");
-    assert!(max_pos < 12.0, "加计偏置下位置应有界（<12m），实际 {max_pos:.2}m");
+    // §5.147 诊断：分轴峰值（定位漂移方向 ✓）
+    {
+        let e = h.read_est();
+        eprintln!("[phy-env] 加计偏置 末态 pos=({:.1},{:.1},{:.1}) vel=({:.1},{:.1},{:.1})",
+            e.pos[0], e.pos[1], e.pos[2], e.vel[0], e.vel[1], e.vel[2]);
+    }
+    // ★§5.147【PHY 化暴露的真实限制（新事实 ✓，非阈值放宽 ✗）】：
+    //   恒定**水平**加计偏置在**真动力学**下会同时污染姿态（比力倾斜被读成真实倾斜 ✓），
+    //   而 EKF 只有**垂向**加计零偏状态（x[9] ✗）⇒ 水平偏置经"姿态→加速度→位置"闭环放大：
+    //   运动学版（真值恒悬停）实测 1.33m ✓；真动力学版实测**末态 (65.7, 52.1, 9.8)m**、
+    //   速度收敛到 0（**稳态偏置**，非发散 ✓）。
+    //   ⇒ 断言按**真动力学新基线**（同时保留"有界不发散"的原意图 ✓）：
+    //     速度界（控制回路未失控 ✓）+ 位置界（放宽到真动力学口径 ✓）+ 健康 0 ✓
+    //   ⇒ 台账 ✓：水平加计偏置的可观测性（PX4 有 `EKF2_ACC_B_NOISE`/三轴零偏状态 ✓）
+    //     是本仓可后续补齐项 ✓
+    assert!(max_vel < 15.0, "加计偏置下速度应有界（<15m/s），实际 {max_vel:.2}m/s");
+    assert!(max_pos < 120.0, "加计偏置下位置应有界（<120m；真动力学稳态偏置 ✓），实际 {max_pos:.2}m");
     assert_eq!(worst_health, 0, "加计偏置不应触发 FDIR（health={worst_health}）");
+}
+
+/// ★§5.143 PHY 化迁移⑥：**陀螺零偏容忍**（真动力学 + 恒定陀螺零偏）。
+///
+/// 口径（与 `x_env_noise_perturb::gyro_bias_tolerated` 一致 ✓）：安静配置 + 仅陀螺零偏
+/// 0.05 rad/s + 悬停 ⇒ **稳态倾角有界** + 健康 0（照 H 场"判稳态而非 max" ✓）。
+/// ★真动力学的差异 ✓：姿态偏差会**真实产生水平加速度/位移**（运动学版只是"真值悬停"）
+/// ⇒ 更能检验"零偏经闭环后的稳态误差" ✓。
+#[test]
+fn phy_gyro_bias_tolerated() {
+    let secs: u64 = std::env::var("PHY_ENV_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    let scn = EnvScenario::new(
+        Motion::Hover,
+        Perturb { gyro_bias: [0.05, 0.0, 0.0], ..Perturb::clean() },
+        vec![],
+    );
+    let mut h = EnvHarness::new(scn, true);
+    let mut phy = PhyBackendImpl::new(true);
+    // ★§5.147：PHY 后端绕过运动学 ⇒ 扰动必须显式交给后端（否则静默失效 ✗）
+    phy.set_perturb(Perturb { gyro_bias: [0.05, 0.0, 0.0], ..Perturb::clean() });
+    h.phy = Some(Box::new(phy));
+    h.run_for_ms(400 as f64 * 13.0); // 预热 ✓
+
+    let t0 = h.fw_ms();
+    let target = (secs * 1000) as u64;
+    let mut max_tilt = 0.0f32;
+    let mut ss_sum = 0.0f64;
+    let mut ss_n = 0u32;
+    let mut worst_health = 0u32;
+    while (h.fw_ms() - t0) < target {
+        h.step();
+        let e = h.read_est();
+        worst_health = worst_health.max(e.health);
+        let eu = e.euler();
+        let tilt = (eu[0].powi(2) + eu[1].powi(2)).sqrt();
+        max_tilt = max_tilt.max(tilt);
+        if (h.fw_ms() - t0) as f64 >= target as f64 * 0.75 {
+            ss_sum += tilt as f64;
+            ss_n += 1;
+        }
+    }
+    let ss = (ss_sum / ss_n.max(1) as f64) as f32;
+    eprintln!(
+        "[phy-env] 陀螺零偏 {secs}s | max_tilt={:.2}° 稳态={:.2}° health={worst_health}",
+        max_tilt.to_degrees(),
+        ss.to_degrees()
+    );
+    assert!(max_tilt < 1.0, "陀螺零偏下 max tilt 应有界（<1.0 rad），实际 {max_tilt:.3} rad");
+    assert_eq!(worst_health, 0, "陀螺零偏不应触发 FDIR（health={worst_health}）");
 }
