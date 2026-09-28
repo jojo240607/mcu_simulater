@@ -280,3 +280,52 @@ fn phy_gyro_bias_tolerated() {
     assert!(max_tilt < 1.0, "陀螺零偏下 max tilt 应有界（<1.0 rad），实际 {max_tilt:.3} rad");
     assert_eq!(worst_health, 0, "陀螺零偏不应触发 FDIR（health={worst_health}）");
 }
+
+/// ★§5.150 PHY 化迁移⑦：**GPS 失锁 → FDIR Degraded → 恢复**（真动力学）。
+///
+/// 口径（与 `x_env_faults::gps_drop_degraded_then_recover` 一致 ✓）：GPS 失锁 ⇒
+/// `fix=0` ⇒ 40 拍后 **Degraded**；恢复 fix ⇒ 回 **Nominal** ✓。
+/// ★真动力学差异 ✓：失锁期间无位置观测 ⇒ 真闭环下机体真会被推走（运动学版真值恒悬停 ✗）
+/// ⇒ 更能检验"无 GPS 时的漂移 + 恢复后的收敛" ✓。
+#[test]
+fn phy_gps_drop_degraded_then_recover() {
+    use mcu_simulater::env::scenario::FaultEvent;
+    let scn = EnvScenario::new(Motion::Hover, Perturb::clean(), vec![]);
+    let mut h = EnvHarness::new(scn, true);
+    let mut phy = PhyBackendImpl::new(true);
+    // ★§5.150 时序（关键 ✓）：`t_secs` 自**后端挂载**起累计 ⇒ 预热（≈5.2s 固件时间）
+    //   会消耗掉早期时刻 ⇒ 故障 MUST 设在预热**之后**（否则预热期已越过 ✗ 实测不触发 ✓）。
+    //   预热时长按 `run_for_ms(400*13)` ≈ 5.2s（实测）⇒ 取 7.0s 留余量 ✓
+    phy.set_faults(vec![FaultEvent::GpsDrop { t: 7.0, dur: 2.0 }]);
+    h.phy = Some(Box::new(phy));
+    h.run_for_ms(400 as f64 * 13.0); // 预热（起飞 + GPS fix ✓；后端时间 ≈5.2s）
+
+    // ① 观察 Degraded
+    let mut saw_degraded = false;
+    let t0 = h.fw_ms();
+    while h.fw_ms() - t0 < 6000 {
+        h.step();
+        if h.read_est().health == 1 {
+            saw_degraded = true;
+            break;
+        }
+    }
+    assert!(saw_degraded, "GPS 失锁应触发 Degraded（health=1）");
+    // ② 观察恢复 Nominal
+    let mut recovered = false;
+    let t1 = h.fw_ms();
+    while h.fw_ms() - t1 < 8000 {
+        h.step();
+        if h.read_est().health == 0 {
+            recovered = true;
+            break;
+        }
+    }
+    let e = h.read_est();
+    let drift = (e.pos[0].powi(2) + e.pos[1].powi(2)).sqrt();
+    eprintln!(
+        "[phy-env] GPS 失锁→恢复 ✓ | degraded={saw_degraded} recovered={recovered} 末水平漂移={drift:.2}m"
+    );
+    assert!(recovered, "GPS 恢复后 FDIR 应回 Nominal（health=0）");
+    assert!(drift < 20.0, "失锁期间漂移应有界（<20m），实际 {drift:.2}m");
+}

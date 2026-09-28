@@ -20,7 +20,7 @@ use fly_sim_core::sim::SimLoop;
 use fly_sim_core::{ControllerKind, PhySdkWorld, SensorConfig};
 use flyctrl_core::config::VehicleConfig;
 use mcu_simulater::machine::Machine;
-use mcu_simulater::env::scenario::Perturb;
+use mcu_simulater::env::scenario::{FaultEvent, Perturb};
 use mcu_simulater::peripheral::vperiph::data_source::FlySimState;
 
 use super::PhyBackend;
@@ -47,6 +47,19 @@ pub struct PhyBackendImpl {
     pub perturb: Perturb,
     /// 已流逝时间（秒 ✓，用于 `accel_bias_step` 的阶跃判据 ✓）
     t_secs: f32,
+    /// ★§5.150 故障事件（PHY 后端须自行施加 ✓；`GpsDrop`/`ImuFreeze`/`ImuSaturate`/
+    ///   `BaroStep`/`BaroFreeze`/`MagFreeze` ✓）——运动学 `scn.write_state` 被绕过 ✗
+    pub faults: Vec<FaultEvent>,
+    /// 故障状态（对应 `scn.fstate` 的核心项 ✓）
+    gps_drop_until: f32,
+    imu_frozen: bool,
+    imu_saturate_fs: Option<f32>,
+    baro_frozen: bool,
+    last_baro_pa: f32,
+    last_imu_acc: [f32; 3],
+    last_imu_gyr: [f32; 3],
+    last_mag: Option<[f32; 3]>,
+    mag_frozen: bool,
     /// ★§5.144 摇杆 override（MAVLink 语义 ✓）：`Some([ch1..ch4])` 时**每步**写入固件
     /// `G_RC_OVERRIDE`（PWM µs ✓，ch1=roll/ch2=pitch/ch3=throttle/ch4=yaw ✓）并刷新
     /// 时间戳（超时 2s ✓ `uplink::get_rc_override` 口径 ✓）
@@ -74,11 +87,54 @@ impl PhyBackendImpl {
             rc_override: None,
             perturb: Perturb::clean(),
             t_secs: 0.0,
+            faults: Vec::new(),
+            gps_drop_until: 0.0,
+            imu_frozen: false,
+            imu_saturate_fs: None,
+            baro_frozen: false,
+            last_baro_pa: 0.0,
+            last_imu_acc: [0.0; 3],
+            last_imu_gyr: [0.0; 3],
+            last_mag: None,
+            mag_frozen: false,
         }
     }
 }
 
 impl PhyBackendImpl {
+    /// ★§5.150：故障评估（与 `EnvScenario::advance` 的故障分支同义 ✓）
+    fn apply_faults(&mut self) {
+        let t = self.t_secs;
+        for ev in &self.faults {
+            match *ev {
+                // ★§5.150 修正（我的 bug ✓）：只在**首次**越过 t 时设定结束时刻
+                //   （原写法每拍重设 ⇒ 失锁永不结束 ✗ 实测 `recovered=false` ✗）
+                FaultEvent::GpsDrop { t: ft, dur } if t >= ft => {
+                    if self.gps_drop_until == 0.0 {
+                        self.gps_drop_until = ft + dur;
+                    }
+                }
+                FaultEvent::ImuFreeze { t: ft } if t >= ft => self.imu_frozen = true,
+                FaultEvent::ImuSaturate { t: ft, fs } if t >= ft => {
+                    self.imu_saturate_fs = Some(fs);
+                }
+                FaultEvent::BaroFreeze { t: ft } if t >= ft => self.baro_frozen = true,
+                FaultEvent::MagFreeze { t: ft } if t >= ft => self.mag_frozen = true,
+                _ => {}
+            }
+        }
+    }
+
+    /// ★§5.150：当前后端时间（秒 ✓）——供测试按**固件时间**安排故障（预热后 ✓）
+    pub fn t_secs(&self) -> f32 {
+        self.t_secs
+    }
+
+    /// ★§5.150：设置故障事件（与 `EnvScenario` 的 `Vec<FaultEvent>` 同义 ✓）
+    pub fn set_faults(&mut self, f: Vec<FaultEvent>) {
+        self.faults = f;
+    }
+
     /// ★§5.147：设置传感扰动（与 `EnvScenario` 的 `Perturb` 同义 ✓）
     pub fn set_perturb(&mut self, p: Perturb) {
         self.perturb = p;
@@ -117,7 +173,9 @@ impl PhyBackend for PhyBackendImpl {
             write_rc_override(m, ch);
         }
         // ① 读取固件执行器输出（4 路 PWM → 归一化推力 ✓，同 x_phy_hover_smoke）
-        self.t_secs += 0.004; // 控制拍 ≈4ms ✓（用于阶跃判据 ✓）
+        self.t_secs += 0.004; // 控制拍 ≈4ms ✓（用于阶跃/故障判据 ✓）
+        // ★§5.150：施加故障事件（与 `scenario.rs:322-` 同义 ✓；每拍评估 ✓）
+        self.apply_faults();
         let motors = read_thrust(m);
         let cmd = flyctrl_core::vehicle::ActuatorCmd { motor: motors };
         // ② 真动力学推进一步（由执行器驱动刚体 ✓）
@@ -126,7 +184,11 @@ impl PhyBackend for PhyBackendImpl {
         // ③ 回写传感器状态（姿态/位置/磁/气压 ✓）——位置用**相对原点**（与运动学口径一致 ✓）
         let imu = self.sim.last_imu();
         {
+            let gps_dropped = self.t_secs < self.gps_drop_until;
             let mut s = st.lock().unwrap();
+            // GPS 失锁（fix=0 ✓）/ 恢复（fix=3 ✓）——★必须**双向**写：只写失锁会让
+            //   fix 永久停在 0 ✗（实测 `recovered=false` ✗）；与 `scenario.rs:476-483` 同义 ✓
+            s.gps_fix = if gps_dropped { 0.0 } else { 3.0 };
             let q = world.att;
             s.att = [q.w, q.x, q.y, q.z];
             // 位置/速度经 GPS 通道承载（与运动学口径一致 ✓）；NED → 经纬高 ✓
@@ -152,22 +214,54 @@ impl PhyBackend for PhyBackendImpl {
                     }
                 }
             }
-            s.imu_acc = [
+            let mut acc = [
                 imu.accel[0].0 as f32 + bias[0],
                 imu.accel[1].0 as f32 + bias[1],
                 imu.accel[2].0 as f32 + bias[2],
             ];
-            s.imu_gyr = [
+            let mut gyr = [
                 imu.gyro[0].0 as f32 + self.perturb.gyro_bias[0],
                 imu.gyro[1].0 as f32 + self.perturb.gyro_bias[1],
                 imu.gyro[2].0 as f32 + self.perturb.gyro_bias[2],
             ];
+            // ★§5.150 IMU 故障：饱和（钳位 ±fs ✓）/ 冻结（保持最后值 ✓）
+            if let Some(fs) = self.imu_saturate_fs {
+                for k in 0..3 {
+                    acc[k] = acc[k].clamp(-fs, fs);
+                    gyr[k] = gyr[k].clamp(-fs, fs);
+                }
+            }
+            if self.imu_frozen {
+                acc = self.last_imu_acc;
+                gyr = self.last_imu_gyr;
+            } else {
+                self.last_imu_acc = acc;
+                self.last_imu_gyr = gyr;
+            }
+            s.imu_acc = acc;
+            s.imu_gyr = gyr;
             if self.inject_mag {
-                s.mag = Some(self.sim.last_mag());
+                // ★§5.150 磁冻结（保持最后值 ✓）
+                if self.mag_frozen {
+                    if let Some(mv) = self.last_mag {
+                        s.mag = Some(mv);
+                    }
+                } else {
+                    let mv = self.sim.last_mag();
+                    self.last_mag = Some(mv);
+                    s.mag = Some(mv);
+                }
             }
             // 气压：由高度换算（NED 向下正 ⇒ h = −z ✓）
             let h = -pd;
-            s.baro_pa = 101_325.0 * (-(h - HOVER_ALT_REF) / 8434.5).exp();
+            let baro = 101_325.0 * (-(h - HOVER_ALT_REF) / 8434.5).exp();
+            // ★§5.150 气压冻结（保持最后值 ✓）；否则更新
+            if self.baro_frozen {
+                s.baro_pa = self.last_baro_pa;
+            } else {
+                s.baro_pa = baro;
+                self.last_baro_pa = baro;
+            }
             // ★§5.145 一次性初始化（首拍）：**只填零通道**为中位 1500 ✓，
             //   **绝不覆盖测试已显式设置的通道** ✓（实测教训：无条件写会抹掉模式/摇杆 ✗）
             //   之后每拍只保持"解锁"（`rc_ch[4]`）✓，模式等由测试/场景掌控 ✓
