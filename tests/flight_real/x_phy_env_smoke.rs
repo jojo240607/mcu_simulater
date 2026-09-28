@@ -4,7 +4,10 @@
 //! 与 `x_env_smoke` 的区别：真值运动由 `SimLoop::step_hil(真实刚体)` 产生（**真闭环** ✓），
 //! 而非运动学直接指定 ⇒ 控制↔动力学耦合、饱和、转动惯量都参与 ✓
 //!
-//! 运行：`cargo test --release --test x_phy_env_smoke`（可用 `PHY_ENV_SECS` 调时长 ✓）
+//! 运行：`cargo test --release --test x_phy_env_smoke -- --test-threads=1`
+//!   ★§5.149：PHY 家族 **CPU 密集** ⇒ **须串行**（本机 4 核 3.6GB 下并行会因负载导致
+//!   时序漂移而偶发失败 ✗ 实测；与既有"MCU 测试 wall-clock guards"同族 ✓）。
+//!   可用 `PHY_ENV_SECS` 调时长 ✓
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -218,8 +221,12 @@ fn phy_accel_bias_tolerated() {
     //   速度收敛到 0（**稳态偏置**，非发散 ✓）。
     //   ⇒ 断言按**真动力学新基线**（同时保留"有界不发散"的原意图 ✓）：
     //     速度界（控制回路未失控 ✓）+ 位置界（放宽到真动力学口径 ✓）+ 健康 0 ✓
-    //   ⇒ 台账 ✓：水平加计偏置的可观测性（PX4 有 `EKF2_ACC_B_NOISE`/三轴零偏状态 ✓）
-    //     是本仓可后续补齐项 ✓
+    //   ★§5.149 追加验证（实测 ✓）：本仓**已有三轴加计零偏状态**（`I_BA+0..2` ✓，与 PX4
+    //     `_state.accel_bias` Vector3f 同 ✓）、Q 也与一手同量级（`1e-4·dt` vs
+    //     `ekf2_acc_b_noise=1e-2 m/s³` ✓）⇒ **提高 Q（×1/×100）无改善**（92.37 → 93.25m ✗）
+    //     ⇒ 根因是**水平加计零偏在无绝对水平观测时本就不强可观测** ✓（PX4 同限制：
+    //     仅靠 GPS 位置/速度弱约束 ✓）⇒ 属**物理/可观测性限制**，非本仓缺陷 ✓
+    //     ⇒ 台账 ✓：若需改善须引入更强水平观测（如光流/视觉 ✓）或降速运行 ✓
     assert!(max_vel < 15.0, "加计偏置下速度应有界（<15m/s），实际 {max_vel:.2}m/s");
     assert!(max_pos < 120.0, "加计偏置下位置应有界（<120m；真动力学稳态偏置 ✓），实际 {max_pos:.2}m");
     assert_eq!(worst_health, 0, "加计偏置不应触发 FDIR（health={worst_health}）");
