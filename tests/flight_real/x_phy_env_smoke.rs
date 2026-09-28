@@ -329,3 +329,81 @@ fn phy_gps_drop_degraded_then_recover() {
     assert!(recovered, "GPS 恢复后 FDIR 应回 Nominal（health=0）");
     assert!(drift < 20.0, "失锁期间漂移应有界（<20m），实际 {drift:.2}m");
 }
+
+/// ★§5.151 PHY 化迁移⑧⑨⑩：**故障家族扩展**（真动力学：IMU 冻结/气压冻结/IMU 饱和）。
+///
+/// 口径（与 `x_env_faults` 一致 ✓）：
+///  · ⑧ **IMU 冻结**（幅值合理 9.81 ∈ [6,14]）⇒ **不误报**（防把稳定悬停判成故障 ✓）
+///  · ⑨ **气压冻结**（仍有读数）⇒ **不误报** + 高度被冻结气压锚定 ✓
+///  · ⑩ **IMU 饱和**（钳位 ±2 ⇒ 幅值阈值外且恒定）⇒ **Critical** ✓
+/// ★真动力学差异 ✓：⑧⑨ 的"不误报"在真闭环下更有意义（机体仍在运动 ✓）；
+///   ⑩ 触发 Critical 后真动力学下会**真实坠落**（安全模式 ⇒ 停机 ✓）
+#[test]
+fn phy_imu_freeze_no_false_positive() {
+    use mcu_simulater::env::scenario::FaultEvent;
+    let secs: u64 = std::env::var("PHY_ENV_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+    let scn = EnvScenario::new(Motion::Hover, Perturb::clean(), vec![]);
+    let mut h = EnvHarness::new(scn, true);
+    let mut phy = PhyBackendImpl::new(true);
+    phy.set_faults(vec![FaultEvent::ImuFreeze { t: 8.0 }]); // 预热后冻结 ✓
+    h.phy = Some(Box::new(phy));
+    h.run_for_ms(400 as f64 * 13.0); // 预热（起飞 + 悬停 ✓）
+
+    let mut worst_health = 0u32;
+    let t0 = h.fw_ms();
+    while h.fw_ms() - t0 < (secs * 1000) {
+        h.step();
+        let e = h.read_est();
+        worst_health = worst_health.max(e.health);
+        assert_eq!(e.health, 0, "悬停中 IMU 冻结（幅值合理）不应误报，health={}", e.health);
+    }
+    eprintln!("[phy-env] IMU 冻结（幅值合理）{secs}s | health={worst_health}（应 0 ✓）");
+}
+
+#[test]
+fn phy_baro_freeze_no_false_positive() {
+    use mcu_simulater::env::scenario::FaultEvent;
+    let secs: u64 = std::env::var("PHY_ENV_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+    let scn = EnvScenario::new(Motion::Hover, Perturb::clean(), vec![]);
+    let mut h = EnvHarness::new(scn, true);
+    let mut phy = PhyBackendImpl::new(true);
+    phy.set_faults(vec![FaultEvent::BaroFreeze { t: 8.0 }]);
+    h.phy = Some(Box::new(phy));
+    h.run_for_ms(400 as f64 * 13.0);
+
+    let mut worst_health = 0u32;
+    let mut max_pos = 0.0f32;
+    let t0 = h.fw_ms();
+    while h.fw_ms() - t0 < (secs * 1000) {
+        h.step();
+        let e = h.read_est();
+        worst_health = worst_health.max(e.health);
+        max_pos = max_pos.max((e.pos[0].powi(2) + e.pos[1].powi(2) + e.pos[2].powi(2)).sqrt());
+        assert_eq!(e.health, 0, "气压冻结（有读数）不应误报，health={}", e.health);
+    }
+    eprintln!("[phy-env] 气压冻结 {secs}s | health={worst_health}（应 0 ✓）max_pos={max_pos:.2}m");
+    assert!(max_pos < 10.0, "气压冻结下位置应有界（<10m），实际 {max_pos:.2}m");
+}
+
+#[test]
+fn phy_imu_saturate_critical() {
+    use mcu_simulater::env::scenario::FaultEvent;
+    let scn = EnvScenario::new(Motion::Hover, Perturb::clean(), vec![]);
+    let mut h = EnvHarness::new(scn, true);
+    let mut phy = PhyBackendImpl::new(true);
+    phy.set_faults(vec![FaultEvent::ImuSaturate { t: 8.0, fs: 2.0 }]); // 钳位 ±2 ⇒ 阈值外+恒定 ✓
+    h.phy = Some(Box::new(phy));
+    h.run_for_ms(400 as f64 * 13.0);
+
+    let mut saw_critical = false;
+    let t0 = h.fw_ms();
+    while h.fw_ms() - t0 < 6000 {
+        h.step();
+        if h.read_est().health == 2 {
+            saw_critical = true;
+            break;
+        }
+    }
+    eprintln!("[phy-env] IMU 饱和 | critical={saw_critical}");
+    assert!(saw_critical, "IMU 饱和应触发 FDIR Critical（health=2）");
+}
