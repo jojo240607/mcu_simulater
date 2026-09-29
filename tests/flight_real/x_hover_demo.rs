@@ -162,6 +162,19 @@ fn hover_60s_demo() {
             m.lock().unwrap().cpu.mem_write(a, &2.0f32.to_le_bytes()).unwrap();
             eprintln!("[demo] A/B：G_ACC_FLIP = 2（水平加速度符号翻转 ✓）");
         }
+        if let Ok(v) = std::env::var("DEMO_SLEW") {
+            if let Ok(f) = v.parse::<f32>() {
+                unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!(flyctrl_core::controller::pid::G_VEL_SLEW), f); }
+                eprintln!("[demo] A/B：G_VEL_SLEW = {f}");
+            }
+        }
+        if let Ok(v) = std::env::var("DEMO_VEL_PRED") {
+            if let Ok(f) = v.parse::<f32>() {
+                let a = mcu_simulater::elfsym::app_sym("G_VEL_PRED") as u64;
+                m.lock().unwrap().cpu.mem_write(a, &f.to_le_bytes()).unwrap();
+                eprintln!("[demo] A/B：G_VEL_PRED = {f}");
+            }
+        }
         if let Ok(kd) = std::env::var("DEMO_KD") {
             if let Ok(v) = kd.parse::<f32>() {
                 let a = mcu_simulater::elfsym::app_sym("G_ATT_KD") as u64;
