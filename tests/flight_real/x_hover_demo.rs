@@ -152,6 +152,30 @@ fn hover_60s_demo() {
         //   ⇒ 水平自由漂移（实测 sp_pos 跟随 est、err_xy≈0）——本次水平漂移的根因 ✓
         st.rc_ch[5] = 2000.0;
         // ★§5.157 A/B：kv_xy 扫描（`DEMO_KV` ✓，PWM 口径无效 ⇒ 用 poke 直接写旋钮 ✓）
+        if std::env::var("DEMO_LEGACY").is_ok() {
+            let a = mcu_simulater::elfsym::app_sym("G_ATT_LEGACY") as u64;
+            m.lock().unwrap().cpu.mem_write(a, &2.0f32.to_le_bytes()).unwrap();
+            eprintln!("[demo] A/B：G_ATT_LEGACY = 2（legacy 期望姿态 ✓）");
+        }
+        if std::env::var("DEMO_ACC_FLIP").is_ok() {
+            let a = mcu_simulater::elfsym::app_sym("G_ACC_FLIP") as u64;
+            m.lock().unwrap().cpu.mem_write(a, &2.0f32.to_le_bytes()).unwrap();
+            eprintln!("[demo] A/B：G_ACC_FLIP = 2（水平加速度符号翻转 ✓）");
+        }
+        if let Ok(kd) = std::env::var("DEMO_KD") {
+            if let Ok(v) = kd.parse::<f32>() {
+                let a = mcu_simulater::elfsym::app_sym("G_ATT_KD") as u64;
+                m.lock().unwrap().cpu.mem_write(a, &v.to_le_bytes()).unwrap();
+                eprintln!("[demo] A/B：G_ATT_KD = {v}");
+            }
+        }
+        if let Ok(kp) = std::env::var("DEMO_KP") {
+            if let Ok(v) = kp.parse::<f32>() {
+                let a = mcu_simulater::elfsym::app_sym("G_ATT_KP") as u64;
+                m.lock().unwrap().cpu.mem_write(a, &v.to_le_bytes()).unwrap();
+                eprintln!("[demo] A/B：G_ATT_KP = {v}");
+            }
+        }
         if let Ok(kv) = std::env::var("DEMO_KV") {
             if let Ok(v) = kv.parse::<f32>() {
                 let a = mcu_simulater::elfsym::app_sym("G_KV_XY") as u64;
@@ -327,6 +351,28 @@ fn hover_60s_demo() {
         }
         eprintln!("[demo] === hb 时间线（{} 条，每 10 条取 1）===", hb.len());
         for l in hb.iter().step_by(10) {
+        // ★§5.158 排查：倾角顶满记录（DBG_TILT = [acc_n,acc_e,tilt_n,tilt_e]）
+        {
+            let ta = mcu_simulater::elfsym::app_sym("DBG_TILT") as u64;
+            if ta != 0 {
+                if let Ok(tb) = m.lock().unwrap().cpu.mem_read(ta, 16) {
+                    let t: Vec<f32> = (0..4).map(|i| f32::from_le_bytes([tb[4*i],tb[4*i+1],tb[4*i+2],tb[4*i+3]])).collect();
+                    eprintln!("[tilt-diag] acc_n={:+.2} acc_e={:+.2} tilt_n={:+.3} tilt_e={:+.3}", t[0], t[1], t[2], t[3]);
+                }
+            }
+        }
+        // ★§5.158 排查：控制器内部量（G_CTRL_DBG = [ex,ey,ez, des_vx,acc_n,_,rate_mode,kv]）
+        {
+            let ca = mcu_simulater::elfsym::app_sym("G_CTRL_DBG") as u64;
+            if ca != 0 {
+                if let Ok(cb) = m.lock().unwrap().cpu.mem_read(ca, 32) {
+                    let c: Vec<f32> = (0..8).map(|i| f32::from_le_bytes([cb[4*i],cb[4*i+1],cb[4*i+2],cb[4*i+3]])).collect();
+                    eprintln!("[ctrl-diag] ex={:+.2} ey={:+.2} ez={:+.2} des_vx={:+.2} acc_n={:+.2} kv={:.2}",
+                        c[0], c[1], c[2], c[3], c[4], c[7]);
+                }
+            }
+        }
+
             eprintln!("[demo-hb] {}", l.trim_start_matches('\u{feff}'));
         }
     }
