@@ -314,6 +314,19 @@ fn hover_60s_demo() {
                 eprintln!("[addr-check] ATT_DBG=0x{:08x} CTRL_DBG=0x{:08x} DBG_TILT=0x{:08x} KV=0x{:08x}",
                     sym("G_PID_ATT_DBG"), sym("G_CTRL_DBG"), sym("DBG_TILT"), sym("G_KV_XY"));
             }
+            // ★§5.161 路径判定：`G_PID_CALLS` 是否增长（确认 PidController 实际被调用 ✓）
+            if step % 1000 == 0 {
+                let sym2 = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
+                let ca = sym2("G_PID_CALLS");
+                let calls = if ca != 0 {
+                    m.lock().unwrap().cpu.mem_read(ca, 4).ok().map(|b| u32::from_le_bytes([b[0],b[1],b[2],b[3]]))
+                } else { None };
+                let ka = sym2("G_KV_XY");
+                let kv = if ka != 0 {
+                    m.lock().unwrap().cpu.mem_read(ka, 4).ok().map(|b| f32::from_le_bytes([b[0],b[1],b[2],b[3]]))
+                } else { None };
+                eprintln!("[path-check] step={step} PID_CALLS={calls:?} G_KV_XY={kv:?}");
+            }
             // ★§5.159 循环内探针（关键 ✓）：姿态环 err/rates + 倾角 + 外环
             {
                 let sym = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
