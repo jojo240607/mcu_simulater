@@ -309,6 +309,31 @@ fn hover_60s_demo() {
                 let frames = u2.slaves().first().map(|s| s.frames()).unwrap_or(0);
                 (frames, u2.rx_fifo_len())
             };
+            if step == 250 {
+                let sym = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
+                eprintln!("[addr-check] ATT_DBG=0x{:08x} CTRL_DBG=0x{:08x} DBG_TILT=0x{:08x} KV=0x{:08x}",
+                    sym("G_PID_ATT_DBG"), sym("G_CTRL_DBG"), sym("DBG_TILT"), sym("G_KV_XY"));
+            }
+            // ★§5.159 循环内探针（关键 ✓）：姿态环 err/rates + 倾角 + 外环
+            {
+                let sym = |n: &str| mcu_simulater::elfsym::app_sym(n) as u64;
+                let rd = |m: &Arc<std::sync::Mutex<mcu_simulater::machine::Machine>>, a: u64, n: usize| -> Option<Vec<f32>> {
+                    if a == 0 { return None; }
+                    let b = m.lock().unwrap().cpu.mem_read(a, n).ok()?;
+                    Some((0..n / 4).map(|i| f32::from_le_bytes([b[4*i],b[4*i+1],b[4*i+2],b[4*i+3]])).collect())
+                };
+                if let (Some(a), Some(c), Some(t)) = (
+                    rd(&m, sym("G_PID_ATT_DBG"), 28),
+                    rd(&m, sym("G_CTRL_DBG"), 32),
+                    rd(&m, sym("DBG_TILT"), 16),
+                ) {
+                    eprintln!(
+                        "[att-diag] t={:.0}s err=({:+.3},{:+.3},{:+.3}) rates=({:+.2},{:+.2},{:+.2}) | acc=({:+.2},{:+.2}) tilt=({:+.3},{:+.3}) | des_vx={:+.2} ex={:+.2}",
+                        step as f64 * 0.004, a[0], a[1], a[2], a[3], a[4], a[5],
+                        t[0], t[1], t[2], t[3], c[3], c[0]
+                    );
+                }
+            }
             eprintln!(
                 "[demo] t={:.0}s thrust={thrust:.3} pos=({:.2},{:.2},{:.2}) vel=({:.2},{:.2},{:.2}) ekf_z={ekf_z:.2} gps_frames={gps_frames} fifo={fifo_len}",
                 step as f64 * 0.004, pos[0], pos[1], pos[2], vel[0], vel[1], vel[2]
@@ -351,27 +376,6 @@ fn hover_60s_demo() {
         }
         eprintln!("[demo] === hb 时间线（{} 条，每 10 条取 1）===", hb.len());
         for l in hb.iter().step_by(10) {
-        // ★§5.158 排查：倾角顶满记录（DBG_TILT = [acc_n,acc_e,tilt_n,tilt_e]）
-        {
-            let ta = mcu_simulater::elfsym::app_sym("DBG_TILT") as u64;
-            if ta != 0 {
-                if let Ok(tb) = m.lock().unwrap().cpu.mem_read(ta, 16) {
-                    let t: Vec<f32> = (0..4).map(|i| f32::from_le_bytes([tb[4*i],tb[4*i+1],tb[4*i+2],tb[4*i+3]])).collect();
-                    eprintln!("[tilt-diag] acc_n={:+.2} acc_e={:+.2} tilt_n={:+.3} tilt_e={:+.3}", t[0], t[1], t[2], t[3]);
-                }
-            }
-        }
-        // ★§5.158 排查：控制器内部量（G_CTRL_DBG = [ex,ey,ez, des_vx,acc_n,_,rate_mode,kv]）
-        {
-            let ca = mcu_simulater::elfsym::app_sym("G_CTRL_DBG") as u64;
-            if ca != 0 {
-                if let Ok(cb) = m.lock().unwrap().cpu.mem_read(ca, 32) {
-                    let c: Vec<f32> = (0..8).map(|i| f32::from_le_bytes([cb[4*i],cb[4*i+1],cb[4*i+2],cb[4*i+3]])).collect();
-                    eprintln!("[ctrl-diag] ex={:+.2} ey={:+.2} ez={:+.2} des_vx={:+.2} acc_n={:+.2} kv={:.2}",
-                        c[0], c[1], c[2], c[3], c[4], c[7]);
-                }
-            }
-        }
 
             eprintln!("[demo-hb] {}", l.trim_start_matches('\u{feff}'));
         }
