@@ -151,6 +151,14 @@ fn hover_60s_demo() {
         //   位置外环启用）。此前 1500 ⇒ raw=992 ⇒ mode=1 ⇒ ALT_HOLD ⇒ **位置环旁路**
         //   ⇒ 水平自由漂移（实测 sp_pos 跟随 est、err_xy≈0）——本次水平漂移的根因 ✓
         st.rc_ch[5] = 2000.0;
+        // ★§5.157 A/B：kv_xy 扫描（`DEMO_KV` ✓，PWM 口径无效 ⇒ 用 poke 直接写旋钮 ✓）
+        if let Ok(kv) = std::env::var("DEMO_KV") {
+            if let Ok(v) = kv.parse::<f32>() {
+                let a = mcu_simulater::elfsym::app_sym("G_KV_XY") as u64;
+                m.lock().unwrap().cpu.mem_write(a, &v.to_le_bytes()).unwrap();
+                eprintln!("[demo] A/B：G_KV_XY = {v}");
+            }
+        }
     }
 
     // ---- 35s 闭环：每步 4ms，8750 步；起飞台保持 → 升空 → 持续悬停 ----

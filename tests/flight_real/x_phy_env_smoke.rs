@@ -113,14 +113,41 @@ fn phy_rc_forward_moves_north() {
     h.phy = Some(Box::new(phy));
 
     h.run_for_ms(400 as f64 * 13.0); // 预热（起飞 + 悬停稳定 ✓）
+    {
+        let ka = mcu_simulater::elfsym::app_sym("G_KV_XY") as u64;
+        if ka != 0 {
+            if let Ok(kb) = h.m.cpu.mem_read(ka, 4) {
+                eprintln!("[kv-diag] G_KV_XY 预热后 = {}", f32::from_le_bytes([kb[0], kb[1], kb[2], kb[3]]));
+            }
+        } else {
+            eprintln!("[kv-diag] G_KV_XY 符号未找到 ✗");
+        }
+    }
     let mut max_hspeed = 0.0f32;
     let mut worst_health = 0u32;
     let t0 = h.fw_ms();
+    let mut k = 0u32;
     while h.fw_ms() - t0 < (secs * 1000) as u64 {
         h.step();
         let e = h.read_est();
         max_hspeed = max_hspeed.max((e.vel[0].powi(2) + e.vel[1].powi(2)).sqrt());
         worst_health = worst_health.max(e.health);
+        k += 1;
+        if k % 1000 == 0 {
+            // ★§5.155 探针：`G_CTRL_DBG` = [ex,ey,ez, des_vx,_,_, rate_mode_xy, _]
+            let ca = mcu_simulater::elfsym::app_sym("G_CTRL_DBG") as u64;
+            if ca != 0 {
+                if let Ok(cb) = h.m.cpu.mem_read(ca, 32) {
+                    let c: Vec<f32> = (0..8)
+                        .map(|i| f32::from_le_bytes([cb[4 * i], cb[4 * i + 1], cb[4 * i + 2], cb[4 * i + 3]]))
+                        .collect();
+                    eprintln!(
+                        "[ctrl-diag] t={}s est_v=({:+.2},{:+.2}) des_vx={:+.3} acc_n={:+.3} kv={:.2} rate_mode={}",
+                        k / 250, e.vel[0], e.vel[1], c[3], c[4], c[7], c[6]
+                    );
+                }
+            }
+        }
     }
     let e = h.read_est();
     let horiz = (e.pos[0].powi(2) + e.pos[1].powi(2)).sqrt();
