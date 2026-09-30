@@ -34,8 +34,11 @@ fn machine_with_sensors() -> Machine {
 
 /// 模拟固件对 I2C1 的"写寄存器地址 + 重复起始读数据"事务（MPU6050 标准读法）。
 fn i2c_read_reg(m: &mut Machine, addr7: u8, reg: u8, n: usize) {
-    let i2c1 = m.i2c.lock().unwrap()[0].clone();
-    let mut i = i2c1.lock().unwrap();
+    // ★§5.200：MPU6050/BMP280 已从 I2C1 移到 **I2C3**（见 `attach_default_sensors` 的
+    //   "I2C 从设备挂 I2C3（port 3）：见 attach_flysim_sensors 的 DMA 冲突说明" ✓）
+    //   ⇒ 旧测试仍按 I2C1 驱动 ⇒ 该处无设备 ⇒ 地址阶段 AF（`matched=false`）✗
+    let i2c3 = m.i2c.lock().unwrap()[2].clone(); // port 3 ⇒ index 2 ✓
+    let mut i = i2c3.lock().unwrap();
     // 使能 + START
     i.write(OFF_CR1, 4, CR1_PE | CR1_START).unwrap();
     // 地址阶段：写 addr7<<1|0（W 方向）
@@ -88,11 +91,11 @@ fn i2c_transaction_traced_end_to_end() {
     assert_eq!(kinds[6], &TraceKind::I2cStop, "最后应为 STOP");
 
     // 每条记录都带总线/端口标识
-    assert!(entries.iter().all(|e| e.bus == BusKind::I2c && e.port == 1));
+    assert!(entries.iter().all(|e| e.bus == BusKind::I2c && e.port == 3));
 
     // 格式化输出应人类可读（调试场景验证）
     let s = entries.iter().map(|e| e.format()).collect::<Vec<_>>().join("\n");
-    assert!(s.contains("i2c1 START W@0x68 match"), "格式化输出应含 START 行：\n{s}");
+    assert!(s.contains("i2c3 START W@0x68 match"), "格式化输出应含 START 行：\n{s}");
     assert!(s.contains("W 0x3b"), "格式化输出应含寄存器地址写：\n{s}");
 }
 
@@ -104,11 +107,11 @@ fn i2c_nack_traced() {
     // 故障注入：mpu6050 NACK → 读方向地址阶段无 ACK → AF（matched=false，无数据阶段）。
     // 语义见 x_fault_injection::midrun_nack：旧"匹配置 ADDR、数据阶段 on_read 才
     // None→AF"会让固件 POLL 驱动在半开事务上超时、AF 残留卡死后续 0x76 事务。
-    assert!(m.inject_i2c_nack(1, 0x68, true), "NACK 注入应命中 mpu6050");
+    assert!(m.inject_i2c_nack(3, 0x68, true), "NACK 注入应命中 mpu6050（I2C3 ✓）");
 
-    let i2c1 = m.i2c.lock().unwrap()[0].clone();
+    let i2c3 = m.i2c.lock().unwrap()[2].clone();
     {
-        let mut i = i2c1.lock().unwrap();
+        let mut i = i2c3.lock().unwrap();
         i.write(OFF_CR1, 4, CR1_PE | CR1_START).unwrap();
         i.write(OFF_DR, 4, (0x68u32 << 1) | 1).unwrap();
         let _ = i.read(OFF_SR2, 4).unwrap();
