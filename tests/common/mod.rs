@@ -114,6 +114,10 @@ static mut SUSPECT_CELL: *const () = core::ptr::null();
 static WATCH_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// ★§5.221：可疑写入对应的**当前任务名**（由钩子从 RTOS TCB 读出 ✓）
 static NAMES: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
+/// ★§5.222 指令飞行记录仪：块级 PC 环形缓冲（`JOC_FTRACE=1` 时启用 ✓，测试台侧 ⇒ 布局中性 ✓）
+#[used]
+pub static mut FTRACE_RING: [u32; 1024] = [0u32; 1024];
+pub static FTRACE_POS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl UsbHostModel {
     /// 固件启动到 USB 就绪所需的步数（x_hil_mcusim 的预启动约 130ms，此处 13ms/步）。
@@ -393,6 +397,163 @@ impl EnvHarness {
             // ★§5.219：写监视开销大（每次栈写都进钩子 ⇒ 常规跑从 14s 变 85s ✗）
             //   ⇒ 仅在 `JOC_STACKWATCH=1` 时安装 ✓
             let want = std::env::var("JOC_STACKWATCH").is_ok();
+            // ★§5.222 飞行记录仪安装（`JOC_FTRACE=1`）
+            {
+                use std::sync::atomic::Ordering as O2;
+                static FT_ON: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if std::env::var("JOC_FTRACE").is_ok() && !FT_ON.swap(true, O2::SeqCst) {
+                    let r = self.m.cpu.add_block_hook(
+                        0x0800_0000,
+                        0x0810_0000,
+                        move |_uc, addr, _sz| {
+                            // ★一旦进入"池内循环"区（0x0806f3d0..0x0806f410，本构建的
+                            //   字面量池 ✓）就**冻结**记录 ⇒ 保留野跳前的现场 ✓
+                            static FROZEN: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if FROZEN.load(O2::Relaxed) {
+                                return;
+                            }
+                            // 冻结点改为"进入 panic 入口"（按名解析 ✓，不再用错二进制的池地址 ✗）
+                            static PANIC_ADDRS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+                            let addrs = PANIC_ADDRS.get_or_init(|| {
+                                vec![
+                                    mcu_simulater::elfsym::app_sym("panic_bounds_check") as u64,
+                                    mcu_simulater::elfsym::app_sym("slice_index_fail") as u64,
+                                ]
+                            });
+                            if addrs.contains(&addr) {
+                                FROZEN.store(true, O2::Relaxed);
+                                return;
+                            }
+                            let i = FTRACE_POS.fetch_add(1, O2::Relaxed) as usize % 1024;
+                            unsafe {
+                                let p = core::ptr::addr_of_mut!(FTRACE_RING[i]);
+                                core::ptr::write_volatile(p, addr as u32);
+                            }
+                        },
+                    );
+                    match r {
+                        Ok(_) => eprintln!("[ftrace] 块钩子已安装 ✓"),
+                        Err(e) => eprintln!("[ftrace] 块钩子安装失败 ✗: {e:?}"),
+                    }
+                }
+            }
+            // ★★§5.222【MSP/异常栈写监视 ✓】飞行记录仪已证明：野跳发生在
+            //   `irq_dispatch` 的 `pop {r3,r4,r5,pc}` ⇒ 被污染的是 **MSP（异常栈，CCM）** ✗
+            //   ⇒ 之前只盯 app 栈、还把 SP∈CCM 的写入全部排除 ✗ ⇒ 一直没看见 ✓
+            {
+                use std::sync::atomic::Ordering as O3;
+                static MSP_ON: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if std::env::var("JOC_MSPWATCH").is_ok() && !MSP_ON.swap(true, O3::SeqCst) {
+                    const MLO: u64 = 0x1000_9000;
+                    const MHI: u64 = 0x1001_0000;
+                    let r = self.m.cpu.add_mem_hook(
+                        unicorn_engine::HookType::MEM_WRITE,
+                        MLO,
+                        MHI - 1,
+                        move |uc, _t, addr, _sz, value| {
+                            let sp = uc.reg_read(unicorn_engine::RegisterARM::SP).unwrap_or(0);
+                            let pc = uc.reg_read(unicorn_engine::RegisterARM::PC).unwrap_or(0);
+                            // 只抓"异常栈内的死区写入"：SP 也在此区、且写入低于 SP 64B~4KB
+                            if sp >= MLO && sp < MHI && addr + 64 < sp && addr + 4096 > sp {
+                                static SEEN: std::sync::atomic::AtomicU32 =
+                                    std::sync::atomic::AtomicU32::new(0);
+                                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+                                    eprintln!(
+                                        "[msp] PC=0x{pc:08x} → 0x{addr:08x} 值=0x{value:08x} SP=0x{sp:08x}"
+                                    );
+                                }
+                            }
+                            false
+                        },
+                    );
+                    match r {
+                        Ok(_) => eprintln!("[msp] 异常栈监视已安装 ✓"),
+                        Err(e) => eprintln!("[msp] 安装失败 ✗: {e:?}"),
+                    }
+                }
+            }
+            // ★★§5.223【emit 帧越界写监视 ✓】飞行记录仪已指认：`rtos_app_sdk::log::emit`
+            //   的帧被写坏 ⇒ 返回时跳进它自己的字面量池 ✓
+            //   判据：PC 落在 emit（0x0806f0ec..0x0806f440，本构建 ✓）或其被调 helper 里，
+            //   且写入目标 **≥ SP+200**（buf[180] 之后 ✓ = 越过缓冲、正打在保存的 LR 上 ✓）
+            {
+                use std::sync::atomic::Ordering as O4;
+                static EW_ON: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if std::env::var("JOC_EMITWATCH").is_ok() && !EW_ON.swap(true, O4::SeqCst) {
+                    // emit 入口 0x0806f0ec = `push {r4,r5,r6,r7,lr}` ⇒ LR 存在 entry_SP − 4 ✓
+                    //   记下每次进入 emit 的 SP，然后**任何**对 (entry_SP−4) 的写入
+                    //   （除序言那条 push 自己 ✓）都是踩 LR = 真凶 ✓
+                    static EMIT_SP: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let r = self.m.cpu.add_mem_hook(
+                        unicorn_engine::HookType::MEM_WRITE,
+                        0x2000_0000,
+                        0x2001_0000, // app RAM（含控制栈 ✓）
+                        move |uc, _t, addr, _sz, value| {
+                            let sp = uc.reg_read(unicorn_engine::RegisterARM::SP).unwrap_or(0);
+                            let pc = uc.reg_read(unicorn_engine::RegisterARM::PC).unwrap_or(0);
+                            // 进入 emit（含序言 push）时记录入口 SP
+                            if (0x0806_f0ec..0x0806_f0f6).contains(&pc) {
+                                EMIT_SP.store(sp as u32, O4::Relaxed);
+                            }
+                            let e = EMIT_SP.load(O4::Relaxed) as u64;
+                            // 序言自己那条 push 写的正是这块，排除它 ✓
+                            let is_prologue = pc == 0x0806_f0ec;
+                            if e != 0 && addr == e - 4 && !is_prologue {
+                                static SEEN: std::sync::atomic::AtomicU32 =
+                                    std::sync::atomic::AtomicU32::new(0);
+                                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+                                    eprintln!(
+                                        "[emit] ★踩 LR！PC=0x{pc:08x} → 0x{addr:08x}                                          值=0x{value:08x} SP=0x{sp:08x} emit入口SP=0x{e:08x}"
+                                    );
+                                }
+                            }
+                            false
+                        },
+                    );
+                    match r {
+                        Ok(_) => eprintln!("[emit] emit 帧监视已安装 ✓"),
+                        Err(e) => eprintln!("[emit] 安装失败 ✗: {e:?}"),
+                    }
+                }
+            }
+            // ★★§5.224【捕获 panic 现场 ✓】`rtos_app_sdk::panic` 执行 `udf #0` 交 RTOS 恢复 ✗
+            //   ⇒ 只要有人 panic，就记录 (LR, R0=index, R1=len, SP) ✓
+            //   钩 `panic_bounds_check`(0x08068df4) 与 `slice_index_fail`(0x08068db0) 入口 ✓
+            {
+                use std::sync::atomic::Ordering as O5;
+                static PB_ON: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if std::env::var("JOC_PANICWATCH").is_ok() && !PB_ON.swap(true, O5::SeqCst) {
+                    // ★按名解析（不再硬编码 ✗ —— 之前用错二进制吃过亏 ✓）
+                    let pb = mcu_simulater::elfsym::app_sym("panic_bounds_check") as u64;
+                    let sf = mcu_simulater::elfsym::app_sym("slice_index_fail") as u64;
+                    eprintln!("[panic] 解析到 panic_bounds_check=0x{pb:08x} slice_index_fail=0x{sf:08x}");
+                    let mut pair: Vec<(u64, u64)> = vec![(sf, sf), (pb, pb)];
+                    let mut hooks = Vec::new();
+                    for (lo, hi) in pair.drain(..) {
+                        let r = self.m.cpu.add_code_hook(lo, hi, move |uc, addr, _sz| {
+                            let lr = uc.reg_read(unicorn_engine::RegisterARM::LR).unwrap_or(0);
+                            let r0 = uc.reg_read(unicorn_engine::RegisterARM::R0).unwrap_or(0);
+                            let r1 = uc.reg_read(unicorn_engine::RegisterARM::R1).unwrap_or(0);
+                            let sp = uc.reg_read(unicorn_engine::RegisterARM::SP).unwrap_or(0);
+                            static SEEN: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(0);
+                            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                                eprintln!(
+                                    "[panic] 进入0x{addr:08x} **来自LR=0x{lr:08x}**                                      R0(index)=0x{r0:x}({r0}) R1(len)=0x{r1:x}({r1}) SP=0x{sp:08x}"
+                                );
+                            }
+                        });
+                        hooks.push(r);
+                    }
+                    eprintln!("[panic] panic 入口钩子: {:?}", hooks.iter().map(|h| h.is_ok()).collect::<Vec<_>>());
+                }
+            }
             if want && !INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 const BASE: u64 = 0x2000_41b0;
                 const TOP: u64 = BASE + 20480;
@@ -475,6 +636,19 @@ impl EnvHarness {
             let (pc, lr, sp) = (rg!(RegisterARM::PC), rg!(RegisterARM::LR), rg!(RegisterARM::SP));
             // ★RTOS 自带栈溢出检测的**粘性标志**（joc-base: g_stack_overflow @ 0x10008f5c ✓）
             //   比我自己涂色可靠 ✓（RTOS 在栈底写哨兵，涂色会踩到它 ✗）
+            // ★§5.222：RTOS 自带三个检测器一起读 ✓（比自造启发式可靠 ✓）
+            let sinv = self
+                .m
+                .cpu
+                .mem_read(0x1000_6298u64, 4)
+                .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                .unwrap_or(u32::MAX);
+            let cfsr_sticky = self
+                .m
+                .cpu
+                .mem_read(0x1000_8f58u64, 4)
+                .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                .unwrap_or(u32::MAX);
             let ovf = self
                 .m
                 .cpu
@@ -527,8 +701,19 @@ impl EnvHarness {
                         .unwrap_or_default()
                 }
             };
+            let ftrace = {
+                let mut out = String::new();
+                let pos = FTRACE_POS.load(std::sync::atomic::Ordering::Relaxed) as usize;
+                for k in 0..160usize {
+                    let idx = (pos + 1024 - 160 + k) % 1024;
+                    // 环在**宿主**进程里 ✓ ⇒ 直接读宿主静态（不是模拟器内存 ✗）
+                    let v = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(FTRACE_RING[idx])) };
+                    out.push_str(&format!("0x{v:08x} "));
+                }
+                out
+            };
             panic!(
-                "run_one_control_tick 失败: {e:?}\n  PC=0x{pc:08x} LR=0x{lr:08x} SP=0x{sp:08x}\n  SCB {scb_s}\n  R0..R12 = {regs:08x?}\n  **RTOS g_stack_overflow = {ovf}**（1 = 栈溢出 ✓）\n  控制栈: 基址=0x{CTRL_STACK_BASE:08x} 长度={CTRL_STACK_LEN} 最深水位偏移={deepest}\n  **可疑写入（{n} 条）**:\n{suspects}",
+                "run_one_control_tick 失败: {e:?}\n  **飞行记录(末160块)** = {ftrace}\n  PC=0x{pc:08x} LR=0x{lr:08x} SP=0x{sp:08x}\n  SCB {scb_s}\n  R0..R12 = {regs:08x?}\n  **RTOS: g_stack_overflow={ovf} · g_sched_invariant_fail={sinv} · g_fault_cfsr={cfsr_sticky}**\n  控制栈: 基址=0x{CTRL_STACK_BASE:08x} 长度={CTRL_STACK_LEN} 最深水位偏移={deepest}\n  **可疑写入（{n} 条）**:\n{suspects}",
                 n = suspects.matches("PC=").count()
             );
         }
