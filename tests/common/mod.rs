@@ -112,6 +112,8 @@ pub struct UsbHostModel {
 static mut SUSPECT_CELL: *const () = core::ptr::null();
 /// ★§5.219：监视生效开关 —— 启动期 bss 清零会合法写整块栈 ✗ ⇒ 前 20 拍不记录 ✓
 static WATCH_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// ★§5.221：可疑写入对应的**当前任务名**（由钩子从 RTOS TCB 读出 ✓）
+static NAMES: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
 
 impl UsbHostModel {
     /// 固件启动到 USB 就绪所需的步数（x_hil_mcusim 的预启动约 130ms，此处 13ms/步）。
@@ -345,7 +347,8 @@ impl EnvHarness {
             static N: AtomicU32 = AtomicU32::new(0);
             static LAST: AtomicU32 = AtomicU32::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
-            if n >= 20 && n % 50 == 0 {
+            // ⚠️ 守卫符号在默认构建里被 feature 裁掉 ✓ ⇒ 仅排查时（JOC_STACKWATCH）读 ✓
+            if n >= 20 && n % 50 == 0 && std::env::var("JOC_STACKWATCH").is_ok() {
                 macro_rules! rd {
                     ($nm:expr) => {{
                         let a = mcu_simulater::elfsym::app_sym($nm) as u64;
@@ -414,19 +417,29 @@ impl EnvHarness {
                                 return false;
                             }
                             let sp_in = sp >= BASE && sp < TOP;
-                            // ★收紧（第二版 ✓）：函数序言一开始就把 SP 下移 ⇒ 合法写**永远 ≥ SP** ✓
-                            //   ⇒ 任何 `addr < sp` 的写入都可疑 ✓（首版用 4KB 余量 ⇒ 漏掉同帧内越界 ✗）
-                            // ★第三版判据（去掉 push 假阳性 ✓）：只抓 **SP 下方 64B~4KB 的"死区"**
-                            //   · `push` 写 `sp-4/-8/…`（≤64B ✓，且钩子在 SP 更新前触发 ✗）⇒ 排除 ✓
-                            //   · 合法大帧在其序言里已把 SP 下移 ⇒ 写入永远 ≥ SP ✓
-                            //   ⇒ 死区里出现写入 = **野写** ✓
+                            // ★第三版判据：只抓 SP 下方 64B~4KB 的"死区"写入 ✓（排除 push 假阳性）
                             let in_dead_zone = sp_in && addr + 64 < sp && addr + 4096 > sp;
                             if !sp_in || in_dead_zone {
-                                if let Ok(mut v) = cell.lock() {
-                                    // 记录 (PC, 目标, 值, SP) + **LR**（调用者返回地址 ✓）便于定位
-                                    if v.len() < 64 {
-                                        v.push((pc as u32, addr as u32, value as u32, lr as u32));
+                                // 读当前任务名：jOS `g_running`@0x100063b8 → TCB(sp@0,name@4) → C 字符串
+                                let mut nm = [0u8; 16];
+                                if let Ok(g) = uc.mem_read_as_vec(0x1000_63b8u64, 4) {
+                                    let tcb = u32::from_le_bytes([g[0], g[1], g[2], g[3]]) as u64;
+                                    if let Ok(np) = uc.mem_read_as_vec(tcb + 4, 4) {
+                                        let np = u32::from_le_bytes([np[0], np[1], np[2], np[3]]) as u64;
+                                        if let Ok(b) = uc.mem_read_as_vec(np, 15) {
+                                            nm[..15].copy_from_slice(&b);
+                                        }
                                     }
+                                }
+                                let e = nm.iter().position(|b| *b == 0).unwrap_or(15);
+                                let who: String = nm[..e].iter().map(|b| *b as char).collect();
+                                static SEEN: std::sync::atomic::AtomicU32 =
+                                    std::sync::atomic::AtomicU32::new(0);
+                                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+                                    let sp_in_ccm2 = sp >= 0x1000_0000 && sp < 0x1001_0000;
+                                    eprintln!(
+                                        "[write] PC=0x{pc:08x} → 0x{addr:08x} 值=0x{value:08x}                                          SP=0x{sp:08x} LR=0x{lr:08x} 任务={who} CCM上下文={sp_in_ccm2}"
+                                    );
                                 }
                             }
                             false // 不拦截，仅观察
@@ -499,9 +512,15 @@ impl EnvHarness {
                     let cell = &*(SUSPECT_CELL as *const std::sync::Mutex<Vec<(u32, u32, u32, u32)>>);
                     cell.lock()
                         .map(|v| {
+                            let names = NAMES.lock().map(|n| n.clone()).unwrap_or_default();
                             v.iter()
                                 .map(|(pc, a, val, sp)| {
-                                    format!("    PC=0x{pc:08x} 写入0x{a:08x} 值=0x{val:08x} **LR=0x{sp:08x}**\n")
+                                    let who = names
+                                        .iter()
+                                        .find(|(ad, _)| *ad == *a)
+                                        .map(|(_, n)| n.clone())
+                                        .unwrap_or_default();
+                                    format!("    PC=0x{pc:08x} 写入0x{a:08x} 值=0x{val:08x} LR=0x{sp:08x} 任务={who}\n")
                                 })
                                 .collect::<String>()
                         })
