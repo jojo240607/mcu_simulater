@@ -118,6 +118,11 @@ static NAMES: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::
 #[used]
 pub static mut FTRACE_RING: [u32; 1024] = [0u32; 1024];
 pub static FTRACE_POS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// ★§5.223 指令级记录环（pc, r4, r2, r6, r8）
+#[used]
+pub static mut ILRING: [(u32, u32, u32, u32, u32); 256] = [(0, 0, 0, 0, 0); 256];
+/// 指令级环写指针（用于取末尾 ✓）
+pub static ILPOS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl UsbHostModel {
     /// 固件启动到 USB 就绪所需的步数（x_hil_mcusim 的预启动约 130ms，此处 13ms/步）。
@@ -554,6 +559,100 @@ impl EnvHarness {
                     eprintln!("[panic] panic 入口钩子: {:?}", hooks.iter().map(|h| h.is_ok()).collect::<Vec<_>>());
                 }
             }
+            // ★★§5.223【未映射写钩子 ✓】直接抓"出错那一笔写"的地址与现场寄存器 ✓
+            {
+                use std::sync::atomic::Ordering as O6;
+                static UW_ON: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if std::env::var("JOC_UNMAPPED").is_ok() && !UW_ON.swap(true, O6::SeqCst) {
+                    let r = self.m.cpu.add_mem_hook(
+                        unicorn_engine::HookType::MEM_WRITE_UNMAPPED,
+                        0,
+                        u64::MAX,
+                        move |uc, _t, addr, sz, value| {
+                            let g = |rg| uc.reg_read(rg).unwrap_or(0);
+                            eprintln!(
+                                "[unmapped] **写0x{addr:08x}** size={sz} 值=0x{value:08x} \
+                                 PC=0x{:08x} LR=0x{:08x} SP=0x{:08x} R0=0x{:08x} R2=0x{:08x} \
+                                 R3=0x{:08x} R4=0x{:08x} R6=0x{:08x} R8=0x{:08x}",
+                                g(unicorn_engine::RegisterARM::PC),
+                                g(unicorn_engine::RegisterARM::LR),
+                                g(unicorn_engine::RegisterARM::SP),
+                                g(unicorn_engine::RegisterARM::R0),
+                                g(unicorn_engine::RegisterARM::R2),
+                                g(unicorn_engine::RegisterARM::R3),
+                                g(unicorn_engine::RegisterARM::R4),
+                                g(unicorn_engine::RegisterARM::R6),
+                                g(unicorn_engine::RegisterARM::R8)
+                            );
+                            false
+                        },
+                    );
+                    match r {
+                        Ok(_) => eprintln!("[unmapped] 未映射写钩子已安装 ✓"),
+                        Err(e) => eprintln!("[unmapped] 安装失败 ✗: {e:?}"),
+                    }
+                }
+            }
+            // ★★§5.223【循环头寄存器监视 ✓】只看 `align_yaw_to_mag` 清零循环头
+            //   （本构建 0x0806f3e0 ✓），且**仅当基址寄存器变野**时打印 ⇒ 抓第一次变坏 ✓
+            {
+                use std::sync::atomic::Ordering as O7;
+                static LOOP_ON: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if std::env::var("JOC_LOOPWATCH").is_ok() && !LOOP_ON.swap(true, O7::SeqCst) {
+                    let lo = mcu_simulater::elfsym::app_sym("align_yaw_to_mag") as u64;
+                    // 循环头 ≈ 函数内固定偏移；这里用"落在该函数区间内"的粗筛 + 只看野值 ✓
+                    let hi = lo + 0x400;
+                    eprintln!("[loop] 监视 align_yaw_to_mag 区间 0x{lo:08x}..0x{hi:08x}");
+                    let r = self.m.cpu.add_block_hook(lo, hi, move |uc, addr, _sz| {
+                        let g = |rg| uc.reg_read(rg).unwrap_or(0);
+                        let (r0, r2, r3, r4, r5, r6, r8) = (
+                            g(unicorn_engine::RegisterARM::R0),
+                            g(unicorn_engine::RegisterARM::R2),
+                            g(unicorn_engine::RegisterARM::R3),
+                            g(unicorn_engine::RegisterARM::R4),
+                            g(unicorn_engine::RegisterARM::R5),
+                            g(unicorn_engine::RegisterARM::R6),
+                            g(unicorn_engine::RegisterARM::R8),
+                        );
+                        // 只要任一"应指向 Eskf 内部"的基址离开 RAM 区 ⇒ 记为野值 ✓
+                        let sw = |v: u64| v < 0x2000_0000 || v >= 0x2002_0000;
+                        if sw(r0) || sw(r4) || (r4 != 0 && sw(r5)) {
+                            static SEEN: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(0);
+                            if SEEN.fetch_add(1, O7::Relaxed) < 20 {
+                                eprintln!(
+                                    "[loop] **野基址** @PC=0x{addr:08x} R0=0x{r0:08x} R2=0x{r2:08x} \
+                                     R3=0x{r3:08x} R4=0x{r4:08x} R5=0x{r5:08x} R6=0x{r6:08x} R8=0x{r8:08x}"
+                                );
+                            }
+                        }
+                    });
+                    eprintln!("[loop] 安装: {:?}", r.is_ok());
+                }
+            }
+            // ★★§5.223【指令级记录（只限 align_yaw_to_mag）✓】把 (pc, r4, r2, r6, r8) 逐指令入环 ✓
+            //   出错时打印最后 64 条 ⇒ **直接看到 r4 被谁写成 0** ✓（不再猜 ✓）
+            {
+                use std::sync::atomic::Ordering as O8;
+                static IL_ON: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if std::env::var("JOC_ILTRACE").is_ok() && !IL_ON.swap(true, O8::SeqCst) {
+                    let lo = mcu_simulater::elfsym::app_sym("align_yaw_to_mag") as u64;
+                    let hi = lo + 0x400;
+                    let r = self.m.cpu.add_code_hook(lo, hi, move |uc, addr, _sz| {
+                        let g = |rg| uc.reg_read(rg).unwrap_or(0) as u32;
+                        let i = ILPOS.fetch_add(1, O8::Relaxed) as usize % 256;
+                        unsafe {
+                            ILRING[i] = (addr as u32, g(unicorn_engine::RegisterARM::R4),
+                                         g(unicorn_engine::RegisterARM::R2), g(unicorn_engine::RegisterARM::R6),
+                                         g(unicorn_engine::RegisterARM::R8));
+                        }
+                    });
+                    eprintln!("[il] 指令级记录安装: {:?} 区间0x{lo:08x}..0x{hi:08x}", r.is_ok());
+                }
+            }
             if want && !INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 const BASE: u64 = 0x2000_41b0;
                 const TOP: u64 = BASE + 20480;
@@ -634,6 +733,8 @@ impl EnvHarness {
                 }};
             }
             let (pc, lr, sp) = (rg!(RegisterARM::PC), rg!(RegisterARM::LR), rg!(RegisterARM::SP));
+            // ★§5.223：MSP/PSP 分离情况（ISR 应在 MSP ✓；若 MSP 落在 app SRAM 就说明栈分离坏了 ✗）
+            let (msp, psp) = (rg!(RegisterARM::MSP), rg!(RegisterARM::PSP));
             // ★RTOS 自带栈溢出检测的**粘性标志**（joc-base: g_stack_overflow @ 0x10008f5c ✓）
             //   比我自己涂色可靠 ✓（RTOS 在栈底写哨兵，涂色会踩到它 ✗）
             // ★§5.222：RTOS 自带三个检测器一起读 ✓（比自造启发式可靠 ✓）
@@ -712,8 +813,18 @@ impl EnvHarness {
                 }
                 out
             };
+            let il = {
+                let mut o = String::new();
+                let ipos = ILPOS.load(std::sync::atomic::Ordering::Relaxed) as usize % 256;
+                for k in 0..40usize {
+                    let idx = (ipos + 256 - 40 + k) % 256;
+                    let e = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ILRING[idx])) };
+                    o.push_str(&format!("\n    pc=0x{:08x} r4=0x{:08x} r2=0x{:08x} r6=0x{:08x} r8=0x{:08x}", e.0, e.1, e.2, e.3, e.4));
+                }
+                o
+            };
             panic!(
-                "run_one_control_tick 失败: {e:?}\n  **飞行记录(末160块)** = {ftrace}\n  PC=0x{pc:08x} LR=0x{lr:08x} SP=0x{sp:08x}\n  SCB {scb_s}\n  R0..R12 = {regs:08x?}\n  **RTOS: g_stack_overflow={ovf} · g_sched_invariant_fail={sinv} · g_fault_cfsr={cfsr_sticky}**\n  控制栈: 基址=0x{CTRL_STACK_BASE:08x} 长度={CTRL_STACK_LEN} 最深水位偏移={deepest}\n  **可疑写入（{n} 条）**:\n{suspects}",
+                "run_one_control_tick 失败: {e:?}\n  **MSP=0x{msp:08x} PSP=0x{psp:08x}**（MSP 应在 CCM 0x1000_xxxx ✓）\n  **指令级(末40条)**{il}\n  **飞行记录(末160块)** = {ftrace}\n  PC=0x{pc:08x} LR=0x{lr:08x} SP=0x{sp:08x}\n  SCB {scb_s}\n  R0..R12 = {regs:08x?}\n  **RTOS: g_stack_overflow={ovf} · g_sched_invariant_fail={sinv} · g_fault_cfsr={cfsr_sticky}**\n  控制栈: 基址=0x{CTRL_STACK_BASE:08x} 长度={CTRL_STACK_LEN} 最深水位偏移={deepest}\n  **可疑写入（{n} 条）**:\n{suspects}",
                 n = suspects.matches("PC=").count()
             );
         }

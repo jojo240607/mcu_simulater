@@ -2227,7 +2227,13 @@ impl Machine {
                 let r12 = uc.reg_read(RegisterARM::R12).unwrap_or(0) as u32;
                 let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
                 let pc_saved = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                let xpsr = uc.reg_read(RegisterARM::XPSR).unwrap_or(0) as u32 & 0xFF00_0000;
+                // ★★§5.223 修复：**必须保留 IT/ICI + T + GE** ✗ —— 本机用"块级重放"模型
+                //   （异常停在块首、返回时重放整块 ✓，见 `enter_exception` 的注释 ✓），
+                //   重放必须恢复**同样的 IT 块状态** ✓；只留条件标志会让 IT 块失去约束
+                //   ⇒ 重放时单条 `strne/ldrne` 被无条件执行 ⇒ **野读/野写**（实测：
+                //   `align_yaw_to_mag` 的 `ittt ne` 块重放后 r4=0 → 写 0x144 ✗）。
+                //   掩码 0xFFFF_FE00 = 保留 APSR/ICI-IT/T/GE，清掉 IPSR(8..0)（由本机接管 ✓）
+                let xpsr = uc.reg_read(RegisterARM::XPSR).unwrap_or(0) as u32 & 0xFFFF_FE00;
                 // 压 8 字帧（低地址→高地址：r0 r1 r2 r3 r12 LR PC xPSR），SP -= 32
                 let sp = sp - 32;
                 let mut frame = [0u8; 32];
@@ -2699,8 +2705,10 @@ impl Machine {
         let r12 = self.cpu.reg_read_u32(RegisterARM::R12)?;
         let lr = self.cpu.reg_read_u32(RegisterARM::LR)?;
         let pc_saved = self.cpu.reg_read_u32(RegisterARM::PC)?;
-        // xPSR 仅保留 APSR 标志位（bit31..24）；IPSR/EPSR 由本机接管
-        let xpsr = self.cpu.reg_read_u32(RegisterARM::XPSR)? & 0xFF00_0000;
+        // ★★§5.223 修复：保留 APSR 标志 **+ ICI/IT + T + GE**（IT 块状态必须随块重放一起恢复 ✓）
+        //   只留 bit31..24 会让 IT 块失去约束 ⇒ 重放时条件指令被无条件执行 ⇒ 野读/野写 ✗
+        //   （掩码 0xFFFF_FE00；IPSR 由本机接管 ⇒ 清掉 ✓）
+        let xpsr = self.cpu.reg_read_u32(RegisterARM::XPSR)? & 0xFFFF_FE00;
         // callee-saved r4..r11：停机在块首，此刻即块首初值。异常返回要重放
         // 被打断的块（PC 恢复为块首），必须同步还原 r4..r11——ISR 链（C 函数
         // prologue/epilogue）虽然自身保存/恢复它们，但恢复的是"打断时刻"的
