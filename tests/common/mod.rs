@@ -340,7 +340,16 @@ impl EnvHarness {
             phy.pre_tick(&mut self.m);
             phy.pre_tick_state(&self.st);
         }
-        run_one_control_tick(&mut self.m).expect("run_one_control_tick 失败");
+        // ★§5.217 诊断（临时）：捕获模拟器错误并打印 PC/LR/SP，便于用 map 定位
+        if let Err(e) = run_one_control_tick(&mut self.m) {
+            use unicorn_engine::RegisterARM;
+            let mut rd = |r: RegisterARM| self.m.cpu.reg_read(r).unwrap_or(u32::MAX as u64);
+            panic!(
+                "run_one_control_tick 失败: {e:?} | PC=0x{:08x} LR=0x{:08x} SP=0x{:08x} R0=0x{:08x} R1=0x{:08x}",
+                rd(RegisterARM::PC), rd(RegisterARM::LR), rd(RegisterARM::SP),
+                rd(RegisterARM::R0), rd(RegisterARM::R1)
+            );
+        }
         let t_after = self.m.systick_ms();
         // ③ 按【实测流逝】推进场景（自洽 ✓：不假设 dt ✗）
         //    ★§5.143：若挂了 PHY 后端 ⇒ 用**真动力学**推进（取代运动学 ✓）
