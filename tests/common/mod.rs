@@ -339,6 +339,33 @@ impl EnvHarness {
     pub fn step(&mut self) {
         use mcu_simulater::clock::run_one_control_tick;
         // ② 固件推进恰好一拍控制（内部轮询固件符号 CTRL_TICKS ✓，不改固件行为 ✓）
+        // ★★§5.220：周期读"悬垂缓冲守卫"的粘性证据（次数/缓冲地址/**调用者 LR** ✓）
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            static LAST: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n >= 20 && n % 50 == 0 {
+                macro_rules! rd {
+                    ($nm:expr) => {{
+                        let a = mcu_simulater::elfsym::app_sym($nm) as u64;
+                        self.m
+                            .cpu
+                            .mem_read(a, 4)
+                            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                            .unwrap_or(u32::MAX)
+                    }};
+                }
+                let cnt = rd!("BAD_BUF_COUNT");
+                if cnt != 0 && cnt != LAST.load(Ordering::Relaxed) {
+                    LAST.store(cnt, Ordering::Relaxed);
+                    let (a, l) = (rd!("BAD_BUF_ADDR"), rd!("BAD_BUF_LR"));
+                    eprintln!(
+                        "[guard] tick={n} 拒绝写入次数={cnt} 缓冲地址=0x{a:08x} **调用者LR=0x{l:08x}**"
+                    );
+                }
+            }
+        }
         // ★§5.219：前 20 拍（启动/bss 清零）不记录 ✓，之后打开监视 ✓
         {
             use std::sync::atomic::Ordering as O;
