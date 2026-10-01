@@ -343,11 +343,55 @@ impl EnvHarness {
         // ★§5.217 诊断（临时）：捕获模拟器错误并打印 PC/LR/SP，便于用 map 定位
         if let Err(e) = run_one_control_tick(&mut self.m) {
             use unicorn_engine::RegisterARM;
-            let mut rd = |r: RegisterARM| self.m.cpu.reg_read(r).unwrap_or(u32::MAX as u64);
+            // ★§5.217 诊断：模拟器故障时把 CPU 现场 + SCB 故障寄存器打出来 ✓
+            //   （`run_one_control_tick` 原来只给字符串 ⇒ 无法定位 ✗；
+            //     有了 PC 才能 addr2line、有了 BFAR/MMFAR 才能知道出错的**数据地址** ✓）
+            macro_rules! rg {
+                ($r:expr) => {
+                    self.m.cpu.reg_read($r).unwrap_or(u32::MAX as u64) as u32
+                };
+            }
+            macro_rules! scb {
+                ($a:expr) => {{
+                    let v = self.m.cpu.mem_read($a, 4).unwrap_or_default();
+                    if v.len() == 4 { u32::from_le_bytes([v[0], v[1], v[2], v[3]]) } else { u32::MAX }
+                }};
+            }
+            let (pc, lr, sp) = (rg!(RegisterARM::PC), rg!(RegisterARM::LR), rg!(RegisterARM::SP));
+            // ★RTOS 自带栈溢出检测的**粘性标志**（joc-base: g_stack_overflow @ 0x10008f5c ✓）
+            //   比我自己涂色可靠 ✓（RTOS 在栈底写哨兵，涂色会踩到它 ✗）
+            let ovf = self
+                .m
+                .cpu
+                .mem_read(0x1000_8f5cu64, 4)
+                .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                .unwrap_or(u32::MAX);
+            let scb_s = format!(
+                "CFSR=0x{:08x} HFSR=0x{:08x} MMFAR=0x{:08x} BFAR=0x{:08x}",
+                scb!(0xE000_ED28u64), scb!(0xE000_ED2Cu64),
+                scb!(0xE000_ED34u64), scb!(0xE000_ED38u64)
+            );
+            let regs = [
+                rg!(RegisterARM::R0), rg!(RegisterARM::R1), rg!(RegisterARM::R2),
+                rg!(RegisterARM::R3), rg!(RegisterARM::R4), rg!(RegisterARM::R5),
+                rg!(RegisterARM::R6), rg!(RegisterARM::R7), rg!(RegisterARM::R8),
+                rg!(RegisterARM::R9), rg!(RegisterARM::R10), rg!(RegisterARM::R11),
+                rg!(RegisterARM::R12),
+            ];
+            // ★控制栈水位（§5.217）：涂 0xA5 后被写过的最高处 ⇒ 用量 = 栈顶 − 该处
+            const CTRL_STACK_BASE: u64 = 0x2000_41b0;
+            const CTRL_STACK_LEN: u64 = 20480;
+            let mut deepest = CTRL_STACK_LEN;
+            if let Ok(v) = self.m.cpu.mem_read(CTRL_STACK_BASE, CTRL_STACK_LEN as usize) {
+                for (i, b) in v.iter().enumerate() {
+                    if *b != 0xA5 {
+                        deepest = i as u64;
+                        break;
+                    }
+                }
+            }
             panic!(
-                "run_one_control_tick 失败: {e:?} | PC=0x{:08x} LR=0x{:08x} SP=0x{:08x} R0=0x{:08x} R1=0x{:08x}",
-                rd(RegisterARM::PC), rd(RegisterARM::LR), rd(RegisterARM::SP),
-                rd(RegisterARM::R0), rd(RegisterARM::R1)
+                "run_one_control_tick 失败: {e:?}\n  PC=0x{pc:08x} LR=0x{lr:08x} SP=0x{sp:08x}\n  SCB {scb_s}\n  R0..R12 = {regs:08x?}\n  **RTOS g_stack_overflow = {ovf}**（1 = 栈溢出 ✓）\n  控制栈: 基址=0x{CTRL_STACK_BASE:08x} 长度={CTRL_STACK_LEN} 最深水位偏移={deepest}"
             );
         }
         let t_after = self.m.systick_ms();
