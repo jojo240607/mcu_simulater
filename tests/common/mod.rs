@@ -107,6 +107,12 @@ pub struct UsbHostModel {
     attached: bool,
 }
 
+
+/// ★§5.219：控制栈写监视结果（`step()` 安装钩子时赋值 ✓；崩溃时读取 ✓）
+static mut SUSPECT_CELL: *const () = core::ptr::null();
+/// ★§5.219：监视生效开关 —— 启动期 bss 清零会合法写整块栈 ✗ ⇒ 前 20 拍不记录 ✓
+static WATCH_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl UsbHostModel {
     /// 固件启动到 USB 就绪所需的步数（x_hil_mcusim 的预启动约 130ms，此处 13ms/步）。
     const START_STEP: u64 = 10;
@@ -333,6 +339,75 @@ impl EnvHarness {
     pub fn step(&mut self) {
         use mcu_simulater::clock::run_one_control_tick;
         // ② 固件推进恰好一拍控制（内部轮询固件符号 CTRL_TICKS ✓，不改固件行为 ✓）
+        // ★§5.219：前 20 拍（启动/bss 清零）不记录 ✓，之后打开监视 ✓
+        {
+            use std::sync::atomic::Ordering as O;
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, O::Relaxed) == 20 {
+                WATCH_ACTIVE.store(true, O::Relaxed);
+            }
+        }
+        // ★§5.219 控制栈**写监视**（只装一次 ✓）：抓"谁在踩控制栈" ✗
+        //   判据 ①：写目标在控制栈内、但**当前 SP 不在**控制栈内 ⇒ 别的任务/上下文在踩 ✓
+        //   判据 ②：写目标在控制栈内、且**远低于当前 SP**（>4KB）⇒ 本任务野写 ✓
+        //   （4KB 余量：ESKF 等最深的合法帧约 ≤2KB ✓ ⇒ 不会误报 ✓）
+        {
+            use std::sync::Mutex;
+            use std::sync::OnceLock;
+            static SUSPECTS: OnceLock<Mutex<Vec<(u32, u32, u32, u32)>>> = OnceLock::new();
+            let cell = SUSPECTS.get_or_init(|| Mutex::new(Vec::new()));
+            // 供崩溃时读取
+            unsafe { SUSPECT_CELL = cell as *const _ as *const (); }
+            static INSTALLED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            // ★§5.219：写监视开销大（每次栈写都进钩子 ⇒ 常规跑从 14s 变 85s ✗）
+            //   ⇒ 仅在 `JOC_STACKWATCH=1` 时安装 ✓
+            let want = std::env::var("JOC_STACKWATCH").is_ok();
+            if want && !INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                const BASE: u64 = 0x2000_41b0;
+                const TOP: u64 = BASE + 20480;
+                self.m
+                    .cpu
+                    .add_mem_hook(
+                        unicorn_engine::HookType::MEM_WRITE,
+                        BASE,
+                        TOP - 1,
+                        move |uc, _ty, addr, _size, value| {
+                            let sp = uc.reg_read(unicorn_engine::RegisterARM::SP).unwrap_or(0);
+                            let pc = uc.reg_read(unicorn_engine::RegisterARM::PC).unwrap_or(0);
+                            let lr = uc.reg_read(unicorn_engine::RegisterARM::LR).unwrap_or(0);
+                            if !WATCH_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+                                return false;
+                            }
+                            // ★排除 ISR/上下文切换上下文 ✗：异常处理用 MSP（CCM 0x1000_xxxx ✓），
+                            //   而 `PendSV_Handler` 会**合法地**把被切换任务的寄存器存到它自己的栈上 ✓
+                            //  （首版没排除 ⇒ 32 条"可疑"全是 `vstmdb r0!,{s16-s31}` ✗ 假阳性 ✓）
+                            let sp_in_ccm = sp >= 0x1000_0000 && sp < 0x1001_0000;
+                            if sp_in_ccm {
+                                return false;
+                            }
+                            let sp_in = sp >= BASE && sp < TOP;
+                            // ★收紧（第二版 ✓）：函数序言一开始就把 SP 下移 ⇒ 合法写**永远 ≥ SP** ✓
+                            //   ⇒ 任何 `addr < sp` 的写入都可疑 ✓（首版用 4KB 余量 ⇒ 漏掉同帧内越界 ✗）
+                            // ★第三版判据（去掉 push 假阳性 ✓）：只抓 **SP 下方 64B~4KB 的"死区"**
+                            //   · `push` 写 `sp-4/-8/…`（≤64B ✓，且钩子在 SP 更新前触发 ✗）⇒ 排除 ✓
+                            //   · 合法大帧在其序言里已把 SP 下移 ⇒ 写入永远 ≥ SP ✓
+                            //   ⇒ 死区里出现写入 = **野写** ✓
+                            let in_dead_zone = sp_in && addr + 64 < sp && addr + 4096 > sp;
+                            if !sp_in || in_dead_zone {
+                                if let Ok(mut v) = cell.lock() {
+                                    // 记录 (PC, 目标, 值, SP) + **LR**（调用者返回地址 ✓）便于定位
+                                    if v.len() < 64 {
+                                        v.push((pc as u32, addr as u32, value as u32, lr as u32));
+                                    }
+                                }
+                            }
+                            false // 不拦截，仅观察
+                        },
+                    )
+                    .ok();
+            }
+        }
         let t_before = self.m.systick_ms();
         // ★§5.145：若挂了 PHY 后端且有摇杆 override ⇒ 控制拍**之前**也写一次
         //   （固件在拍内读 override ✓；此前只在拍后写 ⇒ 读到的是上一拍（首拍为 0）✗）
@@ -390,8 +465,25 @@ impl EnvHarness {
                     }
                 }
             }
+            let suspects = unsafe {
+                if SUSPECT_CELL.is_null() {
+                    String::from("(监视未安装)")
+                } else {
+                    let cell = &*(SUSPECT_CELL as *const std::sync::Mutex<Vec<(u32, u32, u32, u32)>>);
+                    cell.lock()
+                        .map(|v| {
+                            v.iter()
+                                .map(|(pc, a, val, sp)| {
+                                    format!("    PC=0x{pc:08x} 写入0x{a:08x} 值=0x{val:08x} **LR=0x{sp:08x}**\n")
+                                })
+                                .collect::<String>()
+                        })
+                        .unwrap_or_default()
+                }
+            };
             panic!(
-                "run_one_control_tick 失败: {e:?}\n  PC=0x{pc:08x} LR=0x{lr:08x} SP=0x{sp:08x}\n  SCB {scb_s}\n  R0..R12 = {regs:08x?}\n  **RTOS g_stack_overflow = {ovf}**（1 = 栈溢出 ✓）\n  控制栈: 基址=0x{CTRL_STACK_BASE:08x} 长度={CTRL_STACK_LEN} 最深水位偏移={deepest}"
+                "run_one_control_tick 失败: {e:?}\n  PC=0x{pc:08x} LR=0x{lr:08x} SP=0x{sp:08x}\n  SCB {scb_s}\n  R0..R12 = {regs:08x?}\n  **RTOS g_stack_overflow = {ovf}**（1 = 栈溢出 ✓）\n  控制栈: 基址=0x{CTRL_STACK_BASE:08x} 长度={CTRL_STACK_LEN} 最深水位偏移={deepest}\n  **可疑写入（{n} 条）**:\n{suspects}",
+                n = suspects.matches("PC=").count()
             );
         }
         let t_after = self.m.systick_ms();
