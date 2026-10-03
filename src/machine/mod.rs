@@ -411,8 +411,26 @@ impl Machine {
         for i in self.i2c.lock().unwrap().iter() {
             i.lock().unwrap().step_slaves(dt);
         }
-        for s in self.spi.lock().unwrap().iter() {
-            s.lock().unwrap().step_slave(dt);
+        // ★design.md §3：SPI 从设备只在 step 里记录事件；**释放总线锁后**再 publish
+        //   （避免持锁 publish → `feed_gpio` 锁 port_select/nvic 的死锁 ✗）。
+        let mut spi_evs: Vec<(u8, u8, bool, u64)> = Vec::new();
+        {
+            let spis = self.spi.lock().unwrap();
+            for s in spis.iter() {
+                let mut sp = s.lock().unwrap();
+                sp.step_slave(dt);
+                for sl in sp.slaves_mut() {
+                    if let Some(e) = sl.take_event() {
+                        spi_evs.push(e);
+                    }
+                }
+            }
+        }
+        {
+            let ev = self.events.lock().unwrap();
+            for (port, pin, level, tick) in spi_evs {
+                ev.publish(&Event::GpioLevel { port, pin, level, tick });
+            }
         }
         for e in self.escs.lock().unwrap().iter() {
             e.lock().unwrap().step(dt);
@@ -581,7 +599,7 @@ impl Machine {
         // IMU 主源为 BMI088（SPI3，ACCEL_CS=GPIOE_7、GYRO_CS=GPIOE_8）：与固件
         // real-sensors 的 ImuBmi088("bmi088") 对应——注意板级设备名 "spi2" 实际是
         // SPI3 外设（g_spi2），故从设备必须挂在 SPI 端口 3（x_drvtest 同此约定）。
-        self.register_spi_slave(3, Box::new(default_bmi088((4, 7), (4, 8)).with_source(FlySimSource::new(st.clone(), FlySimKind::Imu))));
+        self.register_spi_slave(3, Box::new(default_bmi088((4, 7), (4, 8)).with_source(FlySimSource::new(st.clone(), FlySimKind::Imu)).with_drdy((4, 4), self.events.clone(), 1000.0)));
         // I2C 总线（★§5.136：baro 与 mag **分挂两条独立 I2C、各自 DMA**）：
         //   · 气压计 -> i2c2(I2C3)：TX S4 / RX S2 ✓
         //   · 磁力计 -> i2c0(I2C1)：TX S6（USART2_TX 已让出，改走 S7）/ RX S0 ✓
@@ -622,7 +640,7 @@ impl Machine {
         use crate::peripheral::vperiph::data_source::{StaticBaro, StaticImu, StaticMag};
         use crate::peripheral::vperiph::i2c::{bmp280, mpu6050, qmc5883};
         use crate::peripheral::vperiph::spi::default_bmi088;
-        self.register_spi_slave(3, Box::new(default_bmi088((4, 7), (4, 8)).with_source(StaticImu::default())));
+        self.register_spi_slave(3, Box::new(default_bmi088((4, 7), (4, 8)).with_source(StaticImu::default()).with_drdy((4, 4), self.events.clone(), 1000.0)));
         // I2C 从设备挂 I2C3（port 3）：见 attach_flysim_sensors 的 DMA 冲突说明
         self.register_i2c_slave(3, Box::new(mpu6050(StaticImu::default())));
         self.register_i2c_slave(3, Box::new(bmp280(StaticBaro::at_height(baro_height))));

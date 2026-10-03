@@ -24,6 +24,8 @@
 //!
 //! 读取瞬间刷新（仿 `RegFileSlave` 动态寄存器）。
 
+use crate::events::{Event, EventBus};
+use std::sync::{Arc, Mutex};
 use super::VirtualSpiSlave;
 use crate::peripheral::vperiph::data_source::{DataSource, SensorModel, StaticImu};
 
@@ -90,6 +92,17 @@ pub struct Bmi088 {
     /// 故障注入：置位后 MISO 恒高（0xFF），帧状态机不推进——模拟芯片断线/
     /// 无响应（固件侧 WHO_AM_I 校验失败 → healthy=false → 读零值 → FDIR 冻结）。
     faulted: bool,
+    /// ★design.md §3：**data-ready INT 引脚**（port, pin）——0 ⇒ 关。
+    drdy: Option<(u8, u8)>,
+    /// 事件总线（DRDY 经 `Event::GpioLevel` → EXTI）。
+    events: Option<Arc<Mutex<EventBus>>>,
+    /// DRDY 累加器与电平。
+    drdy_accum: f32,
+    drdy_level: bool,
+    drdy_period: f32,
+    drdy_tick: u64,
+    /// 待发布的 DRDY 事件（由宿主在锁外 publish）。
+    pending: Option<(u8, u8, bool, u64)>,
 }
 
 impl Bmi088 {
@@ -119,10 +132,26 @@ impl Bmi088 {
             n_writes: 0,
             n_reads: 0,
             faulted: false,
+            drdy: None,
+            events: None,
+            drdy_accum: 0.0,
+            drdy_level: false,
+            drdy_period: 0.001,
+            drdy_tick: 0,
+            pending: None,
         };
         s.poke(Chip::Accel, 0x00, ACCEL_WHO_AM_I);
         s.poke(Chip::Gyro, 0x00, GYRO_WHO_AM_I);
         s
+    }
+
+    /// ★design.md §3：启用 **data-ready INT**（BMI088 INT 引脚 → 仿真 GPIO 电平事件 → EXTI）。
+    /// `pin` = INT 的 GPIO (port, pin)；`odr_hz` = 数据就绪率（默认 1kHz）。
+    pub fn with_drdy(mut self, pin: (u8, u8), events: Arc<Mutex<EventBus>>, odr_hz: f32) -> Self {
+        self.drdy = Some(pin);
+        self.events = Some(events);
+        self.drdy_period = if odr_hz > 1.0 { 1.0 / odr_hz } else { 0.001 };
+        self
     }
 
     /// 替换数据源（装配期：默认 StaticImu → FlySimSource 等实时模型）。
@@ -286,9 +315,25 @@ impl VirtualSpiSlave for Bmi088 {
         Some(self)
     }
 
+    fn take_event(&mut self) -> Option<(u8, u8, bool, u64)> {
+        self.pending.take()
+    }
+
     fn step(&mut self, dt: f32) {
         if let Some(src) = &mut self.source {
             src.step(dt);
+        }
+        // ★design.md §3：DRDY —— 每 ODR 周期翻转 INT 引脚并发布 GPIO 电平事件（→ EXTI）。
+        if let (Some((port, pin)), Some(ev)) = (self.drdy, self.events.as_ref()) {
+            self.drdy_accum += dt;
+            if self.drdy_accum >= self.drdy_period {
+                self.drdy_accum -= self.drdy_period;
+                self.drdy_level = !self.drdy_level;
+                self.drdy_tick = self.drdy_tick.wrapping_add(1);
+                // ★只在**锁外**由宿主 publish（这里仅记录）⇒ 不在持总线锁时 publish ✗
+                let _ = ev;
+                self.pending = Some((port, pin, self.drdy_level, self.drdy_tick));
+            }
         }
     }
 }

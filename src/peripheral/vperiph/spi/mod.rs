@@ -70,6 +70,10 @@ pub trait VirtualSpiSlave: Send + Sync {
     /// 仿真时间推进（Math 数据源步进；由 Machine 的 step_virtual_slaves 驱动）。
     fn step(&mut self, _dt: f32) {}
 
+    /// ★design.md §3：虚拟从设备产生的**待发布 GPIO 事件**（port,pin,level,tick）。
+    /// 由宿主在**释放总线锁之后**发布（避免在持锁时 publish → 锁序死锁 ✗）。
+    fn take_event(&mut self) -> Option<(u8, u8, bool, u64)> { None }
+
     /// 持久化（Machine 统一触发；无持久化能力的器件 no-op）。
     ///
     /// SPI NOR Flash 等"保存用途"器件借此把映像写回绑定文件，数据跨 run 存活。
