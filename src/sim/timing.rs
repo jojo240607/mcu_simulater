@@ -151,6 +151,12 @@ pub const RETIRED_BYTES_PER_MS: usize = 168_000;
 /// 修复前 ✗：定时器直接收到 `Δ退休字节`（= 1 字节 1 周期）⇒ 实际速率 = 仿真器字节流
 /// 速率（实测 ≈88_889 周期/固件ms ✗）⇒ 与板级声明 84_000/ms 差 +5.8% ✗，
 /// 且**随代码构成浮动** ⇒ 这正是"相位漂移 / 代码布局敏感"的根 ✓。
-pub const TIMER_CYC84_PER_BYTE_NUM: u64 = 84_000;
+/// ★★★2026-10-04【口径统一为标称 168MHz】：此前是 84_000（= `size/2`），与
+///   - 仿真器基准 `RETIRED_BYTES_PER_MS = 168_000`（固件 1ms = 168k 字节）✗
+///   - DWT.CYCCNT 直接吃 `size`（= 168k 口径）✗
+/// 三方不一致 ⇒ 固件按 168MHz 写的换算（`cycles/168e6`、TIM ARR）在仿真器上差 2×。
+/// 现取**标称 168MHz**（分子=分母 ⇒ 折算比 1 ⇒ 定时器与 DWT 同口径 ✓），
+/// 使固件的 168 假设在仿真器上成立 ⇒ 无感移植真机 ✓（内核实测校准会读到 ~168k 可自检 ✓）。
+pub const TIMER_CYC168_PER_BYTE_NUM: u64 = 168_000;
 /// 分母（与 [`RETIRED_BYTES_PER_MS`] 同源 ⇒ 两者不会再次分叉 ✓）。
-pub const TIMER_CYC84_PER_BYTE_DEN: u64 = RETIRED_BYTES_PER_MS as u64;
+pub const TIMER_CYC168_PER_BYTE_DEN: u64 = RETIRED_BYTES_PER_MS as u64;
