@@ -79,7 +79,12 @@ impl Peripheral for Dwt {
 
     fn tick(&mut self, cycles: u64) {
         if self.ctrl & CYCCNTENA != 0 {
-            self.cyccnt = self.cyccnt.wrapping_add(cycles);
+            // ★★★2026-10-04【核时钟折算】：输入 `cycles` 是 **APB1 84MHz 基准**的字节量
+            //   （与各定时器同基准 ✓）。DWT 计的是**核心时钟 168MHz**（固件按 168MHz 写
+            //   `cycles/168e6`、SysTick reload 168000=1ms ✓）⇒ 必须 ×2 才是核周期 ✓。
+            //   否则 DWT 报 ~84k/ms 而固件期望 168k/ms ⇒ 全仓按 168 的换算差 2× ✗。
+            const CORE_OVER_BASE: u64 = 168_000_000 / 84_000_000;
+            self.cyccnt = self.cyccnt.wrapping_add(cycles.saturating_mul(CORE_OVER_BASE));
         }
     }
 }

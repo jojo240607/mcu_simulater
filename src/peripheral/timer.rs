@@ -1221,7 +1221,7 @@ mod tests {
             kind: TimerKind::General,
             bits: 16,
             channels: 2,
-            clk_hz: 84_000_000,
+            clk_hz: 168_000_000 /* ★APB2：定时器时钟 = 2×PCLK2 = 168MHz（固件 `pace.rs` 按 168MHz 配 500Hz ✓）*/,
             irq: TimerIrq { brk: 24, up: 24, trig_com: 24, cc: 24 }, // 共享 TIM1_BRK 行
         };
         let mut t9 = Timer::new(9, cfg, bus, nvic.clone());

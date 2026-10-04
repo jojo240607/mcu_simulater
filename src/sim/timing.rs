@@ -157,6 +157,11 @@ pub const RETIRED_BYTES_PER_MS: usize = 168_000;
 /// 三方不一致 ⇒ 固件按 168MHz 写的换算（`cycles/168e6`、TIM ARR）在仿真器上差 2×。
 /// 现取**标称 168MHz**（分子=分母 ⇒ 折算比 1 ⇒ 定时器与 DWT 同口径 ✓），
 /// 使固件的 168 假设在仿真器上成立 ⇒ 无感移植真机 ✓（内核实测校准会读到 ~168k 可自检 ✓）。
-pub const TIMER_CYC168_PER_BYTE_NUM: u64 = 168_000;
+/// ★★★2026-10-04 二次修正【基准回 84k】：**每个定时器已按自身 `clk_hz` 折算**
+///   （`timer.rs: tick()` 内 `cycles * clk_hz/84MHz` ✓）⇒ 本常量是**输入基准**，必须保持
+///   84_000（APB1 基准）✗ 不能改成 168_000（那会把 APB1 定时器全部翻倍 ✗，实测使 env
+///   长测例因 TIM 事件密度翻倍而墙钟超时 ✗）。APB2 定时器的 ×2 由各自 `clk_hz` 承担 ✓，
+///   核时钟（DWT）的 ×2 由 `dwt.rs` 承担 ✓。
+pub const TIMER_CYC84_PER_BYTE_NUM: u64 = 84_000;
 /// 分母（与 [`RETIRED_BYTES_PER_MS`] 同源 ⇒ 两者不会再次分叉 ✓）。
-pub const TIMER_CYC168_PER_BYTE_DEN: u64 = RETIRED_BYTES_PER_MS as u64;
+pub const TIMER_CYC84_PER_BYTE_DEN: u64 = RETIRED_BYTES_PER_MS as u64;
