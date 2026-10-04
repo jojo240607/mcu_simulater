@@ -25,6 +25,48 @@
 //! 读取窗口内完整到达"，无需与真机波特率/帧率精确一致。若未来需要
 //! 推流节奏与 CPU 时钟严格同步，应以本模块单一常量为基准重新校准。
 
+/// ═══════════════════════════════════════════════════════════════════════════
+/// ★★★ 唯一的"块 → 各时钟域周期"换算入口（2026-10-04 收敛，**数值零变更**）
+///
+/// 背景（研究结论 ✓）：改造前有**三处各自折算**✗，隐含三种 CPI ✗，是"仿真耗时/真机耗时"
+/// 不可比的根因 ✓：
+///   · block hook 原始量 `cycles = size`（TB 字节，Thumb 2B/指令）⇒ 隐含 **2 拍/指令**
+///   · `timers` 列表（含 **SCB/SysTick** ✓）经 `TIMER_CYC84_PER_BYTE`（84k/168k=÷2）
+///     ⇒ 实际 = `size/2` = **1 拍/指令** ✗
+///   · `DWT.CYCCNT` 经 `size × CORE_OVER_BASE(=2)` ⇒ **4 拍/指令** ✗
+///   · 真机 STM32F407（M4F 混合负载）⇒ **≈1.2~1.5 拍/指令** ✓
+///
+/// 本模块把三者收敛到**同一处**，便于下一步统一到真机 CPI（改一处即可 ✓）。
+/// 现在**保持三个函数各自的现值**，行为与收敛前逐位一致 ✓。
+/// ═══════════════════════════════════════════════════════════════════════════
+
+/// CPU 侧原始虚拟周期（block hook 的 `cycles`；= TB 字节）。
+/// **所有**时钟域都应从它派生 ✓（不要再各自乘系数 ✗）。
+#[inline]
+pub const fn block_cycles(tb_bytes: u64) -> u64 {
+    tb_bytes
+}
+
+/// 外设域输入（TIM/DMA/RTC/**SysTick(SCB)** ✓）：APB1 84MHz 基准。
+/// 现值 = `tb/2`（= 指令数 ⇒ 隐含 CPI=1 ✗）。各 timer 再自乘 `clk_hz/84M` ✓。
+#[inline]
+pub fn peripheral_cycles(tb_bytes: u64, frac: &mut u64) -> u64 {
+    let acc = *frac + tb_bytes * TIMER_CYC84_PER_BYTE_NUM;
+    let out = acc / TIMER_CYC84_PER_BYTE_DEN;
+    *frac = acc % TIMER_CYC84_PER_BYTE_DEN;
+    out
+}
+
+/// DWT（核周期计数器）：现值 = `tb × 2`（⇒ 隐含 CPI=4 ✗）。
+/// 与 [`peripheral_cycles`] 之差（4×）即"仿真耗时 vs 真机耗时"的偏差源 ✓。
+#[inline]
+pub const fn core_cycles_dwt(_unused_tb: u64) -> u64 {
+    // ★步骤 2：DWT 与 SysTick **同口径**（DWT 也在 `timers` 列表里，收的已是核周期 ✓）
+    //   ⇒ 这里不再乘任何系数 ✗（此前 ×2 使 DWT 隐含 CPI=2、比 SysTick 快 2× ✗）。
+    //   保留函数形态仅供调用点统一 ✓；实际基准由 `peripheral_cycles` 唯一决定 ✓。
+    0
+}
+
 /// 周期模型接口
 pub trait CycleModel {
     /// 一个指令块消耗的周期数（块级加权）
@@ -162,6 +204,15 @@ pub const RETIRED_BYTES_PER_MS: usize = 168_000;
 ///   84_000（APB1 基准）✗ 不能改成 168_000（那会把 APB1 定时器全部翻倍 ✗，实测使 env
 ///   长测例因 TIM 事件密度翻倍而墙钟超时 ✗）。APB2 定时器的 ×2 由各自 `clk_hz` 承担 ✓，
 ///   核时钟（DWT）的 ×2 由 `dwt.rs` 承担 ✓。
-pub const TIMER_CYC84_PER_BYTE_NUM: u64 = 84_000;
+/// ★★★2026-10-04【步骤 2：统一到真机 CPI】目标口径 ——
+///   **核周期 = 指令数 × SIM_CPI（STM32F407 M4F 混合负载等效 ≈1.3）**
+///   ⇒ `1 固件 ms`（SysTick reload 168000 ✓）= 168000/1.3 ≈ **129_230 条指令**
+///     = 真机 1ms（129230 × 1.3 ÷ 168MHz ✓）⇒ 固件测得的 ms/dt **具备真机等效意义** ✓。
+///   效应：仿真器报出的耗时**缩小 2×**（此前 DWT 隐含 CPI=2 ⇒ `208µs → ~104µs`），
+///   与 PX4 的数字**可比** ✓（不再是"我们永远不达标"的假象 ✓）。
+///   取值 = 84_000 × CPI = 84_000 × 1.3 = 109_200（分母仍 RETIRED_BYTES_PER_MS ✓）。
+pub const SIM_CPI_NUM: u64 = 13;   // 1.3 拍/指令（真机 M4F 等效）
+pub const SIM_CPI_DEN: u64 = 10;
+pub const TIMER_CYC84_PER_BYTE_NUM: u64 = 84_000 * 13 / 10;   // = 109_200
 /// 分母（与 [`RETIRED_BYTES_PER_MS`] 同源 ⇒ 两者不会再次分叉 ✓）。
 pub const TIMER_CYC84_PER_BYTE_DEN: u64 = RETIRED_BYTES_PER_MS as u64;

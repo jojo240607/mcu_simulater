@@ -338,6 +338,11 @@ impl EnvHarness {
 
     /// 当前【固件时间】(ms) ✓ —— 供测例用"按固件时间的循环"表达时长 ✓
     /// （替代"按步数循环"✗，步数是实现细节 ✓）
+    /// ★诊断：场景真值位姿（NED 位置/速度 + 欧拉角），用于与固件估计逐拍对比。
+    pub fn truth(&self) -> mcu_simulater::env::scenario::Truth {
+        self.scn.truth()
+    }
+
     pub fn fw_ms(&self) -> u64 {
         self.m.systick_ms()
     }

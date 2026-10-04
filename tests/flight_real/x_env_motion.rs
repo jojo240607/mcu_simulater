@@ -39,10 +39,27 @@ fn climb_height_tracks() {
     // 跟踪应单调正确。断言高度单调下降（NED 向下）且健康位正常。
     let scn = EnvScenario::new(Motion::Vertical { vel_up: 2.0 }, Perturb::clean(), vec![]);
     let mut h = EnvHarness::new(scn, true);
-    h.run_for_ms(400 as f64 * 13.0); // 预热（GPS fix + EKF 收敛）
+    // ★诊断：预热期间同时打印【场景真值】与固件时间，判定真值是否已积分到荒谬量级。
+    for k in 0..6 {
+        h.run_for_ms(400 as f64 * 13.0 / 6.0);
+        let t = h.truth();
+        let e = h.read_est();
+        eprintln!(
+            "[motion][warm{}] fw_ms={:5} tru=({:9.2},{:9.2},{:9.2}) tru_vel=({:7.2},{:7.2},{:7.2}) | est=({:9.2},{:9.2},{:9.2})",
+            k, h.fw_ms(), t.pos[0], t.pos[1], t.pos[2], t.vel[0], t.vel[1], t.vel[2],
+            e.pos[0], e.pos[1], e.pos[2]
+        );
+        if k == 5 {
+            let c = h.console_all();
+            let tail: String = c.chars().rev().take(2400).collect::<String>().chars().rev().collect();
+            eprintln!("[motion][console tail]\n{tail}");
+        }
+    }
     let mut prev_pz = f32::NAN;
     let mut mon_dec = true;
     let mut alt_gain = 0.0f32;
+    // ★诊断：逐 0.5s 打印估计（pos/vel）与固件时间，定位"估计是否跟随机动"。
+    let mut dbg_i: u32 = 0;
     let start_pz = {
         let e = h.read_est();
         e.pos[2]
@@ -60,6 +77,15 @@ fn climb_height_tracks() {
             }
         }
         prev_pz = e.pos[2];
+        if dbg_i % 125 == 0 {
+            let ee = h.read_est();
+            eprintln!(
+                "[motion][climb] fw_ms={:6} est=({:7.2},{:7.2},{:7.2}) vel=({:6.2},{:6.2},{:6.2}) armed={} health={} seq={}",
+                h.fw_ms(), ee.pos[0], ee.pos[1], ee.pos[2],
+                ee.vel[0], ee.vel[1], ee.vel[2], ee.armed, ee.health, h.read_sensor_seq()
+            );
+        }
+        dbg_i += 1;
         if e.health > 0 {
             panic!("爬升中 FDIR health={}（应 0）", e.health);
         }

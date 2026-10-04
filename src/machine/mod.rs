@@ -2119,15 +2119,14 @@ impl Machine {
             // 实测均值 ~4.6 万，见 tests/x_sys_retire_calib.rs）。注意历史注释中的
             // "≈1.98e4 退休"是旧 ×AVG=3 口径（timing.rs BlockWeighted 已废弃），
             // 与新口径不矛盾——当前生效的是「访客字节 = 虚拟周期」。
-            let cycles = size as u64;
+            let cycles = crate::sim::timing::block_cycles(size as u64);
             clock.advance(cycles);
             // ★定时器周期流（§5.100 #2 修复）：按【APB1 84MHz 输入基准】折算（各定时器再乘自身 clk_hz/84M ✓），
             //   而不是直接用退休字节数 ✗（那会让定时器速率=仿真器吞吐 ⇒ 随代码浮动 ✗）。
             //   余数累加 ⇒ 长期精确 ✓。
-            let cyc_acc = timer_frac.get()
-                + size as u64 * crate::sim::timing::TIMER_CYC84_PER_BYTE_NUM;
-            let timer_cycles = cyc_acc / crate::sim::timing::TIMER_CYC84_PER_BYTE_DEN;
-            timer_frac.set(cyc_acc % crate::sim::timing::TIMER_CYC84_PER_BYTE_DEN);
+            let mut f = timer_frac.get();
+            let timer_cycles = crate::sim::timing::peripheral_cycles(size as u64, &mut f);
+            timer_frac.set(f);
             // 快路径：BIT_ANY_ACTIVE 由外设区 MMIO 写置位（外设激活只可能发生在 MMIO 写，
             // 见 attach_peripherals 的 TICK_REGIONS 判定），block hook 免去每块全扫
             // ~20 个 active 标记（bench_probe：H10 actives 7→20，MIPS 57.9→34.7）。
