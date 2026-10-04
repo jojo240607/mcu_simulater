@@ -49,7 +49,24 @@ fn climb_height_tracks() {
             k, h.fw_ms(), t.pos[0], t.pos[1], t.pos[2], t.vel[0], t.vel[1], t.vel[2],
             e.pos[0], e.pos[1], e.pos[2]
         );
-        if k == 5 {
+        if k == 0 {
+            // ★② 诊断：读固件侧 ESKF_DIAG2（step 10..14 的 P/零偏快照 ✓）
+            let addr = mcu_simulater::elfsym::app_sym("ESKF_DIAG2") as u64;
+            if let Ok(b) = h.m.cpu.mem_read(addr, 80 * 4) {
+                let f = |i: usize| f32::from_le_bytes([b[i*4], b[i*4+1], b[i*4+2], b[i*4+3]]);
+                for slot in 0..5usize {
+                    let o = slot * 16;
+                    eprintln!(
+                        "[diag2] step={:>5} ba=({:9.2},{:9.2},{:9.2}) Pvv=({:8.1},{:8.1},{:8.1}) Pba=({:9.1},{:9.1},{:9.1}) Pvb=({:9.1},{:9.1},{:9.1})",
+                        f(o+15) as u32,
+                        f(o+0), f(o+1), f(o+2),
+                        f(o+3), f(o+4), f(o+5),
+                        f(o+6), f(o+7), f(o+8),
+                        f(o+12), f(o+13), f(o+14));
+                }
+            }
+        }
+        if true {  // ★②诊断：每轮都 dump（原来只在 k==5，测试被锁相中止时永远看不到 ✗）
             let c = h.console_all();
             let tail: String = c.chars().rev().take(2400).collect::<String>().chars().rev().collect();
             eprintln!("[motion][console tail]\n{tail}");
