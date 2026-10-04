@@ -150,11 +150,17 @@ struct FaultState {
 }
 
 /// 环境场景：运动 + 扰动 + 故障 → 传感器输出（写入 FlySimState）。
+/// ★fix 建立前的静止时长（s）—— 让固件的 GPS 原点与场景原点一致 ✓
+/// （NMEA 首帧 + 固件锁 ref 约需 0.5s ✓ ⇒ 取 1.0s 留裕量 ✓，照 PX4 的"对齐期静止"语义 ✓）
+pub const MOTION_DELAY_S: f32 = 1.0;
+
 pub struct EnvScenario {
     motion: Motion,
     perturb: Perturb,
     faults: Vec<FaultEvent>,
     t: f32,
+    /// 运动学时间轴的推迟量（s ✓）：fix 前真值保持静止 ✓
+    motion_delay_s: f32,
     truth: Truth,
     /// 参考点（GPS 经纬度基准）。
     lat0: f32,
@@ -193,6 +199,7 @@ impl EnvScenario {
             perturb,
             faults,
             t: 0.0,
+            motion_delay_s: MOTION_DELAY_S,  // ★fix 前静止（PX4 at_rest 语义 ✓）
             truth: Truth::default(),
             lat0: 30.0,
             lon0: 114.0,
@@ -232,7 +239,15 @@ impl EnvScenario {
     /// 推进 dt 秒：运动学闭式 + 扰动 + 故障编排。
     pub fn advance(&mut self, dt: f32) {
         self.t += dt;
-        let t = self.t;
+        // ★★★2026-10-04【对齐 PX4 的 at_rest 语义 —— 修"原点偏移"✗】
+        //   固件的 GPS NED 原点在【首次 fix 时刻】锁定（`ublox.rs` 的 ref_lat/ref_lon ✓）；
+        //   若场景从 t=0 就在动 ⇒ fix 落在真值已偏移处 ⇒ 固件 NED 恒少"fix 时刻的真值偏移"✗
+        //   （实测 Vertical 场景 ~1.4m ✓、Hover 不动故为 0 ⇒ 掩盖了它 ✓）。
+        //   PX4 的做法 ✓：局部原点在**静止/起飞前**锁定（`gravity_fusion.cpp:63-65` 的
+        //   `vehicle_at_rest` / `tilt_align` ✓）⇒ 断言方与飞控**共用同一原点** ✓。
+        //   实现：把运动学时间轴**推迟 `motion_delay_s`** ⇒ fix 前真值静止 ⇒ 两原点一致 ✓
+        //   （闭式运动学只依赖 t ✓ ⇒ 一行对齐 ✓，不改变任何运动形态 ✓）。
+        let t = (self.t - self.motion_delay_s).max(0.0);
         // ---- 运动学闭式（按 motion 解析推进） ----
         let (pos, vel, accel_world, att, omega) = match &self.motion {
             Motion::Hover => ([0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3]),
