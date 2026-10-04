@@ -83,7 +83,6 @@ impl Peripheral for Dwt {
             //   （与各定时器同基准 ✓）。DWT 计的是**核心时钟 168MHz**（固件按 168MHz 写
             //   `cycles/168e6`、SysTick reload 168000=1ms ✓）⇒ 必须 ×2 才是核周期 ✓。
             //   否则 DWT 报 ~84k/ms 而固件期望 168k/ms ⇒ 全仓按 168 的换算差 2× ✗。
-            const CORE_OVER_BASE: u64 = 168_000_000 / 84_000_000;
             // ★步骤 2：收到的 `cycles` 已是【核周期】（与 SysTick 同源同口径 ✓）⇒ 直接累加 ✓
             let _ = crate::sim::timing::core_cycles_dwt(0);
             self.cyccnt = self.cyccnt.wrapping_add(cycles);
