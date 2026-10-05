@@ -57,7 +57,117 @@ fn hover_converges_stable() {
     let mut h = EnvHarness::new(scn, true);
 
     // 预热（解锁不必要，估计器独立于 armed；跑足让 EKF 收敛）
-    h.run_for_ms(450 as f64 * 13.0); // ~3s
+    // ★★★相位剖分（固件侧自计 STAGE_CYC/STAGE_N ✓，ELFSYM 直读 ✓）
+    {
+        let names = ["0 step_hil入口","1 IMU预处理","2 姿态/位置门控","3 EKF预测+更新完",
+                     "4 外部观测注入完","5","6","7","8 ESKF step进入","9 ESKF predict完",
+                     "10 重力完","11 GPS位前","12 GPS位后","13 GPS速后","14 空速后",
+                     "15 state组装前","16 气压前","17 气压后","18 磁前","19","20","21","22","23"];
+        eprintln!("[ph] elf={:?}", mcu_simulater::elfsym::flyctrl_app_elf());
+        eprintln!("[ph] sym STAGE_CYC={:?} STAGE_N={:?} ESKF_PRED={:?}",
+                  mcu_simulater::elfsym::try_app_sym("STAGE_CYC"),
+                  mcu_simulater::elfsym::try_app_sym("STAGE_N"),
+                  mcu_simulater::elfsym::try_app_sym("ESKF_PRED"));
+        if let (Some(a), Some(b)) = (mcu_simulater::elfsym::try_app_sym("STAGE_CYC"),
+                                     mcu_simulater::elfsym::try_app_sym("STAGE_N")) {
+            if let (Ok(c), Ok(n)) = (h.m.cpu.mem_read(a as u64, 24*4), h.m.cpu.mem_read(b as u64, 24*4)) {
+                eprintln!("[ph] ---- 相位剖分（累计 DWT 周期 @168MHz ⇒ ms）----");
+                for i in 0..20usize {
+                    let cy = u32::from_le_bytes([c[i*4],c[i*4+1],c[i*4+2],c[i*4+3]]);
+                    let nn = u32::from_le_bytes([n[i*4],n[i*4+1],n[i*4+2],n[i*4+3]]);
+                    if nn > 0 {
+                        eprintln!("[ph] {:<18} cyc={:>12} (n={:>5}) ⇒ {:>8.3} ms/次",
+                                  names[i], cy, nn, cy as f32 / 168_000.0 / nn as f32);
+                    }
+                }
+            }
+        }
+    }
+    // ★★★时间基准实测：固件自己的 tick 计数 vs harness 步进/虚拟时间 ✓
+    {
+        let gt = mcu_simulater::elfsym::try_app_sym("g_tick");
+        let sq0 = h.read_sensor_seq();
+        let st0 = h.steps;
+        eprintln!("[tb0] g_tick sym={:?} steps={} seq={}", gt, st0, sq0);
+        if let Some(a) = gt {
+            let a = a as u64;
+            let t0 = match h.m.cpu.mem_read(a, 4) {
+                Ok(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32,
+                Err(_) => -1.0,
+            };
+            let s0 = h.steps;
+            h.run_for_ms(1000.0);
+            let t1 = match h.m.cpu.mem_read(a, 4) {
+                Ok(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32,
+                Err(_) => -1.0,
+            };
+            let s1 = h.steps;
+            let sq1 = h.read_sensor_seq();
+            eprintln!("[tb] run_for_ms(1000) ⇒ g_tick {t0:.0} → {t1:.0} (Δ{:.0} tick), steps {s0} → {s1} (Δ{}), seq={}",
+                      t1 - t0, s1 - s0, sq1);
+        } else {
+            eprintln!("[tb] g_tick 不在 app ELF 符号表 ✗");
+        }
+    }
+    // ★先把固件 console 里的 RT 统计打出来（exec_us/jit_us/超时 ✓）
+    {
+        let c = h.console_all();
+        let mut n = 0;
+        for ln in c.lines() {
+            if ln.contains("exec_us") || ln.contains("overrun") || ln.contains("deadline")
+               || ln.contains("wq") || ln.contains("rt") {
+                eprintln!("[rt] {ln}");
+                n += 1;
+                if n > 40 { break; }
+            }
+        }
+        eprintln!("[rt] (console 共 {} 字节, 命中 {n} 行)", c.len());
+    }
+    // ★预热期逐段仪表（发散发生在预热期内 ⇒ 必须看这里 ✓）
+    for j in 0..13 {
+        h.run_for_ms(450.0);
+        let e: EstReadout = h.read_est();
+        let eu = e.euler();
+        {
+            // ★L2 estimator item 内部实际耗时（cycles @168MHz ⇒ ms）
+            for nm in ["IT_EXEC_EKF", "IT_EXEC_ATT", "IT_EXEC_SENS", "WQ_EXEC_L2"] {
+                if let Some(a) = mcu_simulater::elfsym::try_app_sym(nm) {
+                    if let Ok(b) = h.m.cpu.mem_read(a as u64, 4) {
+                        let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                        eprintln!("[exec] {nm} = {v} cyc = {:.3} ms", v as f32 / 168_000.0);
+                    }
+                }
+            }
+        }
+        {
+            let a = mcu_simulater::elfsym::app_sym("ESKF_PRED") as u64;
+            if let Ok(b) = h.m.cpu.mem_read(a, 8 * 4) {
+                let g = |i: usize| f32::from_le_bytes([b[i*4], b[i*4+1], b[i*4+2], b[i*4+3]]);
+                eprintln!("[pred] N={:.0} dtt_a={:.6} dtt_v={:.6} dv=({:.2},{:.2},{:.2})",
+                          g(0), g(1), g(2), g(3), g(4), g(5));
+            }
+        }
+        {
+            let a = mcu_simulater::elfsym::app_sym("ESKF_VZ") as u64;
+            if let Ok(b) = h.m.cpu.mem_read(a, 12 * 4) {
+                let g = |i: usize| f32::from_le_bytes([b[i*4], b[i*4+1], b[i*4+2], b[i*4+3]]);
+                eprintln!("[vz] obs={:8.3} pz={:8.3} vz={:8.3} ok={:.0}", g(0), g(1), g(2), g(3));
+            }
+        }
+        eprintln!(
+            "[warm] j={j:2} pos=({:10.3},{:10.3},{:10.3}) vel=({:8.3},{:8.3},{:8.3}) rpy=({:7.3},{:7.3},{:7.3})",
+            e.pos[0], e.pos[1], e.pos[2], e.vel[0], e.vel[1], e.vel[2], eu[0], eu[1], eu[2]
+        );
+    }
+    // ★初始化瞬间的姿态 + 比力（固件静态直读 ✓，绕开日志 ring ✓）
+    {
+        let a = mcu_simulater::elfsym::app_sym("ESKF_INIT_Q") as u64;
+        if let Ok(b) = h.m.cpu.mem_read(a, 8 * 4) {
+            let g = |i: usize| f32::from_le_bytes([b[i*4], b[i*4+1], b[i*4+2], b[i*4+3]]);
+            eprintln!("[initq] q0=({:.4},{:.4},{:.4},{:.4}) acc0=({:.3},{:.3},{:.3})",
+                      g(0), g(1), g(2), g(3), g(4), g(5), g(6));
+        } else { eprintln!("[initq] READ FAIL"); }
+    }
 
     // 收敛后连续采样 500 步（~3.4s）：断言误差全程有界、健康保持 Nominal、任务不冻结
     let mut worst_vel = 0.0f32;
@@ -67,10 +177,20 @@ fn hover_converges_stable() {
     let mut est_ok = true;
     let mut last_seq = h.read_sensor_seq();
     let mut last_adv = 0;
-    for _ in 0..500 {
+    for k in 0..500 {
         h.step();
         let e: EstReadout = h.read_est();
         let eu = e.euler();
+        // ★逐段仪表（Hover 真值恒 0 ⇒ 任何偏离都是纯误差 ✓，一眼看出哪一量先偏 ✓）
+        if k % 25 == 0 {
+            eprintln!(
+                "[hov] k={k:4} pos=({:9.3},{:9.3},{:9.3}) vel=({:8.3},{:8.3},{:8.3})                  rpy=({:7.3},{:7.3},{:7.3}) ab=({:7.3},{:7.3},{:7.3})",
+                e.pos[0], e.pos[1], e.pos[2],
+                e.vel[0], e.vel[1], e.vel[2],
+                eu[0], eu[1], eu[2],
+                e.accel_bias[0], e.accel_bias[1], e.accel_bias[2]
+            );
+        }
         // 悬停真值：vel=0、att=0、pos[2]=0（Hover 参考 0m）
         worst_vel = worst_vel.max(e.vel.iter().map(|v| v.abs()).fold(0.0, f32::max));
         worst_tilt = worst_tilt.max(eu[0].abs()).max(eu[1].abs());

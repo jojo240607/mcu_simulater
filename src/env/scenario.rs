@@ -151,8 +151,9 @@ struct FaultState {
 
 /// 环境场景：运动 + 扰动 + 故障 → 传感器输出（写入 FlySimState）。
 /// ★fix 建立前的静止时长（s）—— 让固件的 GPS 原点与场景原点一致 ✓
-/// （NMEA 首帧 + 固件锁 ref 约需 0.5s ✓ ⇒ 取 1.0s 留裕量 ✓，照 PX4 的"对齐期静止"语义 ✓）
-pub const MOTION_DELAY_S: f32 = 1.0;
+/// ★实测（本轮 ✓）：固件 GPS fix 约需 **1.6s** ⇒ 原 1.0s **不够** ✗ ⇒ fix 落在运动中 ⇒
+///   原点错位 1.15m ⇒ "估计不跟踪真值" ✗。取 **3.0s** 留足裕量 ✓（PX4 at_rest 语义 ✓）。
+pub const MOTION_DELAY_S: f32 = 3.0;
 
 pub struct EnvScenario {
     motion: Motion,

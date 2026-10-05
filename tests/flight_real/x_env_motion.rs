@@ -49,6 +49,40 @@ fn climb_height_tracks() {
             k, h.fw_ms(), t.pos[0], t.pos[1], t.pos[2], t.vel[0], t.vel[1], t.vel[2],
             e.pos[0], e.pos[1], e.pos[2]
         );
+        {
+            // ★运行时计数器（elfsym 直读，绕开日志 ring ✓）
+            let a2 = mcu_simulater::elfsym::app_sym("ESKF_CNT") as u64;
+            if let Ok(b) = h.m.cpu.mem_read(a2, 48 * 4) {
+                let f = |i: usize| f32::from_le_bytes([b[i*4], b[i*4+1], b[i*4+2], b[i*4+3]]);
+                eprintln!("[gyr] ekf_gyro=({:.3},{:.3},{:.3})", f(28), f(29), f(30));
+                {
+                    let a4 = mcu_simulater::elfsym::app_sym("ESKF_PQ") as u64;
+                    if let Ok(q) = h.m.cpu.mem_read(a4, 12 * 4) {
+                        let g = |i: usize| f32::from_le_bytes([q[i*4], q[i*4+1], q[i*4+2], q[i*4+3]]);
+                        eprintln!("[pq] pre=({:.3},{:.3},{:.3},{:.3}) d_ang=({:.4},{:.4},{:.4}) post=({:.3},{:.3},{:.3},{:.3})",
+                                  g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7), g(8), g(9), g(10));
+                    }
+                }
+                {
+                    let a3 = mcu_simulater::elfsym::app_sym("ESKF_INIT_Q") as u64;
+                    if let Ok(q) = h.m.cpu.mem_read(a3, 8 * 4) {
+                        let g = |i: usize| f32::from_le_bytes([q[i*4], q[i*4+1], q[i*4+2], q[i*4+3]]);
+                        eprintln!("[initq] q0=({:.3},{:.3},{:.3},{:.3}) acc0=({:.2},{:.2},{:.2})",
+                                  g(0), g(1), g(2), g(3), g(4), g(5), g(6));
+                    }
+                }
+                eprintln!("[gravq] before=({:.3},{:.3},{:.3},{:.3}) after=({:.3},{:.3},{:.3},{:.3})",
+                          f(39), f(40), f(41), f(42), f(43), f(44), f(45), f(46));
+                eprintln!("[magq] before=({:.3},{:.3},{:.3},{:.3}) after=({:.3},{:.3},{:.3},{:.3})",
+                          f(31), f(32), f(33), f(34), f(35), f(36), f(37), f(38));
+                eprintln!("[att] q=({:.3},{:.3},{:.3},{:.3}) acc_b=({:.2},{:.2},{:.2}) Rf=({:.2},{:.2},{:.2})",
+                          f(16), f(17), f(18), f(19), f(23), f(24), f(25), f(20), f(21), f(22));
+                eprintln!("[cnt] gpsP={}/{} gpsV={}/{} baro_rej={} grav={}/{} step={} est_p=({:.2},{:.2},{:.2}) est_v=({:.2},{:.2},{:.2})",
+                          f(0) as u32, f(1) as u32, f(2) as u32, f(3) as u32,
+                          f(4) as u32, f(5) as u32, f(6) as u32, f(7) as u32,
+                          f(8), f(9), f(10), f(12), f(13), f(14));
+            }
+        }
         if k == 0 {
             // ★② 诊断：读固件侧 ESKF_DIAG2（step 10..14 的 P/零偏快照 ✓）
             let addr = mcu_simulater::elfsym::app_sym("ESKF_DIAG2") as u64;
