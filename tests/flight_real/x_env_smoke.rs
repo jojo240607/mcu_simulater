@@ -21,6 +21,13 @@ fn est_layout_probe() {
     // 跑 400 步（~2.7s 虚拟时间），EKF 应已稳定。
     h.run_for_ms(400 as f64 * 13.0);
     let e = h.read_est();
+    // 判别用打印（2026-10-05）：只用**本文件已用过**的 EstReadout 字段（零新 API 风险）
+    // 问题意识：探针断言"机体在悬停"，但机体是否真的水平**从未被验证**。
+    // health/armed 若异常（降级/未解锁）⇒ 机体不在正常状态 ⇒ 姿态大角可能是【真实】的。
+    eprintln!(
+        "[probe] est wxyz = {:?} | health = {} | armed = {}",
+        e.att_wxyz, e.health, e.armed
+    );
     assert!(
         e.att_wxyz[0].abs() > 0.9,
         "姿态四元数 w 应 ≈1（单位四元数，布局/读取可能错位），得 {}",
