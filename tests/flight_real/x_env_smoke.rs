@@ -19,6 +19,27 @@ fn est_layout_probe() {
     let scn = EnvScenario::new(Motion::Hover, mcu_simulater::env::scenario::Perturb::clean(), vec![]);
     let mut h = EnvHarness::new(scn, true);
     // 跑 400 步（~2.7s 虚拟时间），EKF 应已稳定。
+    // ★帧到达节奏（2026-10-05）：13° 实测为【欠阻尼振荡】✗（输入与初值均已实测无罪 ✓）
+    //   ⇒ 疑因真链路帧到达【不均匀】激发 ✗（host 判据按 k%3 均匀喂帧 ⇒ 复现不出 ✓）
+    //   零固件改动 ✓：用既有 `read_sensor_seq()`（符号+偏移 ✓）逐步观察帧更新时刻 ✓
+    {
+        let mut last = h.read_sensor_seq();
+        let mut iv: [u32; 40] = [0; 40];
+        let mut n = 0usize;
+        let mut gap = 0u32;
+        for _ in 0..200 {
+            h.step(); // 单步推进（≈13 ms ✓）
+            let s = h.read_sensor_seq();
+            if s != last {
+                if n < 40 { iv[n] = gap; n += 1; }
+                gap = 0;
+                last = s;
+            } else {
+                gap += 1;
+            }
+        }
+        eprintln!("[seq] 前 200 步的帧间隔（单位=步≈13ms，前 {} 个）：{:?}", n, &iv[..n]);
+    }
     // ★轨迹采样（2026-10-05）：此前只看【终态】✗ ⇒ 改为 8 段采样，定位触发出现在何时 ✓
     //   用【已验证可用】的出口 read_est() ✓（符号+偏移，本文件已在用 ✓），零固件改动 ✓
     for seg in 0..20u32 {
