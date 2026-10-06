@@ -19,7 +19,17 @@ fn est_layout_probe() {
     let scn = EnvScenario::new(Motion::Hover, mcu_simulater::env::scenario::Perturb::clean(), vec![]);
     let mut h = EnvHarness::new(scn, true);
     // 跑 400 步（~2.7s 虚拟时间），EKF 应已稳定。
-    h.run_for_ms(400 as f64 * 13.0);
+    // ★轨迹采样（2026-10-05）：此前只看【终态】✗ ⇒ 改为 8 段采样，定位触发出现在何时 ✓
+    //   用【已验证可用】的出口 read_est() ✓（符号+偏移，本文件已在用 ✓），零固件改动 ✓
+    for seg in 0..8u32 {
+        h.run_for_ms(50.0 * 13.0);
+        let q = h.read_est();
+        eprintln!(
+            "[traj] {:5.0} ms: wxyz = [{:+.4}, {:+.4}, {:+.4}, {:+.4}] | health = {} | armed = {}",
+            (seg + 1) as f64 * 50.0 * 13.0,
+            q.att_wxyz[0], q.att_wxyz[1], q.att_wxyz[2], q.att_wxyz[3], q.health, q.armed
+        );
+    }
         {
             let t = h.truth();
             eprintln!("[probe] TRUTH att(rpy rad) = {:?} | pos = {:?}", t.att, t.pos);
