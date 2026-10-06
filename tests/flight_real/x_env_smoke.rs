@@ -33,6 +33,10 @@ fn est_layout_probe() {
             "[traj]        pos = [{:+.4}, {:+.4}, {:+.4}] vel = [{:+.4}, {:+.4}, {:+.4}]",
             q.pos[0], q.pos[1], q.pos[2], q.vel[0], q.vel[1], q.vel[2]
         );
+        if seg == 0 || seg == 7 {
+            let d = h.dump_sym_f32("SENSOR_FRAME", 16);
+            eprintln!("[sframe] seg{} f32[0..16] = {:?}", seg, d);
+        }
         let wa = h.diag_world_accel();
         eprintln!("[traj]        HIL_DIAG.world_accel = [{:+.4}, {:+.4}, {:+.4}]", wa[0], wa[1], wa[2]);
     }

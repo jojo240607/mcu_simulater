@@ -1012,6 +1012,20 @@ impl EnvHarness {
         out
     }
 
+    /// ★2026-10-05 通用导出：读符号处 N 个 f32 —— **让数据自己认领字段** ✓
+    /// （不赌结构偏移 ✗：哪个槽是 accel，由 ≈−9.81 自证 ✓）
+    pub fn dump_sym_f32(&mut self, sym: &str, n: usize) -> Vec<f32> {
+        let a = mcu_simulater::elfsym::app_sym(sym);
+        (0..n)
+            .map(|i| {
+                f32::from_bits(
+                    self.m.cpu.mem_read((a + 4 * i as u32) as u64, 4).ok()
+                        .map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0),
+                )
+            })
+            .collect()
+    }
+
     pub fn read_sensor_seq(&mut self) -> u32 {
         self.m
             .cpu
