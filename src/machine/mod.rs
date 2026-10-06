@@ -176,6 +176,12 @@ pub struct Machine {
     /// ★SCB 句柄（§5.102）：`systick_ticks()` 改取 **SysTick 溢出次数** ✓
     /// （旧实现按「异常进入次数」✗ ⇒ 大块推进时溢出被合并 ⇒ 固件毫秒少记 ✗）。
     scb: Option<Arc<Mutex<SystemControl>>>,
+    /// ★DWT 句柄：供 `tick_raw` 按指针同一性把 DWT 与 SCB **一起**标成"吃原始流" ✓。
+    /// ⚠DWT->CYCCNT 计的是**核周期**（与 SysTick 同域 ✓）；若漏标 ⇒ DWT 吃
+    /// `peripheral_cycles`（APB1-84MHz 折算流 ✗）⇒ 实测 **191,643 计数/固件ms**
+    /// （应 168,000 ✗，+14.07%）⇒ 固件侧 `cycle_now()` 与 `cycles_per_ms=168000`
+    /// 不同基 ⇒ period 声明/per-item 预算/所有 cyc→ms 换算同时偏 14% ✗。
+    dwt: Option<Arc<Mutex<Dwt>>>,
     /// `run_ms` 的累计目标（固件 SysTick 拍数）：过冲跨调用携带，长期无漂移
     run_ms_target: u64,
     /// 最近一次异常抢占前的 PC（= 被中断块的 PC，诊在何处不停被抢）
@@ -293,6 +299,7 @@ impl Machine {
             last_virt_retired: std::cell::Cell::new(0),
             vec_entries: std::cell::RefCell::new(vec![0u64; 97]),
             scb: None,
+            dwt: None,
             run_ms_target: 0,
             last_switch_pc: std::cell::Cell::new(0),
             fault: None,
@@ -981,6 +988,7 @@ impl Machine {
         const DWT_SIZE: u32 = 0x1000;
 
         let dwt = Arc::new(Mutex::new(Dwt::new()));
+        self.dwt = Some(dwt.clone()); // ★句柄留存：`attach_interrupt_delivery` 据此标 raw ✓
         let bus = self.bus.clone();
         bus.lock()
             .unwrap()
@@ -2056,17 +2064,28 @@ impl Machine {
             nvic: self.nvic.clone(),
             // 冻结时钟外设列表：所有外设已挂载，转成 Vec，block hook 免每块加锁
             //（bench_probe：H4 每块 timers.lock() 28.8 → H5 冻结无锁 47.3 MIPS）
-            // ★§5.102 ④：按 **Arc 指针同一性**标出"吃原始流"的外设（只 SCB ✓）。
-            // `Arc<Mutex<SystemControl>>` 被强制转换为 `Arc<Mutex<dyn Peripheral>>` 时
-            // **数据指针不变** ⇒ 取 `Arc::as_ptr(..) as *const () as usize` 可比 ✓。
+            // ★§5.102 ④：按 **Arc 指针同一性**标出"吃原始流"的外设（**SCB + DWT** ✓）。
+            //   ⚠**DWT 必须在此名单内** ✓ —— DWT->CYCCNT 计的是**核周期**（与 SysTick 同域 ✓）；
+            //   标成 `false` 会让它吃 `peripheral_cycles`（APB1-84MHz 折算流 ✗），而
+            //   `dwt.rs::tick` 又把收到的值**原样累加**（"收到的已是核周期"这个前提在此不成立 ✗）
+            //   ⇒ 实测 DWT 走 **191,643 计数/固件ms**（应 168,000 ✗，+14.07%），
+            //   而 `rtos_cycles_per_ms()` 返回 168,000 ⇒ 声明的 5ms 周期实际 4.38 个固件ms ✗；
+            //   全部 `÷168_000` 的 cyc→ms 换算也同步偏 14% ✗（§5.x 实测在案）。
             tick_raw: {
                 let scb_p = self
                     .scb
                     .as_ref()
                     .map(|s| Arc::as_ptr(s) as *const () as usize);
+                let dwt_p = self
+                    .dwt
+                    .as_ref()
+                    .map(|d| Arc::as_ptr(d) as *const () as usize);
                 let ts = self.timers.lock().unwrap();
                 ts.iter()
-                    .map(|t| Some(Arc::as_ptr(t) as *const () as usize) == scb_p)
+                    .map(|t| {
+                        let p = Arc::as_ptr(t) as *const () as usize;
+                        Some(p) == scb_p || Some(p) == dwt_p
+                    })
                     .collect()
             },
             timers: self.timers.lock().unwrap().clone(),

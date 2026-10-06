@@ -449,30 +449,79 @@ impl EnvHarness {
                     }
                 }
             }
-            // ★★§5.222【MSP/异常栈写监视 ✓】飞行记录仪已证明：野跳发生在
-            //   `irq_dispatch` 的 `pop {r3,r4,r5,pc}` ⇒ 被污染的是 **MSP（异常栈，CCM）** ✗
-            //   ⇒ 之前只盯 app 栈、还把 SP∈CCM 的写入全部排除 ✗ ⇒ 一直没看见 ✓
+            // ★★★§5.226【跨上下文踩栈探测 —— 取代 §5.222 的失效判据 ✓】
+            //   硬证据链（本轮实测 ✓）：
+            //     · 故障瞬间写者 **SP=0x1000ffd8（CCM ⇒ MSP/内核上下文）**，写目标
+            //       **0x2000ae44**，而 `L2_WQ_STACK = 0x2000a178..0x2000d178`
+            //       ⇒ 0x2000ae44 **落在任务栈内** ⇒ "ISR 写进挂起任务的栈" ✗
+            //     · 写入值 0 ⇒ 该任务保存的 LR 变 0 ⇒ 之后 `pop {…,pc}` 弹回 **0**
+            //       ⇒ `pc=0` ⇒ 随后的写落到未映射地址 ⇒ `UC_ERR_WRITE_UNMAPPED`
+            //       （`SCB CFSR/HFSR/MMFAR/BFAR=0` 正是因为"跳回 0"在架构上完全合法 ⟂ 不是 fault ✓）
+            //     · 与 §5.222 既有结论首尾相接：野跳发生在 `irq_dispatch` 的 `pop {r3,r4,r5,pc}` ✓
+            //   ⚠§5.222 原实现有两个**结构性**缺陷（故一直抓不到 ✗）：
+            //     ① **hook 范围是 CCM（MSP 区）本身** ⇒ 只看得见"写进异常栈"的写 ✗，
+            //        而真凶是"写进**主 SRAM 的任务栈**" ⇒ 结构上不可能命中 ✗
+            //     ② 判据 `addr+64 < SP` 太宽 ⇒ 把 SP 以下的**合法局部变量**全抓了 ✗
+            //        （实测 24/24 命中皆为 `PC=0x08060228` 写自己的局部量，值还是飞控浮点数 ✗）
+            //   ⇒ 改为：**hook 主 SRAM**，判据 = `SP ∈ MSP 区` **且** `目标 ∈ 某任务栈区间`；
+            //     任务栈区间**由 ELF 符号解析**（名字含 STACK 且 size>0 ✓ ⇒ 不硬编码 ✗
+            //     —— §5.223 的硬编码区间已因重构过期 ✓）。
             {
                 use std::sync::atomic::Ordering as O3;
                 static MSP_ON: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if std::env::var("JOC_MSPWATCH").is_ok() && !MSP_ON.swap(true, O3::SeqCst) {
-                    const MLO: u64 = 0x1000_9000;
+                    const MLO: u64 = 0x1000_9000; // MSP（异常栈）区间
                     const MHI: u64 = 0x1001_0000;
+                    let stacks: Vec<(u64, u64, String)> =
+                        mcu_simulater::elfsym::symbols(&mcu_simulater::elfsym::flyctrl_app_elf())
+                            .into_iter()
+                            .filter(|s| s.name.contains("STACK") && s.size > 0)
+                            .map(|s| {
+                                let n = &s.name;
+                                let short = n[n.len().saturating_sub(26)..].to_string();
+                                (s.addr as u64, s.addr as u64 + s.size as u64, short)
+                            })
+                            .collect();
+                    eprintln!(
+                        "[msp] 任务栈区间 {} 个: {:?}",
+                        stacks.len(),
+                        stacks
+                            .iter()
+                            .map(|(a, b, _)| format!("0x{a:x}..0x{b:x}"))
+                            .collect::<Vec<_>>()
+                    );
+                    // ★★§5.226【回归判据 ✓】所有任务栈必须 **8 字节对齐** ——
+                    //   Cortex-M 异常入栈（带 FPU 时 S0–S15+FPSCR 共 72B）要求 8 字节对齐；
+                    //   非对齐 ⇒ 上下文框架错位 ⇒ 保存的返回地址被覆 ⇒ `pop {…,pc}` 弹回 0 ⇒ `pc=0` 野跳 ✓
+                    //   （本判据在修复前会对 `STACK_RATE_BUF` 报错 —— 它就是根因 ✓）
+                    for (lo, _, nm) in &stacks {
+                        if lo % 8 != 0 {
+                            eprintln!(
+                                "[msp] ✗✗ 任务栈 **非 8 字节对齐**：{nm} 起始 0x{lo:x}（mod8={}）⇒ Cortex-M 异常入栈会错位覆写保存的返回地址 ⇒ `pc=0` 野跳 ✗",
+                                lo % 8
+                            );
+                        }
+                    }
                     let r = self.m.cpu.add_mem_hook(
                         unicorn_engine::HookType::MEM_WRITE,
-                        MLO,
-                        MHI - 1,
+                        0x2000_0000,
+                        0x2001_ffff, // ★主 SRAM（所有 app 任务栈都在这里 ✓）
                         move |uc, _t, addr, _sz, value| {
                             let sp = uc.reg_read(unicorn_engine::RegisterARM::SP).unwrap_or(0);
-                            let pc = uc.reg_read(unicorn_engine::RegisterARM::PC).unwrap_or(0);
-                            // 只抓"异常栈内的死区写入"：SP 也在此区、且写入低于 SP 64B~4KB
-                            if sp >= MLO && sp < MHI && addr + 64 < sp && addr + 4096 > sp {
+                            if !(MLO..MHI).contains(&sp) {
+                                return false; // 写者不在内核/异常上下文 ⇒ 正常 ✓
+                            }
+                            if let Some((_, _, nm)) =
+                                stacks.iter().find(|(lo, hi, _)| addr >= *lo && addr < *hi)
+                            {
+                                let pc = uc.reg_read(unicorn_engine::RegisterARM::PC).unwrap_or(0);
+                                let lr = uc.reg_read(unicorn_engine::RegisterARM::LR).unwrap_or(0);
                                 static SEEN: std::sync::atomic::AtomicU32 =
                                     std::sync::atomic::AtomicU32::new(0);
-                                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+                                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
                                     eprintln!(
-                                        "[msp] PC=0x{pc:08x} → 0x{addr:08x} 值=0x{value:08x} SP=0x{sp:08x}"
+                                        "[msp] ★跨上下文踩栈: PC=0x{pc:08x} LR=0x{lr:08x} SP=0x{sp:08x} → {nm} 内 0x{addr:08x} 值=0x{value:08x}"
                                     );
                                 }
                             }
@@ -480,7 +529,9 @@ impl EnvHarness {
                         },
                     );
                     match r {
-                        Ok(_) => eprintln!("[msp] 异常栈监视已安装 ✓"),
+                        Ok(_) => eprintln!(
+                            "[msp] 跨上下文踩栈监视已安装 ✓（hook 主SRAM；判据 = SP∈MSP ∧ 目标∈任务栈）"
+                        ),
                         Err(e) => eprintln!("[msp] 安装失败 ✗: {e:?}"),
                     }
                 }
@@ -864,7 +915,22 @@ impl EnvHarness {
         //   ⇒ 守卫改为"**10% + 固定 200ms**"（量化是固有项、非行为退化 ✗）。
         let tol = (expect / 10) + 200;
         if elapsed.abs_diff(expect) > tol {
-            panic!("[clock] 锁相漂移过大：固件 {elapsed}ms vs 名义 {expect}ms（步 {}）", self.steps);
+            // ★诊断开关（照 `JOC_STACKWATCH` 约定 ✓）：`JOC_CLOCKWARN=1` ⇒ 只告警不 panic。
+            //   用途：**钟源口径改动期**测“每控制拍真实固件ms” —— 否则守卫先炸，
+            //   后面所有仪表（相位剖分/IT_EXEC/[tb] 钟源对照）都读不到 ✗。
+            //   默认（未设变量）行为与原先完全一致 ✓。
+            if std::env::var("JOC_CLOCKWARN").is_ok() {
+                if self.steps % 100 == 0 {
+                    eprintln!(
+                        "[clock] 告警(JOC_CLOCKWARN)：实测 {elapsed}ms vs 名义 {expect}ms \
+                         ⇒ **{:.3} 固件ms/控制拍**（步 {}）",
+                        elapsed as f64 / (self.steps.saturating_sub(1)).max(1) as f64,
+                        self.steps
+                    );
+                }
+            } else {
+                panic!("[clock] 锁相漂移过大：固件 {elapsed}ms vs 名义 {expect}ms（步 {}）", self.steps);
+            }
         }
         self.pump_log();
     }
