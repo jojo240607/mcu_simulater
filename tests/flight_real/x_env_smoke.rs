@@ -21,19 +21,19 @@ fn est_layout_probe() {
     // 跑 400 步（~2.7s 虚拟时间），EKF 应已稳定。
     // ★轨迹采样（2026-10-05）：此前只看【终态】✗ ⇒ 改为 8 段采样，定位触发出现在何时 ✓
     //   用【已验证可用】的出口 read_est() ✓（符号+偏移，本文件已在用 ✓），零固件改动 ✓
-    for seg in 0..8u32 {
-        h.run_for_ms(50.0 * 13.0);
+    for seg in 0..20u32 {
+        h.run_for_ms(3.0 * 13.0);
         let q = h.read_est();
         eprintln!(
             "[traj] {:5.0} ms: wxyz = [{:+.4}, {:+.4}, {:+.4}, {:+.4}] | health = {} | armed = {}",
-            (seg + 1) as f64 * 50.0 * 13.0,
+            (seg + 1) as f64 * 3.0 * 13.0,
             q.att_wxyz[0], q.att_wxyz[1], q.att_wxyz[2], q.att_wxyz[3], q.health, q.armed
         );
         eprintln!(
             "[traj]        pos = [{:+.4}, {:+.4}, {:+.4}] vel = [{:+.4}, {:+.4}, {:+.4}]",
             q.pos[0], q.pos[1], q.pos[2], q.vel[0], q.vel[1], q.vel[2]
         );
-        if seg == 0 || seg == 7 {
+        if seg == 0 || seg == 19 {
             let d = h.dump_sym_f32("SENSOR_FRAME", 16);
             eprintln!("[sframe] seg{} f32[0..16] = {:?}", seg, d);
         }
