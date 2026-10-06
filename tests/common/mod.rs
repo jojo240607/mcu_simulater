@@ -997,6 +997,21 @@ impl EnvHarness {
     }
 
     /// 读取 sensor_seq()（sensors 任务推进计数）。
+    /// ★2026-10-05 读 `HIL_DIAG` 的**前三个 f32** —— 该结构第一个字段就是
+    /// `world_accel: [f32; 3]`（`mod.rs:259-260` ✓）⇒ 偏移 0/4/8，**零猜测** ✓。
+    /// 用途：判定"估计器实际拿到的比力是否正常"✗（真链路轨迹显示运行中逐步发散 ✗）。
+    pub fn diag_world_accel(&mut self) -> [f32; 3] {
+        let a = mcu_simulater::elfsym::app_sym("HIL_DIAG");
+        let mut out = [0f32; 3];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = f32::from_bits(
+                self.m.cpu.mem_read((a + 4 * i as u32) as u64, 4).ok()
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0),
+            );
+        }
+        out
+    }
+
     pub fn read_sensor_seq(&mut self) -> u32 {
         self.m
             .cpu

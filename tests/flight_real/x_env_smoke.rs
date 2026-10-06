@@ -29,6 +29,12 @@ fn est_layout_probe() {
             (seg + 1) as f64 * 50.0 * 13.0,
             q.att_wxyz[0], q.att_wxyz[1], q.att_wxyz[2], q.att_wxyz[3], q.health, q.armed
         );
+        eprintln!(
+            "[traj]        pos = [{:+.4}, {:+.4}, {:+.4}] vel = [{:+.4}, {:+.4}, {:+.4}]",
+            q.pos[0], q.pos[1], q.pos[2], q.vel[0], q.vel[1], q.vel[2]
+        );
+        let wa = h.diag_world_accel();
+        eprintln!("[traj]        HIL_DIAG.world_accel = [{:+.4}, {:+.4}, {:+.4}]", wa[0], wa[1], wa[2]);
     }
         {
             let t = h.truth();
