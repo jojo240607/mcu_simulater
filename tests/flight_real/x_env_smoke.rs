@@ -20,6 +20,13 @@ fn est_layout_probe() {
     let mut h = EnvHarness::new(scn, true);
     // 跑 400 步（~2.7s 虚拟时间），EKF 应已稳定。
     h.run_for_ms(400 as f64 * 13.0);
+        {
+            let t = h.truth();
+            eprintln!("[probe] TRUTH att(rpy rad) = {:?} | pos = {:?}", t.att, t.pos);
+        }
+    for l in h.console_all().lines() {
+        if l.contains("diag") { eprintln!("[console] {}", l); }
+    }
     let e = h.read_est();
     // 判别用打印（2026-10-05）：只用**本文件已用过**的 EstReadout 字段（零新 API 风险）
     // 问题意识：探针断言"机体在悬停"，但机体是否真的水平**从未被验证**。
