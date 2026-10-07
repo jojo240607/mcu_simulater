@@ -58,6 +58,40 @@ fn est_layout_probe() {
             let d = h.dump_sym_f32("SENSOR_FRAME", 16);
             eprintln!("[sframe] seg{} f32[0..16] = {:?}", seg, d);
         }
+        if seg == 3 {
+            eprintln!("[args] HIL_DIAG f32[0..40] = {:?}", h.dump_sym_f32("HIL_DIAG", 32));
+            // ★E1（2026-10-05）：量 1 kHz delta 路径的**真实值** ——
+            //   推理：frame 的 gyro 恒为 0 ✓，而实测姿态是【64°/s 的平滑线性斜坡】✗
+            //   ⇒ 能造出恒定角速率的只可能是【另一条积分路径喂进非零量】✓
+            //   ⇒ 即 `IMU_RING` → `hil.imu_deltas` → `predict_delta` 的 `delta_ang` ✗
+            //   自认领：`delta_vel` 会是 ≈−0.00981×k 这类极好认的值 ✓
+            eprintln!("[ring] IMU_RING f32[0..40] = {:?}", h.dump_sym_f32("IMU_RING", 40));
+            // ★读固件【内置】诊断（estimator_work 里 c<20 || c%250==0 时打印
+            //   accel_bias + 估计 pos/vel + 最大位置修正量的【来源通道】✓）
+            {
+                let c = h.console_all();
+                let lines: Vec<&str> = c.lines().collect();
+                eprintln!("[console] 共 {} 行，先看前 80 行：", lines.len());
+                for l in lines.iter().take(80) {
+                    eprintln!("[c] {}", l);
+                }
+            }
+            // ★#29 判定：`.data` 初值在裸 bin 中是否丢失（项目注释 hil.rs:168-170 明写此现象"实测 ✗"）
+            //   host 跑的是【源码初值】✓，真固件若为 0 ✗ ⇒ 两套参数环境 ⇒ 天然解释 host/固件差异 ✓
+            for sym in [
+                "G_ESKF_GRAV_ON", "G_ESKF_GRAV_GATE", "G_ESKF_MAG_HDG_GATE", "G_ESKF_MAG_YAW_ON",
+                "G_ESKF_FREEZE_BIAS", "G_ESKF_GYR_LPF", "G_ESKF_GYR_NOTCH_FRQ",
+                "G_ESKF_GYR_NOTCH_Q", "G_ESKF_BYPASS_GYR_NOTCH", "G_ESKF_MAG_DELAY_MS",
+            ] {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    h.dump_sym_f32(sym, 1)
+                }));
+                match r {
+                    Ok(v) => eprintln!("[g] {:26} = {:?}", sym, v),
+                    Err(_) => eprintln!("[g] {:26} = <无此符号>", sym),
+                }
+            }
+        }
         let wa = h.diag_world_accel();
         eprintln!("[traj]        HIL_DIAG.world_accel = [{:+.4}, {:+.4}, {:+.4}]", wa[0], wa[1], wa[2]);
     }
