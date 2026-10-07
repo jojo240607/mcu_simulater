@@ -59,7 +59,7 @@ fn est_layout_probe() {
             eprintln!("[sframe] seg{} f32[0..16] = {:?}", seg, d);
         }
         if seg == 3 {
-            eprintln!("[args] HIL_DIAG f32[0..40] = {:?}", h.dump_sym_f32("HIL_DIAG", 32));
+            eprintln!("[args] HIL_DIAG f32[0..40] = {:?}", h.dump_sym_f32("HIL_DIAG", 48));
             // ★E1（2026-10-05）：量 1 kHz delta 路径的**真实值** ——
             //   推理：frame 的 gyro 恒为 0 ✓，而实测姿态是【64°/s 的平滑线性斜坡】✗
             //   ⇒ 能造出恒定角速率的只可能是【另一条积分路径喂进非零量】✓
@@ -109,6 +109,14 @@ fn est_layout_probe() {
     eprintln!(
         "[probe] est wxyz = {:?} | health = {} | armed = {}",
         e.att_wxyz, e.health, e.armed
+    );
+    // ★补强（2026-10-05 实测教训 ✓）：`|w| > 0.9` 对 1e33 也成立 ✗（空转 ✗）
+    //   ⇒ 必须同时要求**有限**且**四元数范数合理** ✓
+    let qn = e.att_wxyz.iter().map(|v| v * v).sum::<f32>();
+    assert!(
+        e.att_wxyz.iter().all(|v| v.is_finite()) && (qn - 1.0).abs() < 0.1,
+        "姿态必须【有限且为单位四元数】：wxyz={:?} norm²={}",
+        e.att_wxyz, qn
     );
     assert!(
         e.att_wxyz[0].abs() > 0.9,
