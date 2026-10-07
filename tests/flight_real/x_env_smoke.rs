@@ -60,6 +60,13 @@ fn est_layout_probe() {
         }
         if seg == 3 {
             eprintln!("[args] HIL_DIAG f32[0..40] = {:?}", h.dump_sym_f32("HIL_DIAG", 48));
+            // ★读固件自带的诊断（`estimator_work` 的 ekfdbg ✓）—— 看**每路观测的接受/拒收** ✓
+            //   （此前实测 `gpsV=0/5` ✗ ⇒ 速度通道可能全被拒 ✓ 那正是 0.596 m/s 残差的来源 ✓）
+            for l in h.console_all().lines() {
+                if l.contains("ekfdbg") || l.contains("rejdbg") {
+                    eprintln!("[fw] {}", l);
+                }
+            }
             // ★E1（2026-10-05）：量 1 kHz delta 路径的**真实值** ——
             //   推理：frame 的 gyro 恒为 0 ✓，而实测姿态是【64°/s 的平滑线性斜坡】✗
             //   ⇒ 能造出恒定角速率的只可能是【另一条积分路径喂进非零量】✓
