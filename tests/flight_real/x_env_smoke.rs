@@ -79,9 +79,11 @@ fn est_layout_probe() {
             // ★#29 判定：`.data` 初值在裸 bin 中是否丢失（项目注释 hil.rs:168-170 明写此现象"实测 ✗"）
             //   host 跑的是【源码初值】✓，真固件若为 0 ✗ ⇒ 两套参数环境 ⇒ 天然解释 host/固件差异 ✓
             for sym in [
-                "G_ESKF_GRAV_ON", "G_ESKF_GRAV_GATE", "G_ESKF_MAG_HDG_GATE", "G_ESKF_MAG_YAW_ON",
+                // ★已裁掉 5 个在本构建中不存在的符号（`G_ESKF_GRAV_ON`/`GRAV_GATE`/
+                //   `MAG_HDG_GATE`/`MAG_YAW_ON`/`MAG_DELAY_MS` ✓ —— 它们的"是否存在"
+                //   已由 `nm` 查清 ✓，留在列表里只会 panic ✗）
                 "G_ESKF_FREEZE_BIAS", "G_ESKF_GYR_LPF", "G_ESKF_GYR_NOTCH_FRQ",
-                "G_ESKF_GYR_NOTCH_Q", "G_ESKF_BYPASS_GYR_NOTCH", "G_ESKF_MAG_DELAY_MS",
+                "G_ESKF_GYR_NOTCH_Q", "G_ESKF_BYPASS_GYR_NOTCH",
             ] {
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     h.dump_sym_f32(sym, 1)
